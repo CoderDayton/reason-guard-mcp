@@ -14,7 +14,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # Skip all tests if no API key (for CI without secrets)
 pytestmark = pytest.mark.skipif(
     not os.getenv("OPENAI_API_KEY"),
@@ -42,7 +41,7 @@ class TestFullPipeline:
 
         # 1. Compress long context
         long_context = "This is a test sentence. " * 100
-        question = "What is the test about?"
+        _question = "What is the test about?"  # noqa: F841
 
         # Mock compression result
         compressed = "This is a test sentence. " * 10
@@ -59,9 +58,9 @@ class TestFullPipeline:
     @pytest.mark.asyncio
     async def test_reason_then_verify(self, mock_llm_client: MagicMock) -> None:
         """Test reasoning followed by verification."""
-        # 1. Get reasoning result
-        answer = "Einstein published relativity in 1905."
-        context = "Albert Einstein published special relativity in 1905."
+        # 1. Get reasoning result (values shown for documentation)
+        _answer = "Einstein published relativity in 1905."  # noqa: F841
+        _context = "Albert Einstein published special relativity in 1905."  # noqa: F841
 
         # 2. Verify answer
         # Mock verification
@@ -79,7 +78,7 @@ class TestFullPipeline:
         compressed_context = "Long document about physics. " * 5
 
         # Step 2: Reason
-        question = "What is the document about?"
+        _question = "What is the document about?"  # noqa: F841
         answer = "The document is about physics."
 
         # Step 3: Verify

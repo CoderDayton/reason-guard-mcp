@@ -36,6 +36,7 @@ class MatrixOfThoughtTool:
 
     Attributes:
         llm: LLM client for generating thoughts.
+
     """
 
     def __init__(self, llm_client: LLMClient) -> None:
@@ -43,6 +44,7 @@ class MatrixOfThoughtTool:
 
         Args:
             llm_client: LLM client for text generation.
+
         """
         self.llm = llm_client
 
@@ -91,6 +93,7 @@ class MatrixOfThoughtTool:
             ... )
             >>> print(result.answer)
             >>> print(result.confidence)  # e.g., 0.85
+
         """
         # Validate inputs
         if not question or not question.strip():
@@ -210,6 +213,7 @@ class MatrixOfThoughtTool:
 
         Returns:
             Generated thought string, or None if generation failed.
+
         """
         try:
             # Build strategy guidance based on row
@@ -272,6 +276,7 @@ Generate ONE focused reasoning step (2-3 sentences) using {strategy}:"""
 
         Returns:
             Synthesized summary string.
+
         """
         try:
             thoughts_text = "\n".join(
@@ -288,7 +293,7 @@ Multiple reasoning perspectives (iteration {col_num}/{total_cols}):
 
 Context: {context[:400]}{"..." if len(context) > 400 else ""}
 
-Synthesize these perspectives into ONE coherent insight (3-4 sentences). 
+Synthesize these perspectives into ONE coherent insight (3-4 sentences).
 Identify agreements, resolve conflicts, and advance toward the answer:"""
 
             return self.llm.generate(prompt, max_tokens=400, temperature=0.5)
@@ -307,6 +312,7 @@ Identify agreements, resolve conflicts, and advance toward the answer:"""
 
         Returns:
             Concise answer string.
+
         """
         try:
             prompt = f"""Question: {question}
@@ -338,6 +344,7 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
 
         Returns:
             NumPy array of shape (rows, cols-1) with weights.
+
         """
         matrix = np.zeros((rows, cols - 1))
 

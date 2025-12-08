@@ -1,8 +1,8 @@
 """Enhanced CoT reasoning tools."""
 
 from .compress import ContextAwareCompressionTool
-from .mot_reasoning import MatrixOfThoughtTool
 from .long_chain import LongChainOfThoughtTool
+from .mot_reasoning import MatrixOfThoughtTool
 from .verify import FactVerificationTool
 
 __all__ = [

@@ -36,6 +36,7 @@ class ContextAwareCompressionTool:
         device: Device to run model on (cuda/cpu).
         tokenizer: Tokenizer for the embedding model.
         model: The embedding model.
+
     """
 
     def __init__(self, model_name: str = "sentence-transformers/all-mpnet-base-v2") -> None:
@@ -44,6 +45,7 @@ class ContextAwareCompressionTool:
         Args:
             model_name: HuggingFace model name for sentence embeddings.
                        Default is all-mpnet-base-v2 for good quality/speed balance.
+
         """
         self.model_name = model_name
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -96,6 +98,7 @@ class ContextAwareCompressionTool:
             ...     compression_ratio=0.3
             ... )
             >>> print(result.tokens_saved)  # e.g., 2500
+
         """
         # Validate inputs
         if not context or not context.strip():
@@ -206,6 +209,7 @@ class ContextAwareCompressionTool:
 
         Returns:
             Normalized embedding tensor of shape (hidden_size,).
+
         """
         inputs = self.tokenizer(
             text,
@@ -240,6 +244,7 @@ class ContextAwareCompressionTool:
 
         Returns:
             List of sentence strings.
+
         """
         # Handle common abbreviations to avoid false splits
         abbrevs = [
@@ -277,5 +282,6 @@ class ContextAwareCompressionTool:
 
         Returns:
             Token count.
+
         """
         return len(self.tokenizer.encode(text, add_special_tokens=False))

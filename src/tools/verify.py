@@ -27,6 +27,7 @@ class FactVerificationTool:
 
     Attributes:
         llm: LLM client for claim extraction and verification.
+
     """
 
     def __init__(self, llm_client: LLMClient) -> None:
@@ -34,6 +35,7 @@ class FactVerificationTool:
 
         Args:
             llm_client: LLM client for text generation.
+
         """
         self.llm = llm_client
 
@@ -72,6 +74,7 @@ class FactVerificationTool:
             ... )
             >>> print(result.verified)  # True
             >>> print(result.confidence)  # 0.9
+
         """
         # Validate inputs
         if not answer or not answer.strip():
@@ -138,6 +141,7 @@ class FactVerificationTool:
 
         Returns:
             List of claim strings.
+
         """
         try:
             prompt = f"""Extract the key FACTUAL CLAIMS from this text that can be verified.
@@ -179,6 +183,7 @@ List up to {max_claims} factual claims, one per line (just the claim, no numberi
 
         Returns:
             Dict with claim, supported (bool), confidence, and reason.
+
         """
         try:
             prompt = f"""Is this claim supported by the given context?
@@ -189,7 +194,7 @@ CONTEXT: {context[:1500]}{"..." if len(context) > 1500 else ""}
 
 Answer with:
 - SUPPORTED: if the context clearly supports this claim
-- CONTRADICTED: if the context contradicts this claim  
+- CONTRADICTED: if the context contradicts this claim
 - UNCLEAR: if the context doesn't contain relevant information
 
 Then briefly explain why (1 sentence):"""

@@ -134,6 +134,7 @@ def safe_json_serialize(obj: Any) -> str:
 
     Returns:
         JSON string representation of the object.
+
     """
     try:
         if hasattr(obj, "to_dict"):

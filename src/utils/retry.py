@@ -40,6 +40,7 @@ def retry_with_backoff(
         @retry_with_backoff(max_attempts=3, base_delay=1.0)
         async def call_llm(prompt: str) -> str:
             return await api.generate(prompt)
+
     """
     retry_exceptions = retry_on or (Exception,)
 
@@ -98,6 +99,7 @@ def with_timeout(timeout_seconds: float) -> Callable[[Callable[P, T]], Callable[
         async def slow_operation() -> str:
             await asyncio.sleep(100)
             return "done"
+
     """
 
     def decorator(func: Callable[P, T]) -> Callable[P, T]:

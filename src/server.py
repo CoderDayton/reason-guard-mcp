@@ -72,9 +72,16 @@ def get_llm_client() -> LLMClient:
     """Get or create LLM client instance."""
     global _llm_client
     if _llm_client is None:
+        # Environment variable takes precedence over config
+        base_url = os.getenv("OPENAI_BASE_URL") or config.get("llm", {}).get("base_url") or None
+        # Empty string from config should be treated as None
+        if base_url == "":
+            base_url = None
+
         _llm_client = LLMClient(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model=config["models"]["reasoning_llm"],
+            base_url=base_url,
+            model=os.getenv("OPENAI_MODEL") or config["models"]["reasoning_llm"],
             timeout=config["llm"]["timeout"],
             max_retries=config["llm"]["retry_attempts"],
         )
@@ -161,6 +168,7 @@ async def compress_prompt(
             question="What was the main finding?",
             compression_ratio=0.3
         )
+
     """
     try:
         if ctx:
@@ -244,6 +252,7 @@ async def matrix_of_thought_reasoning(
             matrix_rows=3,
             matrix_cols=4
         )
+
     """
     try:
         if ctx:
@@ -322,6 +331,7 @@ async def long_chain_of_thought(
             num_steps=10,
             verify_intermediate=True
         )
+
     """
     try:
         if ctx:
@@ -397,6 +407,7 @@ async def verify_fact_consistency(
             context="Albert Einstein published special relativity in 1905...",
             max_claims=5
         )
+
     """
     try:
         if ctx:
@@ -464,6 +475,7 @@ async def recommend_reasoning_strategy(
             problem="Find if there's a path from A to D in graph",
             token_budget=5000
         )
+
     """
     try:
         problem_lower = problem.lower()

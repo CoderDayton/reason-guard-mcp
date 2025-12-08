@@ -36,6 +36,7 @@ class LongChainOfThoughtTool:
 
     Attributes:
         llm: LLM client for generating reasoning steps.
+
     """
 
     def __init__(self, llm_client: LLMClient) -> None:
@@ -43,6 +44,7 @@ class LongChainOfThoughtTool:
 
         Args:
             llm_client: LLM client for text generation.
+
         """
         self.llm = llm_client
 
@@ -86,6 +88,7 @@ class LongChainOfThoughtTool:
             ... )
             >>> print(result.answer)
             >>> print(result.verification_results)
+
         """
         # Validate inputs
         if not problem or not problem.strip():
@@ -187,6 +190,7 @@ class LongChainOfThoughtTool:
 
         Returns:
             Generated step text, or None if failed.
+
         """
         try:
             prompt = f"""Problem: {problem}
@@ -228,6 +232,7 @@ Step {step_num}:"""
 
         Returns:
             Verification result dict with is_valid, reason, step.
+
         """
         try:
             current_step = chain[step_num - 1] if step_num <= len(chain) else ""
@@ -275,6 +280,7 @@ Answer with YES if valid, NO if problematic. Then briefly explain (1 sentence):"
 
         Returns:
             Extracted answer string.
+
         """
         if not chain:
             return "Unable to generate answer"
@@ -307,6 +313,7 @@ Provide a direct, concise answer (1-2 sentences):"""
 
         Returns:
             Formatted context string.
+
         """
         if not chain:
             return ""

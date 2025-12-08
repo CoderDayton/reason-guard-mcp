@@ -29,6 +29,7 @@ class LLMClient:
         client = LLMClient(model="gpt-4-turbo")
         response = client.generate("What is 2+2?")
         print(response)  # "4"
+
     """
 
     def __init__(
@@ -50,6 +51,7 @@ class LLMClient:
 
         Raises:
             LLMException: If API key is not provided and not in environment.
+
         """
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -98,6 +100,7 @@ class LLMClient:
 
         Raises:
             LLMException: If generation fails after retries.
+
         """
         try:
             messages: list[dict[str, str]] = []
@@ -145,6 +148,7 @@ class LLMClient:
 
         Raises:
             LLMException: If generation fails after retries.
+
         """
         try:
             messages: list[dict[str, str]] = []
@@ -180,6 +184,7 @@ class LLMClient:
 
         Returns:
             Estimated token count.
+
         """
         return len(text) // 4
 
@@ -191,6 +196,7 @@ class LLMClient:
 
         Returns:
             Estimated total token count.
+
         """
         total = 0
         for msg in messages:

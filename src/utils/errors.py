@@ -60,6 +60,7 @@ class ToolExecutionError(Exception):
             tool_name: Name of the tool that failed.
             error_message: Human-readable error message.
             details: Optional dictionary with additional error details.
+
         """
         self.tool_name = tool_name
         self.error_message = error_message
@@ -71,6 +72,7 @@ class ToolExecutionError(Exception):
 
         Returns:
             Formatted error string for MCP response.
+
         """
         return f"[{self.tool_name}] {self.error_message}. Details: {self.details}"
 
@@ -79,6 +81,7 @@ class ToolExecutionError(Exception):
 
         Returns:
             Dictionary representation of the error.
+
         """
         return {
             "error": True,
