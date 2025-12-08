@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from functools import wraps
-from typing import ParamSpec, TypeVar
+from typing import ParamSpec, TypeVar, cast
 
 from loguru import logger
 from tenacity import (
@@ -56,12 +56,13 @@ def retry_with_backoff(
             @wraps(func)
             async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
                 try:
-                    return await func(*args, **kwargs)
+                    result = await func(*args, **kwargs)
+                    return cast(T, result)
                 except Exception as e:
                     logger.warning(f"Retry attempt for {func.__name__}: {e}")
                     raise
 
-            return async_wrapper  # type: ignore[return-value]
+            return cast(Callable[P, T], async_wrapper)
 
         @retry(
             stop=stop_after_attempt(max_attempts),
@@ -72,12 +73,13 @@ def retry_with_backoff(
         @wraps(func)
         def sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                return cast(T, result)
             except Exception as e:
                 logger.warning(f"Retry attempt for {func.__name__}: {e}")
                 raise
 
-        return sync_wrapper  # type: ignore[return-value]
+        return cast(Callable[P, T], sync_wrapper)
 
     return decorator
 
@@ -108,11 +110,12 @@ def with_timeout(timeout_seconds: float) -> Callable[[Callable[P, T]], Callable[
 
         @wraps(func)
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 func(*args, **kwargs),
                 timeout=timeout_seconds,
             )
+            return cast(T, result)
 
-        return wrapper  # type: ignore[return-value]
+        return cast(Callable[P, T], wrapper)
 
     return decorator
