@@ -183,8 +183,9 @@ async def compress_prompt(
         )
 
         if ctx:
+            tokens_saved = result.original_tokens - result.compressed_tokens
             await ctx.info(
-                f"Compressed to {result.compression_ratio:.1%} ({result.tokens_saved} tokens saved)"
+                f"Compressed to {result.compression_ratio:.1%} ({tokens_saved} tokens saved)"
             )
 
         return safe_json_serialize(result)

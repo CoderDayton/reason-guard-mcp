@@ -33,7 +33,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["faiss-gpu>=1.7.4"]
+gpu = [
+    # faiss-gpu wheels are limited; install manually if needed:
+    # pip install faiss-gpu (requires CUDA)
+]
 dev = [
     "pytest>=7.4.0",
     "pytest-asyncio>=0.21.0",
@@ -42,7 +45,6 @@ dev = [
     "ruff>=0.1.0",
     "pre-commit>=3.4.0",
 ]
-all = ["enhanced-cot-mcp[gpu,dev]"]
 
 [project.scripts]
 enhanced-cot-mcp = "src.server:main"
