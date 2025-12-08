@@ -51,6 +51,12 @@ repos:
         args: [-c, pyproject.toml, -r, src/]
         additional_dependencies: ["bandit[toml]"]
 
+  # Secret detection with gitleaks
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+
 # CI configuration
 ci:
   autofix_commit_msg: "style: auto-fix from pre-commit hooks"
