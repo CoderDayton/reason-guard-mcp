@@ -537,6 +537,198 @@ class TestLLMClientRuntimeReasoningDetection:
                     assert "runtime-detected reasoning model" not in call.args[0]
 
 
+class TestRuntimeReasoningDetectionWithCaplog:
+    """Integration-style tests for runtime reasoning detection using log capture.
+
+    Tests the full path from unknown model returning reasoning_content
+    through answer extraction and logging, using a custom log sink
+    to capture loguru messages.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unknown_model_with_reasoning_content_full_flow(self) -> None:
+        """Test full flow: unknown model returns reasoning_content, gets logged.
+
+        Verifies:
+        1. Unknown model is not pre-detected as reasoning model
+        2. API response with reasoning_content triggers runtime detection
+        3. Log message is emitted suggesting token multiplier
+        4. Answer is correctly extracted from reasoning_content
+        """
+        from io import StringIO
+
+        from loguru import logger
+
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+        ):
+            # Create client with a model name not in our config
+            client = LLMClient(api_key="sk-test", model="acme-reasoning-v1")
+
+            # Verify NOT pre-detected as reasoning model
+            assert client._is_reasoning_model is False
+            assert client._token_multiplier == 1.0
+
+            # Simulate API response with reasoning_content field
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None  # Reasoning models often have null content
+            mock_message.model_dump.return_value = {
+                "content": None,
+                "role": "assistant",
+                "reasoning_content": (
+                    "Let me analyze this step by step.\n"
+                    "First, I need to understand the question.\n"
+                    "The user is asking about quantum mechanics.\n"
+                    "Thus: Quantum mechanics describes particle behavior at atomic scales."
+                ),
+            }
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "stop"
+
+            mock_response = MagicMock()
+            mock_response.choices = [mock_choice]
+
+            mock_async_openai.return_value.chat.completions.create = AsyncMock(
+                return_value=mock_response
+            )
+            client.async_client = mock_async_openai.return_value
+
+            # Capture loguru output
+            log_output = StringIO()
+            handler_id = logger.add(log_output, format="{message}", level="INFO")
+
+            try:
+                result = await client.generate_async("What is quantum mechanics?")
+
+                # Verify answer extraction worked
+                assert "quantum" in result.lower() or "particle" in result.lower()
+
+                # Verify runtime detection was logged
+                logs = log_output.getvalue()
+                assert (
+                    "runtime-detected reasoning model" in logs
+                ), f"Expected runtime detection log, got: {logs}"
+                assert "reasoning_token_multiplier=3.0" in logs
+            finally:
+                logger.remove(handler_id)
+
+    @pytest.mark.asyncio
+    async def test_known_reasoning_model_no_runtime_log(self) -> None:
+        """Test that known reasoning models don't trigger runtime detection log."""
+        from io import StringIO
+
+        from loguru import logger
+
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+        ):
+            # DeepSeek R1 is a known reasoning model
+            client = LLMClient(api_key="sk-test", model="deepseek-r1")
+
+            # Verify it IS pre-detected
+            assert client._is_reasoning_model is True
+            assert client._token_multiplier == 3.0
+
+            # Simulate API response with reasoning_content
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None
+            mock_message.model_dump.return_value = {
+                "content": None,
+                "role": "assistant",
+                "reasoning_content": "Thus: The answer is 42.",
+            }
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "stop"
+
+            mock_response = MagicMock()
+            mock_response.choices = [mock_choice]
+
+            mock_async_openai.return_value.chat.completions.create = AsyncMock(
+                return_value=mock_response
+            )
+            client.async_client = mock_async_openai.return_value
+
+            # Capture loguru output
+            log_output = StringIO()
+            handler_id = logger.add(log_output, format="{message}", level="INFO")
+
+            try:
+                result = await client.generate_async("What is the meaning of life?")
+
+                # Answer should be extracted
+                assert "42" in result
+
+                # Should NOT have runtime detection log for known models
+                logs = log_output.getvalue()
+                assert (
+                    "runtime-detected reasoning model" not in logs
+                ), f"Unexpected runtime detection log: {logs}"
+            finally:
+                logger.remove(handler_id)
+
+    @pytest.mark.asyncio
+    async def test_runtime_detection_with_token_limit_warning(self) -> None:
+        """Test runtime detection combined with token limit warning.
+
+        When an unknown reasoning model hits the token limit, both the
+        runtime detection and the token limit warning should be logged.
+        """
+        from io import StringIO
+
+        from loguru import logger
+
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+        ):
+            client = LLMClient(api_key="sk-test", model="new-reasoning-model-2025")
+            assert client._is_reasoning_model is False
+
+            # Simulate hitting token limit (finish_reason="length")
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None
+            mock_message.model_dump.return_value = {
+                "content": None,
+                "role": "assistant",
+                "reasoning_content": "Analyzing... Thus: Partial answer here",
+            }
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "length"  # Hit token limit
+
+            mock_response = MagicMock()
+            mock_response.choices = [mock_choice]
+
+            mock_async_openai.return_value.chat.completions.create = AsyncMock(
+                return_value=mock_response
+            )
+            client.async_client = mock_async_openai.return_value
+
+            # Capture loguru output
+            log_output = StringIO()
+            handler_id = logger.add(log_output, format="{message}", level="INFO")
+
+            try:
+                await client.generate_async("Complex question")
+
+                logs = log_output.getvalue()
+
+                # Should have runtime detection log
+                assert "runtime-detected reasoning model" in logs
+
+                # Should also have token limit warning
+                assert "hit token limit" in logs.lower() or "hit max_tokens" in logs.lower()
+            finally:
+                logger.remove(handler_id)
+
+
 class TestLLMClientThinkTagStripping:
     """Test LLMClient <think> tag handling."""
 
