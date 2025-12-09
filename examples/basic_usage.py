@@ -18,6 +18,18 @@ from mcp.types import TextContent
 load_dotenv()
 
 
+def format_percent(value: float | str | None, default: str = "N/A") -> str:
+    """Format a value as percentage, handling non-numeric gracefully."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value
+    try:
+        return f"{value:.1%}"
+    except (TypeError, ValueError):
+        return default
+
+
 async def main() -> None:
     """Demonstrate basic tool usage."""
     try:
@@ -27,7 +39,7 @@ async def main() -> None:
         return
 
     print("=" * 60)
-    print("Enhanced Chain-of-Thought MCP - Basic Usage Examples")
+    print("MatrixMind MCP - Basic Usage Examples")
     print("=" * 60)
 
     # Connect to server
@@ -63,10 +75,15 @@ async def main() -> None:
 
         content = compress_result.content[0]
         result = json.loads(content.text if isinstance(content, TextContent) else "{}")
-        print(f"Original tokens: {result.get('original_tokens', 'N/A')}")
-        print(f"Compressed tokens: {result.get('compressed_tokens', 'N/A')}")
-        print(f"Tokens saved: {result.get('tokens_saved', 'N/A')}")
-        print(f"Compression ratio: {result.get('compression_ratio', 'N/A'):.1%}")
+
+        if result.get("error"):
+            print(f"Error: {result.get('message', 'Unknown error')}")
+        else:
+            print(f"Original tokens: {result.get('original_tokens', 'N/A')}")
+            print(f"Compressed tokens: {result.get('compressed_tokens', 'N/A')}")
+            tokens_saved = result.get("original_tokens", 0) - result.get("compressed_tokens", 0)
+            print(f"Tokens saved: {tokens_saved}")
+            print(f"Compression ratio: {format_percent(result.get('compression_ratio'))}")
 
         # Example 2: Matrix of Thought reasoning
         print("\n🧠 Example 2: Matrix of Thought Reasoning")
@@ -84,18 +101,28 @@ async def main() -> None:
 
         mot_content = mot_result.content[0]
         mot_data = json.loads(mot_content.text if isinstance(mot_content, TextContent) else "{}")
-        print(f"Answer: {mot_data.get('answer', 'N/A')[:200]}...")
-        print(f"Confidence: {mot_data.get('confidence', 'N/A'):.1%}")
-        print(f"Reasoning steps: {mot_data.get('num_reasoning_steps', 'N/A')}")
+
+        if mot_data.get("error"):
+            print(f"Error: {mot_data.get('message', 'Unknown error')}")
+            mot_answer = ""
+        else:
+            mot_answer = mot_data.get("answer", "")
+            answer_preview = mot_answer[:200] + "..." if len(mot_answer) > 200 else mot_answer
+            print(f"Answer: {answer_preview or 'No answer generated'}")
+            print(f"Confidence: {format_percent(mot_data.get('confidence'))}")
+            print(f"Reasoning steps: {len(mot_data.get('reasoning_steps', []))}")
 
         # Example 3: Verify the answer
         print("\n✅ Example 3: Verify Fact Consistency")
         print("-" * 40)
 
+        # Use a fallback answer if MoT didn't produce one
+        answer_to_verify = mot_answer or "Einstein contributed to physics with relativity theory."
+
         verify_result = await client.call_tool(
             "verify_fact_consistency",
             {
-                "answer": mot_data.get("answer", "Einstein contributed to physics."),
+                "answer": answer_to_verify,
                 "context": long_text,
                 "max_claims": 5,
             },
@@ -104,12 +131,16 @@ async def main() -> None:
         verify_content = verify_result.content[0]
         verify_text = verify_content.text if isinstance(verify_content, TextContent) else "{}"
         verify_data = json.loads(verify_text)
-        print(f"Verified: {verify_data.get('verified', 'N/A')}")
-        print(f"Confidence: {verify_data.get('confidence', 'N/A'):.1%}")
-        claims_verified = verify_data.get("claims_verified", "N/A")
-        claims_total = verify_data.get("claims_total", "N/A")
-        print(f"Claims verified: {claims_verified}/{claims_total}")
-        print(f"Recommendation: {verify_data.get('recommendation', 'N/A')}")
+
+        if verify_data.get("error"):
+            print(f"Error: {verify_data.get('message', 'Unknown error')}")
+        else:
+            print(f"Verified: {verify_data.get('verified', 'N/A')}")
+            print(f"Confidence: {format_percent(verify_data.get('confidence'))}")
+            claims_verified = verify_data.get("claims_verified", "N/A")
+            claims_total = verify_data.get("claims_total", "N/A")
+            print(f"Claims verified: {claims_verified}/{claims_total}")
+            print(f"Reason: {verify_data.get('reason', 'N/A')}")
 
         # Example 4: Get strategy recommendation
         print("\n🎯 Example 4: Strategy Recommendation")
@@ -128,10 +159,14 @@ async def main() -> None:
         strategy_content = strategy_result.content[0]
         strategy_text = strategy_content.text if isinstance(strategy_content, TextContent) else "{}"
         strategy_data = json.loads(strategy_text)
-        print(f"Recommended: {strategy_data.get('recommended_strategy', 'N/A')}")
-        print(f"Estimated steps: {strategy_data.get('estimated_depth_steps', 'N/A')}")
-        print(f"Confidence: {strategy_data.get('strategy_confidence', 'N/A'):.1%}")
-        print(f"Explanation: {strategy_data.get('explanation', 'N/A')}")
+
+        if strategy_data.get("error"):
+            print(f"Error: {strategy_data.get('message', 'Unknown error')}")
+        else:
+            print(f"Recommended: {strategy_data.get('recommended_strategy', 'N/A')}")
+            print(f"Estimated steps: {strategy_data.get('estimated_depth_steps', 'N/A')}")
+            print(f"Confidence: {format_percent(strategy_data.get('strategy_confidence'))}")
+            print(f"Explanation: {strategy_data.get('explanation', 'N/A')}")
 
     print("\n" + "=" * 60)
     print("Examples completed successfully! 🎉")
