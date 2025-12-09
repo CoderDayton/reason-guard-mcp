@@ -26,6 +26,7 @@ REASONING_MODEL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bo1\b", re.IGNORECASE),  # o1, o1-preview, o1-mini
     re.compile(r"reasoning", re.IGNORECASE),
     re.compile(r"think", re.IGNORECASE),
+    re.compile(r"glm.*tee", re.IGNORECASE),  # GLM-4 TEE reasoning variant
 ]
 
 
@@ -365,6 +366,13 @@ class LLMClient:
                     # 3. output - used by some providers
                     reasoning_content = msg_dict.get("reasoning_content")
                     if reasoning_content:
+                        # Warn if reasoning model hit token limit - answer may be incomplete
+                        if finish_reason == "length":
+                            logger.warning(
+                                f"Reasoning model hit token limit (finish_reason='length'). "
+                                f"Chain-of-thought may be incomplete. Consider increasing "
+                                f"max_tokens. Reasoning content: {len(reasoning_content)} chars"
+                            )
                         # For reasoning models, extract the conclusion from reasoning
                         # The reasoning_content contains chain-of-thought, we want the final answer
                         content = self._extract_answer_from_reasoning(reasoning_content)
@@ -530,7 +538,7 @@ class LLMClient:
     def _extract_answer_from_reasoning(self, reasoning_content: str) -> str:
         """Extract the final answer from reasoning model output.
 
-        Reasoning models (like MiniMax-M2, o1) return their chain-of-thought
+        Reasoning models (like MiniMax-M2, o1, GLM-4-TEE) return their chain-of-thought
         in reasoning_content, with the actual answer being the conclusion.
         This method extracts a usable answer from the reasoning trace.
 
@@ -544,6 +552,8 @@ class LLMClient:
         if not reasoning_content:
             return ""
 
+        import re
+
         # Common patterns that indicate the start of a final answer
         answer_markers = [
             "Thus we can produce:",
@@ -555,7 +565,32 @@ class LLMClient:
             "Therefore:",
             "So the answer is:",
             "Potential answer:",
+            "My answer:",
+            "Response:",
+            "Output:",
         ]
+
+        # Patterns that indicate meta-commentary (NOT actual answers)
+        meta_patterns = [
+            r"^\s*\*",  # Bullet points about instructions
+            r"^\s*-\s+\*\*",  # Markdown bullet with bold
+            r"is implied to be",
+            r"the core task",
+            r"output format",
+            r"constraint",
+            r"I need to",
+            r"I should",
+            r"the user wants",
+            r"the prompt",
+            r"this is a",
+            r"formatting artifact",
+            r"red herring",
+            r"instruction",
+            r"generate one focused",
+            r"reasoning step",
+            r"2-3 sentences",
+        ]
+        meta_regex = re.compile("|".join(meta_patterns), re.IGNORECASE)
 
         # Try to find explicit answer markers
         reasoning_lower = reasoning_content.lower()
@@ -570,26 +605,41 @@ class LLMClient:
                     answer_part = answer_part.split("\n\n")[0]
                 # Remove quotes if present
                 answer_part = answer_part.strip("\"'")
-                if len(answer_part) > 20:  # Ensure we have substantial content
+                # Check if this looks like meta-commentary
+                if len(answer_part) > 20 and not meta_regex.search(answer_part):
                     return answer_part
 
         # Fallback: Look for quoted content which often contains the answer
-        import re
-
         quoted: list[str] = re.findall(r'"([^"]{30,})"', reasoning_content)
         if quoted:
-            # Return the last substantial quote (likely the final answer attempt)
-            return quoted[-1]
+            # Filter out meta-commentary quotes
+            valid_quotes = [q for q in quoted if not meta_regex.search(q)]
+            if valid_quotes:
+                return valid_quotes[-1]
 
-        # Last resort: return the last paragraph of reasoning
+        # Last resort: return the last non-meta paragraph of reasoning
         paragraphs = [p.strip() for p in reasoning_content.split("\n\n") if p.strip()]
+
+        # Filter out meta-commentary paragraphs
+        substantive_paragraphs = []
+        for para in paragraphs:
+            # Skip paragraphs that are clearly meta-commentary
+            if meta_regex.search(para):
+                continue
+            # Skip paragraphs starting with common meta phrases
+            if para.startswith(("We need to", "The user", "So we", "I need", "Let me", "First,")):
+                continue
+            # Skip very short paragraphs (likely incomplete thoughts)
+            if len(para) < 30:
+                continue
+            substantive_paragraphs.append(para)
+
+        if substantive_paragraphs:
+            return substantive_paragraphs[-1][:500]
+
+        # If all paragraphs were filtered, return last paragraph anyway (truncated)
         if paragraphs:
-            last_para = paragraphs[-1]
-            # Clean up meta-commentary
-            if last_para.startswith(("We need to", "The user", "So we")) and len(paragraphs) > 1:
-                # Try the second-to-last paragraph
-                return paragraphs[-2][:500]
-            return last_para[:500]
+            return paragraphs[-1][:500]
 
         return reasoning_content[:500]
 

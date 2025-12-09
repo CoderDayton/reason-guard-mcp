@@ -626,6 +626,33 @@ GROQ_CONFIG = ModelConfig(
     notes="Groq-hosted models. Apply underlying model's optimal config.",
 )
 
+# Zhipu AI GLM family (ChatGLM)
+GLM_CONFIG = ModelConfig(
+    name="Zhipu GLM-4",
+    temperature=0.7,
+    top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=4_096,
+    capabilities=_STANDARD_CAPS,
+    notes="Zhipu AI GLM-4 standard chat model.",
+)
+
+GLM_REASONING_CONFIG = ModelConfig(
+    name="Zhipu GLM-4 Reasoning",
+    temperature=0.7,
+    top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
+    capabilities=frozenset(
+        {
+            ModelCapability.IS_REASONING_MODEL,
+            ModelCapability.SUPPORTS_TEMPERATURE,
+            ModelCapability.SUPPORTS_TOP_P,
+        }
+    ),
+    notes="GLM-4 reasoning variant (TEE, thinking). Returns reasoning_content field.",
+)
+
 
 # =============================================================================
 # Pattern Matching for Model Identification
@@ -667,6 +694,9 @@ MODEL_PATTERNS: list[tuple[re.Pattern[str], ModelConfig]] = [
     (re.compile(r"command|cohere", re.IGNORECASE), COHERE_CONFIG),
     # MiniMax
     (re.compile(r"minimax|abab", re.IGNORECASE), MINIMAX_CONFIG),
+    # Zhipu GLM - TEE variant is reasoning model
+    (re.compile(r"glm.*tee|glm.*think|glm.*reason", re.IGNORECASE), GLM_REASONING_CONFIG),
+    (re.compile(r"glm|chatglm", re.IGNORECASE), GLM_CONFIG),
     # Groq (fallback - will use default config but flag as Groq)
     (re.compile(r"groq", re.IGNORECASE), GROQ_CONFIG),
 ]
