@@ -54,8 +54,8 @@ coverage.xml
 *.bin
 *.onnx
 *.safetensors
-models/
-model_cache/
+/models/
+/model_cache/
 
 # OS-specific
 .DS_Store
