@@ -225,9 +225,17 @@ class TestLLMClientGenerateAsync:
         ):
             client = LLMClient(api_key="sk-test")
 
+            # Create a proper mock that doesn't have 'text' attribute
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None
+            mock_message.model_dump.return_value = {"content": None, "role": "assistant"}
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "stop"
+
             mock_response = MagicMock()
-            mock_response.choices = [MagicMock()]
-            mock_response.choices[0].message.content = None
+            mock_response.choices = [mock_choice]
 
             mock_async_openai.return_value.chat.completions.create = AsyncMock(
                 return_value=mock_response

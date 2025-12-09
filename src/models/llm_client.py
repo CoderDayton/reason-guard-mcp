@@ -168,20 +168,50 @@ class LLMClient:
                 top_p=top_p,
             )
 
-            # Debug: log raw response structure
+            # Extract content with fallback for non-standard API responses
+            content: str | None = None
+            finish_reason: str | None = None
+
             if response.choices:
                 choice = response.choices[0]
-                content = choice.message.content
                 finish_reason = choice.finish_reason
+                content = choice.message.content
+
+                # Some APIs return content in alternative fields
+                if not content:
+                    # Check for 'text' field (some providers use this)
+                    msg = choice.message
+                    if hasattr(msg, "text") and msg.text:  # type: ignore[attr-defined]
+                        content = msg.text  # type: ignore[attr-defined]
+                    # Check model_dump for hidden fields
+                    elif hasattr(msg, "model_dump"):
+                        msg_dict = msg.model_dump()
+                        content = msg_dict.get("text") or msg_dict.get("output") or ""
+                        if content:
+                            logger.debug(
+                                f"Found content in alternative field: {list(msg_dict.keys())}"
+                            )
+
                 logger.debug(
                     f"Response: finish_reason={finish_reason}, "
                     f"content_len={len(content) if content else 0}, "
                     f"content_preview={content[:100] if content else 'EMPTY'}..."
                 )
+
+                # Warn on suspicious empty response with length finish reason
+                if not content and finish_reason == "length":
+                    raw_msg = (
+                        choice.message.model_dump()
+                        if hasattr(choice.message, "model_dump")
+                        else str(choice.message)
+                    )
+                    logger.warning(
+                        f"API returned finish_reason='length' but empty content. "
+                        f"Raw message: {raw_msg}"
+                    )
             else:
                 logger.warning(f"No choices in response: {response}")
 
-            content = response.choices[0].message.content
             return content or ""
 
         except Exception as e:
