@@ -6,60 +6,155 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![FastMCP 2.0](https://img.shields.io/badge/FastMCP-2.0-green.svg)](https://gofastmcp.com)
 
-A **production-ready MCP server** implementing advanced Chain-of-Thought reasoning techniques. Built with **FastMCP 2.0**, this server provides 6 powerful tools for LLM-enhanced reasoning:
+**Advanced Chain-of-Thought reasoning tools for LLMs.** Matrix-of-Thought, long-chain reasoning, semantic compression, and fact verification—all via MCP.
 
-| Tool | Description | Performance |
-|------|-------------|-------------|
-| **compress_prompt** | Semantic sentence-level compression | 10.93× faster than token-level methods |
-| **matrix_of_thought_reasoning** | Multi-dimensional reasoning (breadth + depth) | 7× faster than RATT, +4.2% F1 |
-| **long_chain_of_thought** | Sequential step-by-step reasoning | Exponential advantage for serial problems |
-| **verify_fact_consistency** | Claim-level fact checking | Prevents hallucinations |
-| **recommend_reasoning_strategy** | Auto-select optimal approach | Saves token budget |
-| **check_status** | Server health and diagnostics | Real-time monitoring |
+## Why MatrixMind?
 
-## Quick Start
+| Tool                           | What it does                                  | Benchmark                                |
+| ------------------------------ | --------------------------------------------- | ---------------------------------------- |
+| `compress_prompt`              | Semantic compression for long documents       | **10.9× faster** than token-level        |
+| `matrix_of_thought_reasoning`  | Multi-perspective reasoning (breadth × depth) | **+4.2% F1**, 7× faster than RATT        |
+| `long_chain_of_thought`        | Step-by-step reasoning with verification      | Exponential advantage on serial problems |
+| `verify_fact_consistency`      | Claim-level fact checking                     | Prevents hallucinations                  |
+| `recommend_reasoning_strategy` | Auto-select optimal approach                  | Saves token budget                       |
 
-### Option 1: Run with uvx (Recommended)
+## IDE Integration
+
+<details open>
+<summary><strong>VS Code</strong></summary>
+Add to your workspace or user settings (`.vscode/settings.json`):
+
+```json
+{
+  "servers": {
+    "matrixmind": {
+      "command": "uvx",
+      "args": ["matrixmind-mcp"],
+      "env": {
+        "OPENAI_API_KEY": "sk-your-key"
+      }
+    }
+  }
+}
+```
+
+<details>
+<summary><strong>Claude Desktop</strong></summary>
+
+Add to `~/.config/claude/claude_desktop_config.json` (Linux/Mac) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+
+```json
+{
+  "mcpServers": {
+    "matrixmind": {
+      "command": "uvx",
+      "args": ["matrixmind-mcp"],
+      "env": {
+        "OPENAI_API_KEY": "sk-your-key"
+      }
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Cursor</strong></summary>
+
+Add to `.cursor/mcp.json` in your project or `~/.cursor/mcp.json` globally:
+
+```json
+{
+  "mcpServers": {
+    "matrixmind": {
+      "command": "uvx",
+      "args": ["matrixmind-mcp"],
+      "env": {
+        "OPENAI_API_KEY": "sk-your-key"
+      }
+    }
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Continue</strong></summary>
+
+Add to your Continue config (`~/.continue/config.json`):
+
+```json
+{
+  "experimental": {
+    "modelContextProtocolServers": [
+      {
+        "transport": {
+          "type": "stdio",
+          "command": "uvx",
+          "args": ["matrixmind-mcp"]
+        }
+      }
+    ]
+  }
+}
+```
+
+</details>
+
+<details>
+<summary><strong>Other MCP Clients (HTTP mode)</strong></summary>
 
 ```bash
-# Set your OpenAI API key
-export OPENAI_API_KEY=sk-your-key-here
-
-# Run directly (no installation needed)
+export OPENAI_API_KEY=sk-your-key
+export SERVER_TRANSPORT=http
+export SERVER_PORT=8000
 uvx matrixmind-mcp
+# Connect to http://localhost:8000
 ```
 
-### Option 2: Install from Source
+</details>
+
+## Using Different LLM Providers
+
+Works with any OpenAI-compatible API:
 
 ```bash
-# Clone the repository
-git clone https://github.com/coderdayton/matrixmind-mcp.git
-cd matrixmind-mcp
+# OpenAI (default)
+export OPENAI_API_KEY=sk-your-key
 
-# Install with uv (recommended)
-uv sync --dev
+# Ollama (local)
+export OPENAI_BASE_URL=http://localhost:11434/v1
+export OPENAI_MODEL=llama3.3
 
-# Copy and configure environment
-cp .env.example .env
-# Edit .env and set your OPENAI_API_KEY
+# Azure OpenAI
+export OPENAI_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment
+export OPENAI_API_KEY=your-azure-key
 
-# Run the server
-python -m src.server
+# OpenRouter
+export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+export OPENAI_API_KEY=your-openrouter-key
+export OPENAI_MODEL=anthropic/claude-sonnet-4
 ```
 
-### Test the Installation
+## Workflow
 
-```bash
-# Run all tests
-make test
-
-# Run smoke tests only
-make test-smoke
+```
+┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ compress_prompt │ ──► │ matrix_of_thought │ ──► │ verify_fact_    │
+│ (if >3K tokens) │     │ OR long_chain    │     │ consistency     │
+└─────────────────┘     └──────────────────┘     └─────────────────┘
 ```
 
-## Tools Reference
+1. **Compress** long documents first (if >3000 tokens)
+2. **Reason** using MoT (multi-hop) or long_chain (serial problems)
+3. **Verify** the answer against context
 
-### 1. `compress_prompt`
+<details>
+<summary><strong>Full Tool Reference</strong></summary>
+
+### `compress_prompt`
 
 Compress long context using semantic sentence-level filtering.
 
@@ -73,9 +168,7 @@ Compress long context using semantic sentence-level filtering.
 
 **Returns:** `compressed_context`, `tokens_saved`, `compression_ratio`
 
-**Use when:** Input documents are >3000 tokens and you need faster reasoning.
-
-### 2. `matrix_of_thought_reasoning`
+### `matrix_of_thought_reasoning`
 
 Multi-dimensional reasoning combining breadth (strategies) and depth (refinement).
 
@@ -90,9 +183,7 @@ Multi-dimensional reasoning combining breadth (strategies) and depth (refinement
 
 **Returns:** `answer`, `confidence`, `reasoning_steps`, `matrix_shape`
 
-**Use when:** Multi-hop reasoning, complex constraints, need multiple perspectives.
-
-### 3. `long_chain_of_thought`
+### `long_chain_of_thought`
 
 Sequential step-by-step reasoning with verification checkpoints.
 
@@ -106,9 +197,7 @@ Sequential step-by-step reasoning with verification checkpoints.
 
 **Returns:** `answer`, `confidence`, `reasoning_steps`, `verification_results`
 
-**Use when:** Serial problems, constraint satisfaction, graph connectivity.
-
-### 4. `verify_fact_consistency`
+### `verify_fact_consistency`
 
 Verify answer claims against knowledge base/context.
 
@@ -122,9 +211,7 @@ Verify answer claims against knowledge base/context.
 
 **Returns:** `verified`, `confidence`, `claims_verified`, `claims_total`
 
-**Use when:** Quality assurance, preventing hallucinations, validating multi-fact answers.
-
-### 5. `recommend_reasoning_strategy`
+### `recommend_reasoning_strategy`
 
 Get recommendation for optimal reasoning approach.
 
@@ -137,9 +224,7 @@ Get recommendation for optimal reasoning approach.
 
 **Returns:** `recommended_strategy`, `estimated_depth_steps`, `explanation`
 
-**Use when:** Uncertain which method to use for a given problem.
-
-### 6. `check_status`
+### `check_status`
 
 Get server health and configuration status.
 
@@ -149,225 +234,123 @@ Get server health and configuration status.
 
 **Returns:** `model_loaded`, `gpu_memory`, `disk_space`, `llm_config`
 
-**Use when:** Debugging, monitoring, health checks.
-
-## Typical Workflow
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ compress_prompt │ ──► │ matrix_of_thought │ ──► │ verify_fact_    │
-│ (if long input) │     │ OR long_chain    │     │ consistency     │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-```
-
-1. **Compress** long documents first (if >3000 tokens)
-2. **Reason** using MoT (multi-hop) or long_chain (serial)
-3. **Verify** the answer against context
+</details>
 
 ## Configuration
 
-All configuration is done via environment variables:
+<details>
+<summary><strong>Environment Variables</strong></summary>
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `OPENAI_API_KEY` | OpenAI API key | - | **Yes** |
-| `OPENAI_BASE_URL` | Custom API endpoint (OpenAI-compatible) | OpenAI default | No |
-| `OPENAI_MODEL` | Model to use | `gpt-4.1` | No |
-| `EMBEDDING_MODEL` | Sentence embedding model | `Snowflake/snowflake-arctic-embed-xs` | No |
-| `EMBEDDING_CACHE_DIR` | Model cache directory | `~/.cache/matrixmind-mcp/models/` | No |
-| `LLM_TIMEOUT` | Request timeout in seconds | `60` | No |
-| `LLM_MAX_RETRIES` | Max retry attempts | `3` | No |
-| `SERVER_NAME` | MCP server name | `MatrixMind-MCP` | No |
-| `SERVER_TRANSPORT` | Transport mode: `stdio`, `http`, `sse` | `stdio` | No |
-| `SERVER_HOST` | Host for http/sse | `localhost` | No |
-| `SERVER_PORT` | Port for http/sse | `8000` | No |
-| `LOG_LEVEL` | Logging level | `INFO` | No |
+| Variable              | Description               | Default                               |
+| --------------------- | ------------------------- | ------------------------------------- |
+| `OPENAI_API_KEY`      | OpenAI API key            | **Required**                          |
+| `OPENAI_BASE_URL`     | Custom API endpoint       | OpenAI default                        |
+| `OPENAI_MODEL`        | Model to use              | `gpt-4.1`                             |
+| `EMBEDDING_MODEL`     | Sentence embedding model  | `Snowflake/snowflake-arctic-embed-xs` |
+| `EMBEDDING_CACHE_DIR` | Model cache directory     | `~/.cache/matrixmind-mcp/models/`     |
+| `LLM_TIMEOUT`         | Request timeout (seconds) | `60`                                  |
+| `LLM_MAX_RETRIES`     | Max retry attempts        | `3`                                   |
+| `SERVER_TRANSPORT`    | `stdio`, `http`, or `sse` | `stdio`                               |
+| `SERVER_HOST`         | Host for http/sse         | `localhost`                           |
+| `SERVER_PORT`         | Port for http/sse         | `8000`                                |
+| `LOG_LEVEL`           | Logging level             | `INFO`                                |
 
-### Using with Different Providers
+</details>
 
-```bash
-# OpenAI (default)
-export OPENAI_API_KEY=sk-your-key
-
-# Ollama (local)
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_MODEL=llama3.3
-
-# Azure OpenAI
-export OPENAI_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment
-export OPENAI_API_KEY=your-azure-key
-
-# OpenRouter (multi-provider)
-export OPENAI_BASE_URL=https://openrouter.ai/api/v1
-export OPENAI_API_KEY=your-openrouter-key
-export OPENAI_MODEL=anthropic/claude-sonnet-4
-```
-
-## Deployment Options
-
-### Option 1: Local Development (stdio)
+## Development
 
 ```bash
-uvx matrixmind-mcp
-# or
+# Clone and install
+git clone https://github.com/coderdayton/matrixmind-mcp.git
+cd matrixmind-mcp
+uv sync --dev
+
+# Run tests
+make test          # All tests
+make test-smoke    # Quick validation
+make test-e2e      # End-to-end MCP tests
+
+# Run locally
+cp .env.example .env  # Add your API key
 python -m src.server
 ```
 
-### Option 2: HTTP Server
+<details>
+<summary><strong>Docker</strong></summary>
 
 ```bash
-export SERVER_TRANSPORT=http
-export SERVER_PORT=8000
-python -m src.server
-# Server listens on http://localhost:8000
-```
-
-### Option 3: Docker
-
-```bash
-# Build image
 docker build -t matrixmind-mcp .
-
-# Run container
 docker run -e OPENAI_API_KEY=$OPENAI_API_KEY -p 8000:8000 matrixmind-mcp
 
-# Or use docker-compose
+# Or with docker-compose
 docker compose up -d
 ```
 
-### Option 4: FastMCP Cloud
+</details>
+
+<details>
+<summary><strong>FastMCP Cloud</strong></summary>
 
 ```bash
 fastmcp deploy src/server.py --name matrixmind-mcp --public
 ```
 
-## Testing
+</details>
 
-```bash
-# Run all tests
-make test
+## Performance
 
-# Run with coverage
-make test-cov
+| Metric              | Target           | Actual      |
+| ------------------- | ---------------- | ----------- |
+| Compression speed   | <0.5s/10K tokens | **0.28s**   |
+| MoT reasoning (3×4) | <5 min           | **3.2 min** |
+| Long chain per step | <30s             | **15-20s**  |
+| Verification        | <2s/10 claims    | **1.8s**    |
+| Quality (F1)        | +4% vs baseline  | **+4.2%**   |
+| Token reduction     | 30%              | **24-48%**  |
 
-# Run specific test categories
-make test-smoke      # Smoke tests
-make test-e2e        # End-to-end MCP tests
-pytest tests/test_integration.py -v    # Integration tests
-pytest tests/test_performance.py -v    # Load/stress tests
-
-# Run all checks (lint + typecheck)
-make check
-```
-
-## Project Structure
-
-```
-matrixmind-mcp/
-├── src/
-│   ├── server.py              # FastMCP server with 6 tools
-│   ├── tools/
-│   │   ├── compress.py        # CPC compression
-│   │   ├── mot_reasoning.py   # Matrix of Thought
-│   │   ├── long_chain.py      # Long chain reasoning
-│   │   └── verify.py          # Fact verification
-│   └── utils/
-│       ├── schema.py          # Type definitions
-│       ├── errors.py          # Custom exceptions
-│       ├── retry.py           # Retry decorators
-│       └── logging.py         # Structured logging
-├── tests/
-│   ├── test_smoke.py          # Quick validation tests
-│   ├── test_integration.py    # Pipeline tests
-│   ├── test_performance.py    # Load/stress tests
-│   ├── test_e2e_mcp.py        # End-to-end MCP tests
-│   └── conftest.py            # Test fixtures
-├── examples/
-│   ├── basic_usage.py         # Basic tool usage
-│   ├── multi_hop_qa.py        # Multi-hop reasoning
-│   └── constraint_solving.py  # Constraint problems
-├── .github/
-│   ├── workflows/
-│   │   ├── ci.yml             # Continuous integration
-│   │   └── release.yml        # PyPI publishing
-│   └── ISSUE_TEMPLATE/        # Bug reports, feature requests
-├── .env.example               # Environment template
-├── Dockerfile                 # Container build
-├── docker-compose.yml         # Container orchestration
-├── Makefile                   # Development commands
-├── pyproject.toml             # Project metadata
-└── CONTRIBUTING.md            # Contribution guidelines
-```
-
-## Performance Benchmarks
-
-| Metric | Target | Actual |
-|--------|--------|--------|
-| Compression speed | <0.5s/10K tokens | 0.28s avg |
-| MoT reasoning | <5 min (3×4 matrix) | 3.2 min avg |
-| Long chain | <30s per step | 15-20s avg |
-| Verification | <2s per 10 claims | 1.8s avg |
-| Quality (F1) | +4% vs baseline | +4.2% achieved |
-| Token efficiency | 30% reduction | 24-48% actual |
-
-## Troubleshooting
+<details>
+<summary><strong>Troubleshooting</strong></summary>
 
 ### "OpenAI API key not found"
 
 ```bash
 export OPENAI_API_KEY=sk-your-key-here
-# Or add to .env file (for local development)
 ```
 
 ### "CUDA out of memory"
 
-The embedding model runs on GPU if available. If you encounter memory issues:
-
 ```bash
-export EMBEDDING_MODEL=Snowflake/snowflake-arctic-embed-xs  # Default, ~90MB
-# Or use an even smaller model:
-export EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2  # ~80MB
+# Use a smaller embedding model (~80MB)
+export EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
 ```
 
 ### "Tool takes too long"
 
 ```bash
-export LLM_TIMEOUT=300  # Increase timeout to 5 minutes
+export LLM_TIMEOUT=300  # 5 minutes
 ```
 
 ### "Import errors"
 
 ```bash
-# Reinstall dependencies
 uv sync --dev --force-reinstall
 ```
 
-## Contributing
+</details>
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style, and contribution guidelines.
+## Research
 
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-### Research Papers
-
-This implementation synthesizes techniques from four research papers:
+This implementation synthesizes techniques from:
 
 - [Chain of Thought Empowers Transformers to Solve Inherently Serial Problems](https://arxiv.org/abs/2402.12875) (ICLR 2024)
 - [Let Me Think! A Long Chain-of-Thought Can Be Worth Exponentially Many Short Ones](https://arxiv.org/abs/2505.21825) (2025)
 - [Matrix of Thought: Re-evaluating Complex Reasoning](https://arxiv.org/abs/2509.03918) (2025)
 - [Prompt Compression with Context-Aware Sentence Encoding](https://arxiv.org/abs/2409.01227) (AAAI 2025)
 
-### Frameworks & Tools
+## License
 
-- [FastMCP](https://gofastmcp.com) — MCP framework
-- [Anthropic MCP](https://modelcontextprotocol.io) — Protocol specification
-- [Sentence Transformers](https://sbert.net) — Sentence embeddings
-- [Snowflake Arctic Embed](https://huggingface.co/Snowflake/snowflake-arctic-embed-xs) — Embedding model
+MIT — see [LICENSE](LICENSE)
 
 ---
 
-**Ready to enhance your LLM reasoning?** Start with `uvx matrixmind-mcp`
+**[Contributing](CONTRIBUTING.md)** · **[Issues](https://github.com/coderdayton/matrixmind-mcp/issues)** · Built with [FastMCP](https://gofastmcp.com)
