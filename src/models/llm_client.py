@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -14,6 +15,16 @@ from src.utils.retry import retry_with_backoff
 if TYPE_CHECKING:
     pass
 
+# Patterns that identify reasoning models needing higher token limits
+REASONING_MODEL_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"minimax", re.IGNORECASE),
+    re.compile(r"deepseek", re.IGNORECASE),
+    re.compile(r"qwen", re.IGNORECASE),
+    re.compile(r"\bo1\b", re.IGNORECASE),  # o1, o1-preview, o1-mini
+    re.compile(r"reasoning", re.IGNORECASE),
+    re.compile(r"think", re.IGNORECASE),
+]
+
 
 class LLMClient:
     """Wrapper around OpenAI LLM with retry logic and structured error handling.
@@ -24,11 +35,16 @@ class LLMClient:
     - Both sync and async interfaces
     - Token estimation utilities
     - Structured error handling
+    - Auto-detection of reasoning models with token multiplier
 
     Example:
         client = LLMClient(model="gpt-4-turbo")
         response = client.generate("What is 2+2?")
         print(response)  # "4"
+
+        # For reasoning models, tokens are auto-scaled:
+        client = LLMClient(model="deepseek-reasoner")
+        # max_tokens=300 becomes 900 (3x multiplier)
 
     """
 
@@ -39,6 +55,7 @@ class LLMClient:
         model: str = "gpt-4-turbo",
         timeout: int = 60,
         max_retries: int = 3,
+        reasoning_token_multiplier: float | None = None,
     ) -> None:
         """Initialize LLM client.
 
@@ -48,6 +65,9 @@ class LLMClient:
             model: Model name to use for completions.
             timeout: Request timeout in seconds.
             max_retries: Maximum retry attempts for failed requests.
+            reasoning_token_multiplier: Multiplier for max_tokens when using
+                reasoning models. If None, auto-detects based on model name
+                (3.0x for reasoning models, 1.0x for standard models).
 
         Raises:
             LLMException: If API key is not provided and not in environment.
@@ -60,6 +80,17 @@ class LLMClient:
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
+
+        # Auto-detect if this is a reasoning model
+        self._is_reasoning_model = self._detect_reasoning_model(model)
+
+        # Set token multiplier: explicit > auto-detect > default
+        if reasoning_token_multiplier is not None:
+            self._token_multiplier = reasoning_token_multiplier
+        elif self._is_reasoning_model:
+            self._token_multiplier = 3.0  # Reasoning models need ~3x tokens for CoT
+        else:
+            self._token_multiplier = 1.0
 
         # Initialize sync client
         self.client = OpenAI(
@@ -75,7 +106,38 @@ class LLMClient:
             timeout=timeout,
         )
 
-        logger.info(f"LLM client initialized with model: {model}")
+        if self._is_reasoning_model:
+            logger.info(
+                f"LLM client initialized with reasoning model: {model} "
+                f"(token multiplier: {self._token_multiplier}x)"
+            )
+        else:
+            logger.info(f"LLM client initialized with model: {model}")
+
+    @staticmethod
+    def _detect_reasoning_model(model_name: str) -> bool:
+        """Detect if model is a reasoning model based on name patterns.
+
+        Args:
+            model_name: The model identifier string.
+
+        Returns:
+            True if model appears to be a reasoning model.
+
+        """
+        return any(pattern.search(model_name) for pattern in REASONING_MODEL_PATTERNS)
+
+    def _scale_tokens(self, max_tokens: int) -> int:
+        """Scale max_tokens by the reasoning multiplier.
+
+        Args:
+            max_tokens: Original token limit requested.
+
+        Returns:
+            Scaled token limit for reasoning models.
+
+        """
+        return int(max_tokens * self._token_multiplier)
 
     @retry_with_backoff(max_attempts=3, base_delay=1.0)
     def generate(
@@ -110,10 +172,13 @@ class LLMClient:
 
             messages.append({"role": "user", "content": prompt})
 
+            # Scale tokens for reasoning models
+            scaled_tokens = self._scale_tokens(max_tokens)
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
-                max_tokens=max_tokens,
+                max_tokens=scaled_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )
@@ -158,12 +223,22 @@ class LLMClient:
 
             messages.append({"role": "user", "content": prompt})
 
-            logger.debug(f"Sending async request to {self.model} with {len(prompt)} char prompt")
+            # Scale tokens for reasoning models
+            scaled_tokens = self._scale_tokens(max_tokens)
+
+            logger.debug(
+                f"Sending async request to {self.model} with {len(prompt)} char prompt"
+                + (
+                    f" (tokens: {max_tokens}→{scaled_tokens})"
+                    if scaled_tokens != max_tokens
+                    else ""
+                )
+            )
 
             response = await self.async_client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
-                max_tokens=max_tokens,
+                max_tokens=scaled_tokens,
                 temperature=temperature,
                 top_p=top_p,
             )

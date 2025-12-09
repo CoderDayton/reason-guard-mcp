@@ -85,6 +85,69 @@ class TestLLMClientInit:
             assert client.max_retries == 5
 
 
+class TestLLMClientReasoningModelDetection:
+    """Test reasoning model auto-detection and token scaling."""
+
+    def test_standard_model_no_scaling(self) -> None:
+        """Test standard models have 1.0x token multiplier."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            assert client._is_reasoning_model is False
+            assert client._token_multiplier == 1.0
+            assert client._scale_tokens(300) == 300
+
+    def test_minimax_detected_as_reasoning(self) -> None:
+        """Test MiniMax models are detected as reasoning models."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="MiniMaxAI/MiniMax-M2")
+            assert client._is_reasoning_model is True
+            assert client._token_multiplier == 3.0
+            assert client._scale_tokens(300) == 900
+
+    def test_deepseek_detected_as_reasoning(self) -> None:
+        """Test DeepSeek models are detected as reasoning models."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="deepseek-reasoner")
+            assert client._is_reasoning_model is True
+            assert client._token_multiplier == 3.0
+
+    def test_qwen_detected_as_reasoning(self) -> None:
+        """Test Qwen models are detected as reasoning models."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="qwen-2.5-coder")
+            assert client._is_reasoning_model is True
+
+    def test_o1_detected_as_reasoning(self) -> None:
+        """Test o1 models are detected as reasoning models."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            for model in ["o1", "o1-preview", "o1-mini"]:
+                client = LLMClient(api_key="sk-test", model=model)
+                assert client._is_reasoning_model is True, f"{model} should be detected"
+
+    def test_explicit_multiplier_overrides_auto(self) -> None:
+        """Test explicit multiplier overrides auto-detection."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # Standard model with explicit high multiplier
+            client = LLMClient(
+                api_key="sk-test",
+                model="gpt-4-turbo",
+                reasoning_token_multiplier=2.5,
+            )
+            assert client._token_multiplier == 2.5
+            assert client._scale_tokens(400) == 1000
+
+    def test_explicit_multiplier_on_reasoning_model(self) -> None:
+        """Test explicit multiplier can override reasoning model default."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(
+                api_key="sk-test",
+                model="deepseek-r1",
+                reasoning_token_multiplier=4.0,  # Override default 3.0x
+            )
+            assert client._is_reasoning_model is True
+            assert client._token_multiplier == 4.0
+
+
 class TestLLMClientGenerate:
     """Test LLMClient.generate method."""
 
