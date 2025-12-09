@@ -69,6 +69,37 @@ class TestEnvHelpers:
         result = _get_env_int("INVALID_INT", 50)
         assert result == 50
 
+    def test_get_env_float_returns_float(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test _get_env_float returns float value."""
+        monkeypatch.setenv("FLOAT_KEY", "0.5")
+
+        from src.server import _get_env_float
+
+        result = _get_env_float("FLOAT_KEY", 0.7)
+        assert result == 0.5
+
+    def test_get_env_float_returns_default_when_not_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _get_env_float returns default when not set."""
+        monkeypatch.delenv("NONEXISTENT_FLOAT", raising=False)
+
+        from src.server import _get_env_float
+
+        result = _get_env_float("NONEXISTENT_FLOAT", 0.7)
+        assert result == 0.7
+
+    def test_get_env_float_invalid_value_returns_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test _get_env_float returns default for invalid float."""
+        monkeypatch.setenv("INVALID_FLOAT", "not_a_number")
+
+        from src.server import _get_env_float
+
+        result = _get_env_float("INVALID_FLOAT", 0.7)
+        assert result == 0.7
+
 
 class TestEmbeddingModelName:
     """Test embedding model name resolution."""

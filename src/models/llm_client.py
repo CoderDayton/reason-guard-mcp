@@ -56,6 +56,7 @@ class LLMClient:
         timeout: int = 60,
         max_retries: int = 3,
         reasoning_token_multiplier: float | None = None,
+        default_temperature: float = 0.7,
     ) -> None:
         """Initialize LLM client.
 
@@ -68,6 +69,9 @@ class LLMClient:
             reasoning_token_multiplier: Multiplier for max_tokens when using
                 reasoning models. If None, auto-detects based on model name
                 (3.0x for reasoning models, 1.0x for standard models).
+            default_temperature: Default sampling temperature (0.0-2.0).
+                Lower = more deterministic, higher = more creative.
+                Can be overridden per-call.
 
         Raises:
             LLMException: If API key is not provided and not in environment.
@@ -80,6 +84,7 @@ class LLMClient:
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
+        self.default_temperature = default_temperature
 
         # Auto-detect if this is a reasoning model
         self._is_reasoning_model = self._detect_reasoning_model(model)
@@ -144,7 +149,7 @@ class LLMClient:
         self,
         prompt: str,
         max_tokens: int = 2000,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         top_p: float = 0.9,
         system_prompt: str | None = None,
     ) -> str:
@@ -153,7 +158,8 @@ class LLMClient:
         Args:
             prompt: User prompt/question.
             max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature (0.0-2.0).
+            temperature: Sampling temperature (0.0-2.0). If None, uses
+                the client's default_temperature.
             top_p: Top-p (nucleus) sampling parameter.
             system_prompt: Optional system message to set context.
 
@@ -175,11 +181,16 @@ class LLMClient:
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
 
+            # Use provided temperature or fall back to default
+            actual_temperature = (
+                temperature if temperature is not None else self.default_temperature
+            )
+
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=scaled_tokens,
-                temperature=temperature,
+                temperature=actual_temperature,
                 top_p=top_p,
             )
 
@@ -195,7 +206,7 @@ class LLMClient:
         self,
         prompt: str,
         max_tokens: int = 2000,
-        temperature: float = 0.7,
+        temperature: float | None = None,
         top_p: float = 0.9,
         system_prompt: str | None = None,
     ) -> str:
@@ -204,7 +215,8 @@ class LLMClient:
         Args:
             prompt: User prompt/question.
             max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature (0.0-2.0).
+            temperature: Sampling temperature (0.0-2.0). If None, uses
+                the client's default_temperature.
             top_p: Top-p (nucleus) sampling parameter.
             system_prompt: Optional system message to set context.
 
@@ -226,6 +238,11 @@ class LLMClient:
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
 
+            # Use provided temperature or fall back to default
+            actual_temperature = (
+                temperature if temperature is not None else self.default_temperature
+            )
+
             logger.debug(
                 f"Sending async request to {self.model} with {len(prompt)} char prompt"
                 + (
@@ -239,7 +256,7 @@ class LLMClient:
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=scaled_tokens,
-                temperature=temperature,
+                temperature=actual_temperature,
                 top_p=top_p,
             )
 

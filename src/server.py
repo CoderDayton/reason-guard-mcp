@@ -53,6 +53,17 @@ def _get_env_int(key: str, default: int) -> int:
     return default
 
 
+def _get_env_float(key: str, default: float) -> float:
+    """Get environment variable as float."""
+    value = os.getenv(key)
+    if value:
+        try:
+            return float(value)
+        except ValueError:
+            logger.warning(f"Invalid float for {key}: {value}, using default {default}")
+    return default
+
+
 # =============================================================================
 # Configuration from Environment Variables
 # =============================================================================
@@ -63,6 +74,7 @@ OPENAI_BASE_URL = _get_env("OPENAI_BASE_URL") or None  # None = use default Open
 OPENAI_MODEL = _get_env("OPENAI_MODEL", "gpt-4.1")
 LLM_TIMEOUT = _get_env_int("LLM_TIMEOUT", 60)
 LLM_MAX_RETRIES = _get_env_int("LLM_MAX_RETRIES", 3)
+LLM_TEMPERATURE = _get_env_float("LLM_TEMPERATURE", 0.7)
 
 # Model Configuration
 EMBEDDING_MODEL = _get_env("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-xs")
@@ -154,6 +166,7 @@ def get_llm_client() -> LLMClient:
             model=OPENAI_MODEL,
             timeout=LLM_TIMEOUT,
             max_retries=LLM_MAX_RETRIES,
+            default_temperature=LLM_TEMPERATURE,
         )
     return _llm_client
 

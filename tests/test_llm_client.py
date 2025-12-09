@@ -124,6 +124,17 @@ class TestLLMClientReasoningModelDetection:
                 client = LLMClient(api_key="sk-test", model=model)
                 assert client._is_reasoning_model is True, f"{model} should be detected"
 
+    def test_default_temperature(self) -> None:
+        """Test default temperature is stored and used."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # Default temperature
+            client = LLMClient(api_key="sk-test")
+            assert client.default_temperature == 0.7
+
+            # Custom temperature
+            client = LLMClient(api_key="sk-test", default_temperature=0.3)
+            assert client.default_temperature == 0.3
+
     def test_explicit_multiplier_overrides_auto(self) -> None:
         """Test explicit multiplier overrides auto-detection."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
