@@ -1,4 +1,4 @@
-# Enhanced Chain-of-Thought MCP Server
+# MatrixMind MCP Server
 # Multi-stage build for smaller final image
 
 # Stage 1: Build dependencies
@@ -33,7 +33,6 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
 COPY src/ ./src/
-COPY config.yaml ./
 COPY pyproject.toml ./
 
 # Create non-root user
@@ -47,6 +46,11 @@ RUN mkdir -p logs
 # Environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+
+# Default server configuration (can be overridden)
+ENV SERVER_TRANSPORT=http
+ENV SERVER_HOST=0.0.0.0
+ENV SERVER_PORT=8000
 
 # Expose port for HTTP transport
 EXPOSE 8000

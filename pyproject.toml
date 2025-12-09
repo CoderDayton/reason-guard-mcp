@@ -1,11 +1,11 @@
 [project]
-name = "enhanced-cot-mcp"
+name = "matrixmind-mcp"
 version = "0.1.0"
 description = "Enhanced Chain-of-Thought MCP Server with FastMCP 2.0"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Enhanced CoT Team" }]
+authors = [{ name = "MatrixMind Team" }]
 keywords = ["mcp", "chain-of-thought", "reasoning", "llm", "fastmcp"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,12 +48,12 @@ dev = [
 ]
 
 [project.scripts]
-enhanced-cot-mcp = "src.server:main"
+matrixmind-mcp = "src.server:main"
 
 [project.urls]
-Homepage = "https://github.com/enhanced-cot-mcp/enhanced-cot-mcp"
-Documentation = "https://github.com/enhanced-cot-mcp/enhanced-cot-mcp#readme"
-Repository = "https://github.com/enhanced-cot-mcp/enhanced-cot-mcp"
+Homepage = "https://github.com/coderdayton/matrixmind-mcp"
+Documentation = "https://github.com/coderdayton/matrixmind-mcp#readme"
+Repository = "https://github.com/coderdayton/matrixmind-mcp"
 
 [build-system]
 requires = ["hatchling"]
@@ -66,6 +66,12 @@ packages = ["src"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+markers = [
+    "integration: marks tests requiring OPENAI_API_KEY (run with '-m integration')",
+    "stress: marks tests as stress tests (deselect with '-m \"not stress\"')",
+    "benchmark: marks tests as benchmarks for performance measurement",
+    "slow: marks tests as slow running",
+]
 
 [tool.mypy]
 python_version = "3.11"
@@ -84,7 +90,7 @@ ignore = [
     "D401",  # First line imperative mood - too strict for decorators
     "D417",  # Missing ctx arg in docstring - FastMCP injects it
     "N812",  # Lowercase import as non-lowercase - torch.nn.functional as F is standard
-    "N818",  # Exception suffix - EnhancedCoTException is acceptable
+    "N818",  # Exception suffix - MatrixMindException is acceptable
 ]
 
 [tool.bandit]

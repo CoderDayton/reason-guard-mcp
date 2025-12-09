@@ -1,23 +1,24 @@
-# Docker Compose for Enhanced CoT MCP Server
+# Docker Compose for MatrixMind MCP Server
 # Usage: docker compose up -d
 
 services:
-  cot-mcp:
+  matrixmind-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: enhanced-cot-mcp
+    container_name: matrixmind-mcp
     ports:
       - "8000:8000"
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - LOG_LEVEL=INFO
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4-turbo}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - SERVER_TRANSPORT=http
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8000
     volumes:
       - ./logs:/app/logs
-      - ./config.yaml:/app/config.yaml:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -37,7 +38,7 @@ services:
   # Optional: Redis for caching (future enhancement)
   # redis:
   #   image: redis:7-alpine
-  #   container_name: cot-mcp-redis
+  #   container_name: matrixmind-redis
   #   ports:
   #     - "6379:6379"
   #   volumes:
