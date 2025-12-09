@@ -491,3 +491,81 @@ class TestLLMClientThinkTagStripping:
         Clean answer here."""
         result = client._strip_think_tags(content)
         assert result == "Clean answer here."
+
+
+class TestLLMClientGarbageDetection:
+    """Test LLMClient garbage response detection."""
+
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        """Create LLM client for testing."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            return LLMClient(api_key="sk-test")
+
+    def test_valid_prose_passes(self, client: LLMClient) -> None:
+        """Test that valid prose content passes validation."""
+        content = "Einstein developed special relativity in 1905."
+        result = client._validate_and_clean_content(content)
+        assert result == content
+
+    def test_valid_code_passes(self, client: LLMClient) -> None:
+        """Test that valid code content passes validation."""
+        content = """def hello_world():
+    print("Hello, world!")
+    return 42"""
+        result = client._validate_and_clean_content(content)
+        assert result == content
+
+    def test_empty_content_returns_empty(self, client: LLMClient) -> None:
+        """Test that empty content returns empty string."""
+        assert client._validate_and_clean_content("") == ""
+
+    def test_garbage_punctuation_detected(self, client: LLMClient) -> None:
+        """Test that strings of punctuation/whitespace are detected as garbage."""
+        garbage = ",   ,           ,   , ,       ,   ,           ,   , ,"
+        result = client._validate_and_clean_content(garbage)
+        assert result == ""
+
+    def test_garbage_repeated_chars_detected(self, client: LLMClient) -> None:
+        """Test that highly repetitive content is detected as garbage."""
+        # 100 commas with a few spaces - very low unique char ratio
+        garbage = "," * 80 + " " * 20
+        result = client._validate_and_clean_content(garbage)
+        assert result == ""
+
+    def test_low_alphanumeric_ratio_detected(self, client: LLMClient) -> None:
+        """Test that content with very low alphanumeric ratio is garbage."""
+        # Only 10% alphanumeric
+        garbage = "abc" + "!@#$%^&*()_+-=[]{}|;':\",./<>?" * 3
+        result = client._validate_and_clean_content(garbage)
+        assert result == ""
+
+    def test_borderline_content_passes(self, client: LLMClient) -> None:
+        """Test that borderline but valid content passes."""
+        # JSON-like content has lower alphanumeric ratio but should still pass
+        content = '{"key": "value", "number": 42, "array": [1, 2, 3]}'
+        result = client._validate_and_clean_content(content)
+        assert result == content
+
+    def test_short_punctuation_passes(self, client: LLMClient) -> None:
+        """Test that short punctuation strings are not flagged as repetitive garbage."""
+        # Short content shouldn't trigger repetition check
+        content = "..."
+        result = client._validate_and_clean_content(content)
+        # This will fail alphanumeric ratio check, not repetition
+        assert result == ""
+
+    def test_markdown_with_formatting_passes(self, client: LLMClient) -> None:
+        """Test that markdown with special chars passes."""
+        content = """# Heading
+
+**Bold text** and *italic text*
+
+- List item 1
+- List item 2
+
+```python
+print("code")
+```"""
+        result = client._validate_and_clean_content(content)
+        assert result == content

@@ -292,6 +292,10 @@ class LLMClient:
                     f"content_preview={content[:100] if content else 'EMPTY'}..."
                 )
 
+                # Validate content quality - detect garbage responses
+                if content:
+                    content = self._validate_and_clean_content(content)
+
                 # Warn on suspicious empty response with length finish reason
                 if not content and finish_reason == "length":
                     raw_msg = (
@@ -467,4 +471,59 @@ class LLMClient:
                 return self._extract_answer_from_reasoning(thinking_content)
 
         # No think tags, return content as-is
+        return content
+
+    def _validate_and_clean_content(self, content: str) -> str:
+        """Validate response content quality and clean garbage responses.
+
+        Detects common failure modes where models return garbage:
+        - Strings of repeated punctuation/whitespace
+        - Very low alphanumeric character ratio
+        - Repeated character sequences
+
+        Args:
+            content: The response content to validate.
+
+        Returns:
+            The original content if valid, empty string if garbage detected.
+
+        """
+        if not content:
+            return ""
+
+        # Calculate alphanumeric ratio
+        alphanumeric_count = sum(1 for c in content if c.isalnum())
+        total_chars = len(content)
+
+        if total_chars == 0:
+            return ""
+
+        alphanumeric_ratio = alphanumeric_count / total_chars
+
+        # Content should have at least 20% alphanumeric characters
+        # Valid prose typically has 70-85%, even code has 40-60%
+        min_ratio = 0.20
+
+        if alphanumeric_ratio < min_ratio:
+            logger.warning(
+                f"Garbage response detected: alphanumeric ratio {alphanumeric_ratio:.2%} "
+                f"(threshold: {min_ratio:.0%}). Content preview: {content[:100]!r}"
+            )
+            return ""
+
+        # Check for excessive character repetition (e.g., ",,,,,,," or "      ")
+        # Count unique characters vs total
+        unique_chars = len(set(content))
+        repetition_ratio = unique_chars / total_chars
+
+        # If very few unique characters relative to length, likely garbage
+        # (e.g., ",   ,   ,   ," has ~4 unique chars but could be 100+ length)
+        if total_chars > 50 and repetition_ratio < 0.05:
+            logger.warning(
+                f"Garbage response detected: repetition ratio {repetition_ratio:.2%} "
+                f"(only {unique_chars} unique chars in {total_chars}). "
+                f"Content preview: {content[:100]!r}"
+            )
+            return ""
+
         return content
