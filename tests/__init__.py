@@ -1,1 +1,1 @@
-"""Tests for Enhanced CoT MCP Server."""
+"""Tests for MatrixMind MCP Server."""

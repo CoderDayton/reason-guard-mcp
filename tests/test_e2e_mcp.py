@@ -52,6 +52,7 @@ class TestMCPProtocol:
                 "long_chain_of_thought",
                 "verify_fact_consistency",
                 "recommend_reasoning_strategy",
+                "check_status",
             }
 
             assert tool_names == expected_tools, f"Missing tools: {expected_tools - tool_names}"
@@ -155,12 +156,15 @@ class TestMCPProtocol:
 
         with patch("src.server.get_mot_tool") as mock_get_tool:
             mock_tool = MagicMock()
-            mock_tool.reason.return_value = ReasoningResult(
-                answer="The answer is 42.",
-                confidence=0.85,
-                reasoning_steps=["Step 1", "Step 2"],
-                reasoning_trace={"matrix": [[1, 2], [3, 4]]},
-                tokens_used=500,
+            # Mock the async method used by the server
+            mock_tool.reason_async = AsyncMock(
+                return_value=ReasoningResult(
+                    answer="The answer is 42.",
+                    confidence=0.85,
+                    reasoning_steps=["Step 1", "Step 2"],
+                    reasoning_trace={"matrix": [[1, 2], [3, 4]]},
+                    tokens_used=500,
+                )
             )
             mock_get_tool.return_value = mock_tool
 
@@ -190,12 +194,15 @@ class TestMCPProtocol:
 
         with patch("src.server.get_long_chain_tool") as mock_get_tool:
             mock_tool = MagicMock()
-            mock_tool.reason.return_value = ReasoningResult(
-                answer="Step-by-step answer.",
-                confidence=0.78,
-                reasoning_steps=["Step 1", "Step 2", "Step 3"],
-                verification_results={"passed": True},
-                tokens_used=800,
+            # Mock the async method used by the server
+            mock_tool.reason_async = AsyncMock(
+                return_value=ReasoningResult(
+                    answer="Step-by-step answer.",
+                    confidence=0.78,
+                    reasoning_steps=["Step 1", "Step 2", "Step 3"],
+                    verification_results={"passed": True},
+                    tokens_used=800,
+                )
             )
             mock_get_tool.return_value = mock_tool
 
@@ -224,13 +231,16 @@ class TestMCPProtocol:
 
         with patch("src.server.get_verify_tool") as mock_get_tool:
             mock_tool = MagicMock()
-            mock_tool.verify.return_value = VerificationResult(
-                verified=True,
-                confidence=0.95,
-                claims_verified=3,
-                claims_total=3,
-                reason="All claims verified.",
-                claim_details=[{"claim": "Test", "status": "supported"}],
+            # Mock the async method used by the server
+            mock_tool.verify_async = AsyncMock(
+                return_value=VerificationResult(
+                    verified=True,
+                    confidence=0.95,
+                    claims_verified=3,
+                    claims_total=3,
+                    reason="All claims verified.",
+                    claim_details=[{"claim": "Test", "status": "supported"}],
+                )
             )
             mock_get_tool.return_value = mock_tool
 
@@ -307,7 +317,7 @@ class TestMCPServerInitialization:
         """Test that server name is properly configured."""
         from src.server import mcp
 
-        assert mcp.name == "Enhanced-CoT-MCP"
+        assert mcp.name == "MatrixMind-MCP"
 
     @pytest.mark.asyncio
     async def test_client_can_ping_server(self) -> None:

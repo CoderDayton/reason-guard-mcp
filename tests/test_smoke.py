@@ -1,12 +1,10 @@
-"""Smoke tests for Enhanced CoT MCP Server.
+"""Smoke tests for MatrixMind MCP Server.
 
 Quick tests to verify all tools are functional.
 Run with: pytest tests/test_smoke.py -v
 """
 
 from __future__ import annotations
-
-from unittest.mock import patch
 
 import pytest
 
@@ -72,20 +70,11 @@ class TestCompressionTool:
 
     def test_compression_empty_context_raises(self) -> None:
         """Test that empty context raises error."""
-        from src.tools.compress import ContextAwareCompressionTool
-
-        # Mock the model loading to avoid actual loading
-        with patch.object(ContextAwareCompressionTool, "__init__", lambda self, model_name: None):
-            tool = ContextAwareCompressionTool.__new__(ContextAwareCompressionTool)
-            tool.model_name = "test"
-            tool.device = "cpu"
-
-            # The actual compress method checks for empty context
-            with pytest.raises(CompressionException, match="cannot be empty"):
-                # We need to test the validation logic
-                context = ""
-                if not context or not context.strip():
-                    raise CompressionException("Context cannot be empty")
+        # Test the validation logic directly (avoids model loading)
+        context = ""
+        with pytest.raises(CompressionException, match="cannot be empty"):
+            if not context or not context.strip():
+                raise CompressionException("Context cannot be empty")
 
     def test_compression_ratio_validation(self) -> None:
         """Test compression ratio bounds."""

@@ -1,10 +1,10 @@
-"""Integration tests for Enhanced CoT MCP Server.
+"""Integration tests for MatrixMind MCP Server.
 
 Tests full pipeline: compress → reason → verify
 Requires OPENAI_API_KEY to be set.
 
-Run with: pytest tests/test_integration.py -v --ignore-glob="**/test_integration.py"
-Or with live API: OPENAI_API_KEY=sk-... pytest tests/test_integration.py -v
+Run with: pytest -m integration -v
+Or exclude: pytest -m "not integration"
 """
 
 from __future__ import annotations
@@ -15,10 +15,14 @@ from unittest.mock import MagicMock
 import pytest
 
 # Skip all tests if no API key (for CI without secrets)
-pytestmark = pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set - skipping integration tests",
-)
+# Also mark as integration tests for explicit selection
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not os.getenv("OPENAI_API_KEY"),
+        reason="OPENAI_API_KEY not set - skipping integration tests",
+    ),
+]
 
 
 @pytest.fixture
