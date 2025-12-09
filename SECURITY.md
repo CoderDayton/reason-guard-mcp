@@ -72,9 +72,9 @@ echo "OPENAI_API_KEY=sk-..." > .env
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp="https://github.com/OWNER/enhanced-cot-mcp.*" \
+  --certificate-identity-regexp="https://github.com/coderdayton/matrixmind-mcp.*" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-  ghcr.io/OWNER/enhanced-cot-mcp:latest
+  ghcr.io/OWNER/matrixmind-mcp:latest
 ```
 
 ### Dependency Management

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/coderdayton/matrixmind-mcp#readme
+    about: Check the README for usage guides and troubleshooting
+  - name: Discussions
+    url: https://github.com/coderdayton/matrixmind-mcp/discussions
+    about: Ask questions and share ideas with the community
+  - name: Security Vulnerabilities
+    url: https://github.com/coderdayton/matrixmind-mcp/security/advisories/new
+    about: Report security issues privately (do not use public issues)

@@ -1,0 +1,121 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "[Bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the form below.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Bug Description
+      description: A clear and concise description of the bug.
+      placeholder: What happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to Reproduce
+      description: Steps to reproduce the behavior.
+      placeholder: |
+        1. Run `uvx matrixmind-mcp`
+        2. Call tool `compress_prompt` with...
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error Logs
+      description: Paste any relevant error messages or logs.
+      render: shell
+      placeholder: |
+        Traceback (most recent call last):
+          File "...", line X, in <module>
+            ...
+        Error: ...
+
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Which tool is affected?
+      options:
+        - compress_prompt
+        - matrix_of_thought_reasoning
+        - long_chain_of_thought
+        - verify_fact_consistency
+        - recommend_reasoning_strategy
+        - check_status
+        - Multiple / All tools
+        - Not tool-specific
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: What version are you using? (`pip show matrixmind-mcp`)
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: python
+    attributes:
+      label: Python Version
+      options:
+        - "3.12"
+        - "3.11"
+        - "3.10"
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Docker
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment Details
+      description: Any other relevant environment info (GPU, provider, etc.)
+      placeholder: |
+        - LLM Provider: OpenAI / Ollama / Azure
+        - GPU: NVIDIA RTX 4090 / CPU only
+        - Transport: stdio / http
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I have searched existing issues to ensure this is not a duplicate
+          required: true
+        - label: I am using the latest version of matrixmind-mcp
+          required: false

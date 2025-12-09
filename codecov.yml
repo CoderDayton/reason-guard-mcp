@@ -1,0 +1,45 @@
+# Codecov Configuration
+# https://docs.codecov.com/docs/codecovyml-reference
+
+coverage:
+  precision: 2
+  round: down
+  range: "60...100"
+
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 5%  # Allow 5% drop before failing
+        informational: true  # Don't block PRs
+    patch:
+      default:
+        target: 80%
+        informational: true
+
+parsers:
+  gcov:
+    branch_detection:
+      conditional: true
+      loop: true
+      method: false
+      macro: false
+
+comment:
+  layout: "reach,diff,flags,files"
+  behavior: default
+  require_changes: true
+  require_base: false
+  require_head: true
+
+ignore:
+  - "tests/**/*"
+  - "examples/**/*"
+  - "**/__init__.py"
+  - "**/conftest.py"
+
+flags:
+  unittests:
+    paths:
+      - src/
+    carryforward: true
