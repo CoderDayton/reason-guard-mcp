@@ -9,6 +9,9 @@ from src.models.model_config import (
     DEEPSEEK_R1_CONFIG,
     DEEPSEEK_V3_CONFIG,
     DEFAULT_CONFIG,
+    DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    GEMINI_CONFIG,
     GEMMA_CONFIG,
     GPT4_CONFIG,
     GPT5_CONFIG,
@@ -19,6 +22,7 @@ from src.models.model_config import (
     QWEN_THINKING_CONFIG,
     ModelCapability,
     ModelConfig,
+    TruncationStrategy,
     get_api_params,
     get_effective_temperature,
     get_model_config,
@@ -515,3 +519,269 @@ class TestEdgeCases:
         assert DEFAULT_CONFIG.supports_temperature
         assert DEFAULT_CONFIG.supports_top_p
         assert not DEFAULT_CONFIG.is_reasoning_model
+
+
+# =============================================================================
+# Context window management tests
+# =============================================================================
+
+
+class TestContextWindowManagement:
+    """Tests for context window management methods."""
+
+    def test_estimate_tokens_basic(self) -> None:
+        """Test token estimation with known text."""
+        config = ModelConfig(name="test")
+        # 100 chars / 4 = 25 tokens
+        text = "a" * 100
+        assert config.estimate_tokens(text) == 25
+
+    def test_estimate_tokens_empty(self) -> None:
+        """Test token estimation with empty string."""
+        config = ModelConfig(name="test")
+        assert config.estimate_tokens("") == 0
+
+    def test_estimate_tokens_short(self) -> None:
+        """Test token estimation with very short text."""
+        config = ModelConfig(name="test")
+        # 3 chars / 4 = 0 (integer division)
+        assert config.estimate_tokens("abc") == 0
+        # 4 chars / 4 = 1
+        assert config.estimate_tokens("abcd") == 1
+
+    def test_effective_input_limit(self) -> None:
+        """Test effective_input_limit property."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=4000,
+        )
+        # output_reserve = min(4000, 2048) = 2048
+        # effective = 10000 - 2048 = 7952
+        assert config.effective_input_limit == 7952
+
+    def test_effective_input_limit_small_output(self) -> None:
+        """Test effective_input_limit with small max_output_tokens."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=1000,
+        )
+        # output_reserve = min(1000, 2048) = 1000
+        # effective = 10000 - 1000 = 9000
+        assert config.effective_input_limit == 9000
+
+    def test_effective_input_limit_minimum(self) -> None:
+        """Test effective_input_limit never goes below 1024."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=2000,
+            max_output_tokens=4000,
+        )
+        # output_reserve = min(4000, 2048) = 2048
+        # effective = max(2000 - 2048, 1024) = max(-48, 1024) = 1024
+        assert config.effective_input_limit == 1024
+
+    def test_fits_in_context_true(self) -> None:
+        """Test fits_in_context returns True for small text."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=2000,
+        )
+        # available = 10000 - 2000 = 8000 tokens = 32000 chars
+        small_text = "x" * 1000  # ~250 tokens
+        assert config.fits_in_context(small_text)
+
+    def test_fits_in_context_false(self) -> None:
+        """Test fits_in_context returns False for large text."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=1000,
+            max_output_tokens=500,
+        )
+        # available = 1000 - 500 = 500 tokens = 2000 chars
+        large_text = "x" * 5000  # ~1250 tokens
+        assert not config.fits_in_context(large_text)
+
+    def test_fits_in_context_with_reserve(self) -> None:
+        """Test fits_in_context with custom output reserve."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=8000,
+        )
+        # With default reserve (8000): available = 2000 tokens
+        # With custom reserve (1000): available = 9000 tokens
+        text = "x" * 10000  # ~2500 tokens
+        assert not config.fits_in_context(text)
+        assert config.fits_in_context(text, reserve_for_output=1000)
+
+    def test_fits_in_context_with_additional_tokens(self) -> None:
+        """Test fits_in_context with additional tokens."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=2000,
+            max_output_tokens=500,
+        )
+        # available = 2000 - 500 - 1000 = 500 tokens = 2000 chars
+        text = "x" * 1600  # ~400 tokens, should fit
+        assert config.fits_in_context(text, additional_tokens=1000)
+
+        text2 = "x" * 2400  # ~600 tokens, should not fit
+        assert not config.fits_in_context(text2, additional_tokens=1000)
+
+    def test_get_available_tokens_basic(self) -> None:
+        """Test get_available_tokens calculation."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=2000,
+        )
+        assert config.get_available_tokens() == 8000
+
+    def test_get_available_tokens_with_used(self) -> None:
+        """Test get_available_tokens with already used tokens."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=2000,
+        )
+        assert config.get_available_tokens(used_tokens=3000) == 5000
+
+    def test_get_available_tokens_never_negative(self) -> None:
+        """Test get_available_tokens never returns negative."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=1000,
+            max_output_tokens=500,
+        )
+        # available = max(0, 1000 - 500 - 1000) = 0
+        assert config.get_available_tokens(used_tokens=1000) == 0
+
+    def test_truncate_to_fit_no_truncation_needed(self) -> None:
+        """Test truncate_to_fit returns original when text fits."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=10000,
+            max_output_tokens=2000,
+        )
+        text = "short text"
+        result = config.truncate_to_fit(text)
+        assert result == text
+
+    def test_truncate_to_fit_keep_start(self) -> None:
+        """Test truncate_to_fit with KEEP_START strategy."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=100,
+            max_output_tokens=50,
+        )
+        # available = 50 tokens = 200 chars
+        text = "x" * 300
+        result = config.truncate_to_fit(text, strategy=TruncationStrategy.KEEP_START)
+        assert len(result) == 200
+        assert result == "x" * 200
+
+    def test_truncate_to_fit_keep_end(self) -> None:
+        """Test truncate_to_fit with KEEP_END strategy."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=100,
+            max_output_tokens=50,
+        )
+        # available = 50 tokens = 200 chars
+        text = "START" + "x" * 290 + "END!!"
+        result = config.truncate_to_fit(text, strategy=TruncationStrategy.KEEP_END)
+        assert len(result) == 200
+        assert result.endswith("END!!")
+        assert "START" not in result
+
+    def test_truncate_to_fit_keep_both_ends(self) -> None:
+        """Test truncate_to_fit with KEEP_BOTH_ENDS strategy."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=200,
+            max_output_tokens=50,
+        )
+        # available = 150 tokens = 600 chars
+        text = "START_" + "x" * 800 + "_FINISH"
+        result = config.truncate_to_fit(text, strategy=TruncationStrategy.KEEP_BOTH_ENDS)
+
+        # Should contain truncation marker
+        assert "[... content truncated ...]" in result
+        # Should have start portion
+        assert result.startswith("START_")
+        # Should have end portion
+        assert result.endswith("_FINISH")
+
+    def test_truncate_to_fit_error_strategy(self) -> None:
+        """Test truncate_to_fit raises error with ERROR strategy."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=100,
+            max_output_tokens=50,
+        )
+        text = "x" * 500  # Too long
+
+        with pytest.raises(ValueError, match="exceeds available context"):
+            config.truncate_to_fit(text, strategy=TruncationStrategy.ERROR)
+
+    def test_truncate_to_fit_with_additional_tokens(self) -> None:
+        """Test truncate_to_fit respects additional_tokens."""
+        config = ModelConfig(
+            name="test",
+            max_context_length=200,
+            max_output_tokens=50,
+        )
+        # available = 200 - 50 - 100 = 50 tokens = 200 chars
+        text = "x" * 300
+        result = config.truncate_to_fit(text, additional_tokens=100)
+        assert len(result) == 200
+
+
+class TestContextLengthValues:
+    """Tests for actual context length values in model configs."""
+
+    def test_gpt5_context_length(self) -> None:
+        """Test GPT-5 has correct context length."""
+        assert GPT5_CONFIG.max_context_length == 128_000
+        assert GPT5_CONFIG.max_output_tokens == 16_384
+
+    def test_gpt4_context_length(self) -> None:
+        """Test GPT-4 has correct context length."""
+        assert GPT4_CONFIG.max_context_length == 128_000
+        assert GPT4_CONFIG.max_output_tokens == 16_384
+
+    def test_o1_context_length(self) -> None:
+        """Test o1/o3 has larger context for reasoning."""
+        assert O1_CONFIG.max_context_length == 200_000
+        assert O1_CONFIG.max_output_tokens == 100_000
+
+    def test_deepseek_context_length(self) -> None:
+        """Test DeepSeek models have correct context lengths."""
+        assert DEEPSEEK_V3_CONFIG.max_context_length == 64_000
+        assert DEEPSEEK_R1_CONFIG.max_context_length == 64_000
+
+    def test_claude_context_length(self) -> None:
+        """Test Claude has correct context length."""
+        assert CLAUDE_CONFIG.max_context_length == 200_000
+        assert CLAUDE_CONFIG.max_output_tokens == 8_192
+
+    def test_gemini_context_length(self) -> None:
+        """Test Gemini 1.5 Pro has 2M context."""
+        assert GEMINI_CONFIG.max_context_length == 2_000_000
+
+    def test_llama4_context_length(self) -> None:
+        """Test Llama 4 has correct context length."""
+        assert LLAMA4_CONFIG.max_context_length == 128_000
+
+    def test_default_context_constants(self) -> None:
+        """Test default context constants are exported."""
+        assert DEFAULT_CONTEXT_LENGTH == 8192
+        assert DEFAULT_MAX_OUTPUT_TOKENS == 4096
+
+    def test_default_config_uses_defaults(self) -> None:
+        """Test DEFAULT_CONFIG uses default context values."""
+        assert DEFAULT_CONFIG.max_context_length == DEFAULT_CONTEXT_LENGTH
+        assert DEFAULT_CONFIG.max_output_tokens == DEFAULT_MAX_OUTPUT_TOKENS

@@ -15,6 +15,10 @@ Usage:
 
     params = config.to_api_params()
     # Returns dict suitable for API calls, excluding unsupported params
+
+    # Context window management
+    truncated = config.truncate_to_context(long_text, reserve_output=4096)
+    fits = config.fits_in_context(text, reserve_output=4096)
 """
 
 from __future__ import annotations
@@ -38,6 +42,24 @@ class ModelCapability(Enum):
     MUTUALLY_EXCLUSIVE_SAMPLING = "mutually_exclusive_sampling"
 
 
+class TruncationStrategy(Enum):
+    """Strategy for truncating content that exceeds context window."""
+
+    # Keep the beginning of the text (most common for prompts)
+    KEEP_START = "keep_start"
+    # Keep the end of the text (useful for recent context)
+    KEEP_END = "keep_end"
+    # Keep both start and end, remove middle (good for long documents)
+    KEEP_BOTH_ENDS = "keep_both_ends"
+    # No truncation - raise error if content exceeds limit
+    ERROR = "error"
+
+
+# Default context length for unknown models (conservative estimate)
+DEFAULT_CONTEXT_LENGTH = 8192
+DEFAULT_MAX_OUTPUT_TOKENS = 4096
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Configuration for a specific model or model family.
@@ -49,6 +71,8 @@ class ModelConfig:
         top_k: Optimal top_k sampling (None if not supported).
         frequency_penalty: Penalty for token frequency (None if not supported).
         presence_penalty: Penalty for token presence (None if not supported).
+        max_context_length: Maximum context window in tokens.
+        max_output_tokens: Maximum output tokens the model can generate.
         capabilities: Set of ModelCapability flags.
         notes: Human-readable notes about optimal usage.
 
@@ -60,6 +84,8 @@ class ModelConfig:
     top_k: int | None = None
     frequency_penalty: float | None = None
     presence_penalty: float | None = None
+    max_context_length: int = DEFAULT_CONTEXT_LENGTH
+    max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS
     capabilities: frozenset[ModelCapability] = field(
         default_factory=lambda: frozenset(
             {ModelCapability.SUPPORTS_TEMPERATURE, ModelCapability.SUPPORTS_TOP_P}
@@ -90,6 +116,133 @@ class ModelConfig:
     def has_mutually_exclusive_sampling(self) -> bool:
         """Check if temp and top_p cannot be used together."""
         return ModelCapability.MUTUALLY_EXCLUSIVE_SAMPLING in self.capabilities
+
+    @property
+    def effective_input_limit(self) -> int:
+        """Get max input tokens (context minus typical output reservation)."""
+        # Reserve space for output - use half of max_output or 2048, whichever is smaller
+        output_reserve = min(self.max_output_tokens, 2048)
+        return max(self.max_context_length - output_reserve, 1024)
+
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count for text.
+
+        Uses the approximation that 1 token ≈ 4 characters for English text.
+        For more accurate counts, use tiktoken library.
+
+        Args:
+            text: Text to estimate token count for.
+
+        Returns:
+            Estimated token count.
+
+        """
+        return len(text) // 4
+
+    def fits_in_context(
+        self,
+        text: str,
+        *,
+        reserve_for_output: int | None = None,
+        additional_tokens: int = 0,
+    ) -> bool:
+        """Check if text fits within the model's context window.
+
+        Args:
+            text: Text to check.
+            reserve_for_output: Tokens to reserve for model output.
+                If None, uses max_output_tokens.
+            additional_tokens: Extra tokens to account for (e.g., system prompt).
+
+        Returns:
+            True if text fits within available context.
+
+        """
+        reserve = reserve_for_output if reserve_for_output is not None else self.max_output_tokens
+        available = self.max_context_length - reserve - additional_tokens
+        estimated = self.estimate_tokens(text)
+        return estimated <= available
+
+    def get_available_tokens(
+        self,
+        *,
+        reserve_for_output: int | None = None,
+        used_tokens: int = 0,
+    ) -> int:
+        """Calculate available tokens for input.
+
+        Args:
+            reserve_for_output: Tokens to reserve for model output.
+                If None, uses max_output_tokens.
+            used_tokens: Tokens already used (e.g., system prompt).
+
+        Returns:
+            Number of tokens available for additional input.
+
+        """
+        reserve = reserve_for_output if reserve_for_output is not None else self.max_output_tokens
+        return max(0, self.max_context_length - reserve - used_tokens)
+
+    def truncate_to_fit(
+        self,
+        text: str,
+        *,
+        reserve_for_output: int | None = None,
+        additional_tokens: int = 0,
+        strategy: TruncationStrategy = TruncationStrategy.KEEP_START,
+    ) -> str:
+        """Truncate text to fit within context window.
+
+        Args:
+            text: Text to truncate.
+            reserve_for_output: Tokens to reserve for model output.
+                If None, uses max_output_tokens.
+            additional_tokens: Extra tokens to account for (e.g., system prompt).
+            strategy: How to truncate (keep start, end, or both).
+
+        Returns:
+            Truncated text that fits within context.
+
+        Raises:
+            ValueError: If strategy is ERROR and text exceeds limit.
+
+        """
+        reserve = reserve_for_output if reserve_for_output is not None else self.max_output_tokens
+        available_tokens = self.max_context_length - reserve - additional_tokens
+        available_chars = available_tokens * 4  # Reverse the token estimation
+
+        if len(text) <= available_chars:
+            return text
+
+        if strategy == TruncationStrategy.ERROR:
+            estimated = self.estimate_tokens(text)
+            raise ValueError(
+                f"Text ({estimated} tokens) exceeds available context "
+                f"({available_tokens} tokens) for model {self.name}"
+            )
+
+        if strategy == TruncationStrategy.KEEP_START:
+            return text[:available_chars]
+
+        if strategy == TruncationStrategy.KEEP_END:
+            return text[-available_chars:]
+
+        # KEEP_BOTH_ENDS: keep 40% from start, 60% from end
+        if strategy == TruncationStrategy.KEEP_BOTH_ENDS:
+            start_chars = int(available_chars * 0.4)
+            end_chars = available_chars - start_chars
+            truncation_marker = "\n\n[... content truncated ...]\n\n"
+            marker_allowance = len(truncation_marker)
+
+            if available_chars <= marker_allowance:
+                return text[:available_chars]
+
+            start_chars = int((available_chars - marker_allowance) * 0.4)
+            end_chars = available_chars - marker_allowance - start_chars
+
+            return text[:start_chars] + truncation_marker + text[-end_chars:]
+
+        return text[:available_chars]  # Fallback
 
     def to_api_params(
         self,
@@ -192,6 +345,8 @@ GPT5_CONFIG = ModelConfig(
     name="OpenAI GPT-5",
     temperature=0.7,
     top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=16_384,
     capabilities=_STANDARD_CAPS,
     notes="General: 0.7, Coding: 0.0-0.3. Alter temp OR top_p, not both recommended.",
 )
@@ -200,20 +355,40 @@ GPT5_CODING_CONFIG = ModelConfig(
     name="OpenAI GPT-5 (Coding)",
     temperature=0.2,
     top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=16_384,
     capabilities=_STANDARD_CAPS,
     notes="Lower temperature for deterministic code generation.",
 )
 
-# OpenAI GPT-4 family (legacy, same settings as GPT-5)
-GPT4_CONFIG = GPT5_CONFIG  # Alias for backward compatibility
+# OpenAI GPT-4 family (legacy, same context as GPT-5)
+GPT4_CONFIG = ModelConfig(
+    name="OpenAI GPT-4",
+    temperature=0.7,
+    top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=16_384,
+    capabilities=_STANDARD_CAPS,
+    notes="General: 0.7, Coding: 0.0-0.3. Alter temp OR top_p, not both recommended.",
+)
 
-GPT4_CODING_CONFIG = GPT5_CODING_CONFIG  # Alias for backward compatibility
+GPT4_CODING_CONFIG = ModelConfig(
+    name="OpenAI GPT-4 (Coding)",
+    temperature=0.2,
+    top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=16_384,
+    capabilities=_STANDARD_CAPS,
+    notes="Lower temperature for deterministic code generation.",
+)
 
 # OpenAI o1/o3 reasoning models - fixed sampling, no params supported
 O1_CONFIG = ModelConfig(
     name="OpenAI o1/o3 Reasoning",
     temperature=None,
     top_p=None,
+    max_context_length=200_000,
+    max_output_tokens=100_000,
     capabilities=_REASONING_CAPS,
     notes="Reasoning models use fixed temperature=1, top_p=1. Sampling params not supported.",
 )
@@ -223,6 +398,8 @@ DEEPSEEK_V3_CONFIG = ModelConfig(
     name="DeepSeek V3",
     temperature=0.3,
     top_p=None,
+    max_context_length=64_000,
+    max_output_tokens=8_192,
     capabilities=frozenset({ModelCapability.SUPPORTS_TEMPERATURE}),
     notes="API auto-scales temp (1.0→0.3). Coding: 0.0, Conversation: 1.3.",
 )
@@ -232,6 +409,8 @@ DEEPSEEK_R1_CONFIG = ModelConfig(
     name="DeepSeek R1",
     temperature=0.6,
     top_p=0.95,
+    max_context_length=64_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.IS_REASONING_MODEL,
@@ -247,6 +426,8 @@ MISTRAL_SMALL_CONFIG = ModelConfig(
     name="Mistral Small 3.2",
     temperature=0.15,
     top_p=None,
+    max_context_length=32_000,
+    max_output_tokens=8_192,
     capabilities=frozenset({ModelCapability.SUPPORTS_TEMPERATURE}),
     notes="Very low temperature recommended for Mistral Small.",
 )
@@ -255,6 +436,8 @@ MISTRAL_LARGE_CONFIG = ModelConfig(
     name="Mistral Large/Medium",
     temperature=0.7,
     top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
     notes="Standard settings for Mistral Large/Medium models.",
 )
@@ -263,6 +446,8 @@ MAGISTRAL_CONFIG = ModelConfig(
     name="Mistral Magistral (Reasoning)",
     temperature=0.7,
     top_p=0.95,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.IS_REASONING_MODEL,
@@ -279,6 +464,8 @@ QWEN_THINKING_CONFIG = ModelConfig(
     temperature=0.6,
     top_p=0.95,
     top_k=20,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.IS_REASONING_MODEL,
@@ -296,6 +483,8 @@ QWEN_NON_THINKING_CONFIG = ModelConfig(
     top_p=0.8,
     top_k=20,
     presence_penalty=1.5,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.SUPPORTS_TEMPERATURE,
@@ -312,6 +501,8 @@ LLAMA4_CONFIG = ModelConfig(
     name="Llama 4",
     temperature=0.6,
     top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
     notes="From Meta's generation_config.json.",
 )
@@ -320,6 +511,8 @@ LLAMA3_CONFIG = ModelConfig(
     name="Llama 3",
     temperature=0.6,
     top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
     notes="Standard settings for Llama 3 family.",
 )
@@ -330,6 +523,8 @@ GEMMA_CONFIG = ModelConfig(
     temperature=1.0,
     top_p=0.96,
     top_k=64,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=_WITH_TOP_K,
     notes="Higher temperature than typical. From HuggingFace config.",
 )
@@ -340,8 +535,10 @@ GEMINI_CONFIG = ModelConfig(
     temperature=0.7,
     top_p=0.95,
     top_k=40,
+    max_context_length=2_000_000,  # Gemini 1.5 Pro supports 2M tokens
+    max_output_tokens=8_192,
     capabilities=_WITH_TOP_K,
-    notes="Standard Gemini settings with top_k support.",
+    notes="Standard Gemini settings with top_k support. Gemini 1.5 Pro has 2M context.",
 )
 
 # Anthropic Claude family
@@ -349,6 +546,8 @@ CLAUDE_CONFIG = ModelConfig(
     name="Anthropic Claude",
     temperature=0.7,
     top_p=0.9,
+    max_context_length=200_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.SUPPORTS_TEMPERATURE,
@@ -364,6 +563,8 @@ PHI_CONFIG = ModelConfig(
     name="Microsoft Phi-4",
     temperature=0.7,
     top_p=0.95,
+    max_context_length=16_000,
+    max_output_tokens=4_096,
     capabilities=_STANDARD_CAPS,
     notes="Standard Phi-4 settings.",
 )
@@ -373,6 +574,8 @@ PHI_REASONING_CONFIG = ModelConfig(
     temperature=0.8,
     top_p=0.95,
     top_k=50,
+    max_context_length=16_000,
+    max_output_tokens=4_096,
     capabilities=frozenset(
         {
             ModelCapability.IS_REASONING_MODEL,
@@ -389,6 +592,8 @@ COHERE_CONFIG = ModelConfig(
     name="Cohere Command R+",
     temperature=0.3,
     top_p=0.75,
+    max_context_length=128_000,
+    max_output_tokens=4_096,
     capabilities=_STANDARD_CAPS,
     notes="Conservative defaults from Cohere docs.",
 )
@@ -398,6 +603,8 @@ MINIMAX_CONFIG = ModelConfig(
     name="MiniMax",
     temperature=0.7,
     top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=frozenset(
         {
             ModelCapability.IS_REASONING_MODEL,
@@ -413,6 +620,8 @@ GROQ_CONFIG = ModelConfig(
     name="Groq",
     temperature=0.7,
     top_p=0.9,
+    max_context_length=128_000,
+    max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
     notes="Groq-hosted models. Apply underlying model's optimal config.",
 )
