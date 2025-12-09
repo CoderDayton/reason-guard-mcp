@@ -158,6 +158,8 @@ class LLMClient:
 
             messages.append({"role": "user", "content": prompt})
 
+            logger.debug(f"Sending async request to {self.model} with {len(prompt)} char prompt")
+
             response = await self.async_client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
@@ -165,6 +167,19 @@ class LLMClient:
                 temperature=temperature,
                 top_p=top_p,
             )
+
+            # Debug: log raw response structure
+            if response.choices:
+                choice = response.choices[0]
+                content = choice.message.content
+                finish_reason = choice.finish_reason
+                logger.debug(
+                    f"Response: finish_reason={finish_reason}, "
+                    f"content_len={len(content) if content else 0}, "
+                    f"content_preview={content[:100] if content else 'EMPTY'}..."
+                )
+            else:
+                logger.warning(f"No choices in response: {response}")
 
             content = response.choices[0].message.content
             return content or ""
