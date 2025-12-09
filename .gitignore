@@ -4,7 +4,78 @@ __pycache__/
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.pyc
+*.pyo
+*.pyd
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+.env.local
+.env.*.local
+
+# Keep .env.example tracked, ignore actual secrets
+.env
+!.env.example
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Testing & Coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+coverage.xml
+*.cover
+*.log
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb
+
+# Model cache (large files, downloaded at runtime)
+*.pt
+*.pth
+*.bin
+*.onnx
+*.safetensors
+models/
+model_cache/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Documentation build
+docs/_build/
+docs/ref/
+site/
+
+# Package managers
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Docker
+*.pid
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
