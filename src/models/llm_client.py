@@ -179,18 +179,32 @@ class LLMClient:
 
                 # Some APIs return content in alternative fields
                 if not content:
-                    # Check for 'text' field (some providers use this)
                     msg = choice.message
-                    if hasattr(msg, "text") and msg.text:  # type: ignore[attr-defined]
-                        content = msg.text  # type: ignore[attr-defined]
-                    # Check model_dump for hidden fields
-                    elif hasattr(msg, "model_dump"):
+                    msg_dict: dict[str, str | None] = {}
+
+                    # Get all fields from message object
+                    if hasattr(msg, "model_dump"):
                         msg_dict = msg.model_dump()
-                        content = msg_dict.get("text") or msg_dict.get("output") or ""
-                        if content:
-                            logger.debug(
-                                f"Found content in alternative field: {list(msg_dict.keys())}"
-                            )
+
+                    # Priority order for content extraction:
+                    # 1. reasoning_content - used by reasoning models (MiniMax-M2, o1, etc.)
+                    # 2. text - used by some providers
+                    # 3. output - used by some providers
+                    reasoning_content = msg_dict.get("reasoning_content")
+                    if reasoning_content:
+                        # For reasoning models, extract the conclusion from reasoning
+                        # The reasoning_content contains chain-of-thought, we want the final answer
+                        content = self._extract_answer_from_reasoning(reasoning_content)
+                        logger.debug(
+                            f"Extracted from reasoning_content "
+                            f"({len(reasoning_content)} chars → {len(content)} chars)"
+                        )
+                    elif hasattr(msg, "text") and msg.text:  # type: ignore[attr-defined]
+                        content = msg.text  # type: ignore[attr-defined]
+                    elif msg_dict.get("text"):
+                        content = msg_dict["text"]
+                    elif msg_dict.get("output"):
+                        content = msg_dict["output"]
 
                 logger.debug(
                     f"Response: finish_reason={finish_reason}, "
@@ -249,3 +263,69 @@ class LLMClient:
             total += 4
             total += self.estimate_tokens(msg.get("content", ""))
         return total
+
+    def _extract_answer_from_reasoning(self, reasoning_content: str) -> str:
+        """Extract the final answer from reasoning model output.
+
+        Reasoning models (like MiniMax-M2, o1) return their chain-of-thought
+        in reasoning_content, with the actual answer being the conclusion.
+        This method extracts a usable answer from the reasoning trace.
+
+        Args:
+            reasoning_content: The raw reasoning chain from the model.
+
+        Returns:
+            Extracted answer or the last substantive part of reasoning.
+
+        """
+        if not reasoning_content:
+            return ""
+
+        # Common patterns that indicate the start of a final answer
+        answer_markers = [
+            "Thus we can produce:",
+            "Thus:",
+            "So we can write:",
+            "The answer is:",
+            "Final answer:",
+            "In conclusion:",
+            "Therefore:",
+            "So the answer is:",
+            "Potential answer:",
+        ]
+
+        # Try to find explicit answer markers
+        reasoning_lower = reasoning_content.lower()
+        for marker in answer_markers:
+            marker_lower = marker.lower()
+            if marker_lower in reasoning_lower:
+                idx = reasoning_lower.rfind(marker_lower)
+                # Extract everything after the marker
+                answer_part = reasoning_content[idx + len(marker) :].strip()
+                # Clean up: take until next paragraph or end
+                if "\n\n" in answer_part:
+                    answer_part = answer_part.split("\n\n")[0]
+                # Remove quotes if present
+                answer_part = answer_part.strip("\"'")
+                if len(answer_part) > 20:  # Ensure we have substantial content
+                    return answer_part
+
+        # Fallback: Look for quoted content which often contains the answer
+        import re
+
+        quoted: list[str] = re.findall(r'"([^"]{30,})"', reasoning_content)
+        if quoted:
+            # Return the last substantial quote (likely the final answer attempt)
+            return quoted[-1]
+
+        # Last resort: return the last paragraph of reasoning
+        paragraphs = [p.strip() for p in reasoning_content.split("\n\n") if p.strip()]
+        if paragraphs:
+            last_para = paragraphs[-1]
+            # Clean up meta-commentary
+            if last_para.startswith(("We need to", "The user", "So we")) and len(paragraphs) > 1:
+                # Try the second-to-last paragraph
+                return paragraphs[-2][:500]
+            return last_para[:500]
+
+        return reasoning_content[:500]

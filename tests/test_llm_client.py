@@ -311,3 +311,56 @@ class TestLLMClientTokenEstimation:
         messages: list[dict[str, str]] = [{"role": "user"}]  # No content
         result = client.count_messages_tokens(messages)
         assert result == 4  # Just overhead, no content tokens
+
+
+class TestLLMClientReasoningExtraction:
+    """Test LLMClient reasoning content extraction."""
+
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        """Create LLM client for testing."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            return LLMClient(api_key="sk-test")
+
+    def test_extract_empty_reasoning(self, client: LLMClient) -> None:
+        """Test extraction from empty reasoning returns empty string."""
+        result = client._extract_answer_from_reasoning("")
+        assert result == ""
+
+    def test_extract_with_thus_marker(self, client: LLMClient) -> None:
+        """Test extraction finds content after 'Thus:' marker."""
+        reasoning = """The user wants X. We analyze Y.
+        Thus: Einstein's key contributions include special and general relativity.
+        Some more meta text."""
+        result = client._extract_answer_from_reasoning(reasoning)
+        assert "Einstein" in result
+        assert "relativity" in result
+
+    def test_extract_with_quoted_answer(self, client: LLMClient) -> None:
+        """Test extraction finds quoted content as answer."""
+        reasoning = """We need to produce an answer. The answer should be:
+        "Einstein revolutionized physics with special relativity in 1905."
+        That satisfies the requirement."""
+        result = client._extract_answer_from_reasoning(reasoning)
+        assert "Einstein" in result
+        assert "1905" in result
+
+    def test_extract_fallback_to_last_paragraph(self, client: LLMClient) -> None:
+        """Test extraction falls back to last paragraph when no markers found."""
+        reasoning = """First paragraph of analysis.
+
+        Second paragraph with more details.
+
+        Final paragraph: Einstein's work on relativity changed physics forever."""
+        result = client._extract_answer_from_reasoning(reasoning)
+        assert "Einstein" in result
+        assert "relativity" in result
+
+    def test_extract_skips_meta_commentary(self, client: LLMClient) -> None:
+        """Test extraction skips paragraphs starting with meta phrases."""
+        reasoning = """Einstein developed special relativity in 1905.
+
+        We need to produce a single step answer."""
+        result = client._extract_answer_from_reasoning(reasoning)
+        assert "Einstein" in result
+        assert "We need to" not in result
