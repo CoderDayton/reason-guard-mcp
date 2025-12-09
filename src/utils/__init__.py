@@ -1,10 +1,10 @@
-"""Utility modules for Enhanced CoT MCP."""
+"""Utility modules for MatrixMind MCP."""
 
 from .errors import (
     CompressionException,
     ConfigException,
-    EnhancedCoTException,
     LLMException,
+    MatrixMindException,
     ReasoningException,
     ToolExecutionError,
     VerificationException,
@@ -24,7 +24,7 @@ __all__ = [
     "ReasoningResult",
     "StrategyRecommendation",
     "safe_json_serialize",
-    "EnhancedCoTException",
+    "MatrixMindException",
     "CompressionException",
     "ReasoningException",
     "VerificationException",

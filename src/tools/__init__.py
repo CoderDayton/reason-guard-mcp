@@ -1,4 +1,4 @@
-"""Enhanced CoT reasoning tools."""
+"""MatrixMind reasoning tools."""
 
 from .compress import ContextAwareCompressionTool
 from .long_chain import LongChainOfThoughtTool

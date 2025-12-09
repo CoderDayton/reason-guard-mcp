@@ -1,4 +1,4 @@
-"""Type definitions and schemas for Enhanced CoT MCP."""
+"""Type definitions and schemas for MatrixMind MCP."""
 
 from __future__ import annotations
 

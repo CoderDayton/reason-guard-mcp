@@ -1,4 +1,4 @@
-"""Enhanced Chain-of-Thought MCP Server.
+"""MatrixMind MCP Server.
 
 FastMCP 2.0 implementation providing 4 reasoning tools:
 1. compress_prompt - Semantic context compression
@@ -6,61 +6,137 @@ FastMCP 2.0 implementation providing 4 reasoning tools:
 3. long_chain_of_thought - Deep sequential reasoning
 4. verify_fact_consistency - Answer verification
 
-Run with: fastmcp run src/server.py
+Run with: uvx matrixmind-mcp
 Or: python -m src.server
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Any
 
-import yaml
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from loguru import logger
 
 from src.models.llm_client import LLMClient
+from src.models.model_manager import ModelManager
 from src.tools.compress import ContextAwareCompressionTool
 from src.tools.long_chain import LongChainOfThoughtTool
 from src.tools.mot_reasoning import MatrixOfThoughtTool
 from src.tools.verify import FactVerificationTool
-from src.utils.errors import EnhancedCoTException, ToolExecutionError
+from src.utils.errors import MatrixMindException, ModelNotReadyException, ToolExecutionError
 from src.utils.schema import ReasoningStrategy, safe_json_serialize
 
-# Load environment variables
+# Load environment variables from .env file (for local development)
 load_dotenv()
 
-# Load configuration
-CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
-if CONFIG_PATH.exists():
-    with open(CONFIG_PATH) as f:
-        config = yaml.safe_load(f)
-else:
-    logger.warning("config.yaml not found, using defaults")
-    config = {
-        "server": {"name": "Enhanced-CoT-MCP", "transport": "stdio"},
-        "models": {"reasoning_llm": "gpt-4-turbo", "embedding_model": "all-mpnet-base-v2"},
-        "llm": {"timeout": 60, "retry_attempts": 3},
-    }
 
-# Initialize FastMCP server
+def _get_env(key: str, default: str = "") -> str:
+    """Get environment variable, treating empty string as unset."""
+    value = os.getenv(key, default)
+    return value if value else default
+
+
+def _get_env_int(key: str, default: int) -> int:
+    """Get environment variable as integer."""
+    value = os.getenv(key)
+    if value:
+        try:
+            return int(value)
+        except ValueError:
+            logger.warning(f"Invalid integer for {key}: {value}, using default {default}")
+    return default
+
+
+# =============================================================================
+# Configuration from Environment Variables
+# =============================================================================
+
+# LLM Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_BASE_URL = _get_env("OPENAI_BASE_URL") or None  # None = use default OpenAI
+OPENAI_MODEL = _get_env("OPENAI_MODEL", "gpt-4.1")
+LLM_TIMEOUT = _get_env_int("LLM_TIMEOUT", 60)
+LLM_MAX_RETRIES = _get_env_int("LLM_MAX_RETRIES", 3)
+
+# Model Configuration
+EMBEDDING_MODEL = _get_env("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-xs")
+
+# Server Configuration
+SERVER_NAME = _get_env("SERVER_NAME", "MatrixMind-MCP")
+SERVER_TRANSPORT = _get_env("SERVER_TRANSPORT", "stdio")
+SERVER_HOST = _get_env("SERVER_HOST", "localhost")
+SERVER_PORT = _get_env_int("SERVER_PORT", 8000)
+
+# =============================================================================
+# Initialize Embedding Model Manager
+# =============================================================================
+
+
+def _get_embedding_model_name() -> str:
+    """Get full embedding model name, adding prefix only for short names.
+
+    If the model name already contains a '/' (e.g., 'Snowflake/snowflake-arctic-embed-xs'),
+    it's assumed to be a full HuggingFace model path. Otherwise, 'sentence-transformers/'
+    prefix is added for backward compatibility with short names like 'all-mpnet-base-v2'.
+    """
+    model_name = EMBEDDING_MODEL
+    # Only add prefix if no org/namespace is specified
+    if "/" not in model_name:
+        model_name = f"sentence-transformers/{model_name}"
+    return model_name
+
+
+def _init_model_manager() -> None:
+    """Initialize the model manager with embedding model.
+
+    Preloads the embedding model at startup (blocking) so tools are immediately
+    ready when the server starts. This ensures the first tool call doesn't have
+    to wait for model download.
+    """
+    model_manager = ModelManager.get_instance()
+    model_name = _get_embedding_model_name()
+    logger.info(f"Preloading embedding model: {model_name}")
+    # Blocking: wait for model to be ready before server starts
+    model_manager.initialize(model_name, blocking=True)
+    logger.info("Embedding model ready")
+
+
+# =============================================================================
+# Thread Pool for CPU-bound Operations
+# =============================================================================
+# Prevents blocking the event loop during compression/encoding operations
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="matrixmind-worker")
+
+
+# =============================================================================
+# Initialize FastMCP Server
+# =============================================================================
+
 mcp = FastMCP(
-    name=config["server"]["name"],
-    instructions="""Enhanced Chain-of-Thought reasoning server with 4 tools:
+    name=SERVER_NAME,
+    instructions="""MatrixMind reasoning server with 6 tools:
 
 1. compress_prompt: Reduce token count for long documents (use first for large inputs)
 2. matrix_of_thought_reasoning: Multi-perspective reasoning for complex problems
 3. long_chain_of_thought: Deep sequential reasoning for serial problems
 4. verify_fact_consistency: Verify answer accuracy against context
+5. recommend_reasoning_strategy: Get optimal reasoning approach for a problem
+6. check_status: Get server/model status for debugging
 
 Typical workflow: compress → reason (MoT or long_chain) → verify
 """,
 )
 
-# Lazy-loaded tool instances (initialized on first use)
+# =============================================================================
+# Lazy-loaded Tool Instances
+# =============================================================================
+
 _llm_client: LLMClient | None = None
 _compression_tool: ContextAwareCompressionTool | None = None
 _mot_tool: MatrixOfThoughtTool | None = None
@@ -72,31 +148,26 @@ def get_llm_client() -> LLMClient:
     """Get or create LLM client instance."""
     global _llm_client
     if _llm_client is None:
-        # Environment variable takes precedence over config
-        base_url = os.getenv("OPENAI_BASE_URL") or config.get("llm", {}).get("base_url") or None
-        # Empty string from config should be treated as None
-        if base_url == "":
-            base_url = None
-
         _llm_client = LLMClient(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=base_url,
-            model=os.getenv("OPENAI_MODEL") or config["models"]["reasoning_llm"],
-            timeout=config["llm"]["timeout"],
-            max_retries=config["llm"]["retry_attempts"],
+            api_key=OPENAI_API_KEY,
+            base_url=OPENAI_BASE_URL,
+            model=OPENAI_MODEL,
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
         )
     return _llm_client
 
 
 def get_compression_tool() -> ContextAwareCompressionTool:
-    """Get or create compression tool instance."""
+    """Get or create compression tool instance.
+
+    Note: The compression tool uses the ModelManager which handles
+    model loading state. If called before model is ready, it will
+    raise ModelNotReadyException with a helpful message.
+    """
     global _compression_tool
     if _compression_tool is None:
-        model_name = config["models"].get(
-            "embedding_model", "sentence-transformers/all-mpnet-base-v2"
-        )
-        if not model_name.startswith("sentence-transformers/"):
-            model_name = f"sentence-transformers/{model_name}"
+        model_name = _get_embedding_model_name()
         _compression_tool = ContextAwareCompressionTool(model_name=model_name)
     return _compression_tool
 
@@ -175,11 +246,18 @@ async def compress_prompt(
             await ctx.info(f"Compressing {len(context)} characters...")
 
         tool = get_compression_tool()
-        result = tool.compress(
-            context=context,
-            question=question,
-            compression_ratio=compression_ratio,
-            preserve_order=preserve_order,
+
+        # Run CPU-bound compression in thread pool to avoid blocking event loop
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor,
+            partial(
+                tool.compress,
+                context=context,
+                question=question,
+                compression_ratio=compression_ratio,
+                preserve_order=preserve_order,
+            ),
         )
 
         if ctx:
@@ -190,7 +268,19 @@ async def compress_prompt(
 
         return safe_json_serialize(result)
 
-    except EnhancedCoTException as e:
+    except ModelNotReadyException as e:
+        # Specific error for model not ready - give user actionable feedback
+        error = ToolExecutionError(
+            "compress_prompt",
+            str(e),
+            {
+                "retry_after_seconds": 30,
+                "hint": "The embedding model is still loading. Please retry shortly.",
+            },
+        )
+        logger.warning(f"Model not ready for compression: {e}")
+        return json.dumps(error.to_dict())
+    except MatrixMindException as e:
         error = ToolExecutionError("compress_prompt", str(e))
         logger.error(f"Compression failed: {e}")
         return json.dumps(error.to_dict())
@@ -260,7 +350,9 @@ async def matrix_of_thought_reasoning(
             await ctx.info(f"Starting MoT reasoning ({matrix_rows}×{matrix_cols} matrix)...")
 
         tool = get_mot_tool()
-        result = tool.reason(
+
+        # Use native async method for optimal performance
+        result = await tool.reason_async(
             question=question,
             context=context,
             matrix_rows=matrix_rows,
@@ -273,7 +365,7 @@ async def matrix_of_thought_reasoning(
 
         return safe_json_serialize(result)
 
-    except EnhancedCoTException as e:
+    except MatrixMindException as e:
         error = ToolExecutionError("matrix_of_thought_reasoning", str(e))
         logger.error(f"MoT reasoning failed: {e}")
         return json.dumps(error.to_dict())
@@ -339,7 +431,9 @@ async def long_chain_of_thought(
             await ctx.info(f"Starting long-chain reasoning ({num_steps} steps)...")
 
         tool = get_long_chain_tool()
-        result = tool.reason(
+
+        # Use native async method for optimal performance
+        result = await tool.reason_async(
             problem=problem,
             num_steps=num_steps,
             verify_intermediate=verify_intermediate,
@@ -354,7 +448,7 @@ async def long_chain_of_thought(
 
         return safe_json_serialize(result)
 
-    except EnhancedCoTException as e:
+    except MatrixMindException as e:
         error = ToolExecutionError("long_chain_of_thought", str(e))
         logger.error(f"Long chain reasoning failed: {e}")
         return json.dumps(error.to_dict())
@@ -415,7 +509,9 @@ async def verify_fact_consistency(
             await ctx.info(f"Verifying answer ({len(answer.split())} words)...")
 
         tool = get_verify_tool()
-        result = tool.verify(
+
+        # Use native async method for optimal performance
+        result = await tool.verify_async(
             answer=answer,
             context=context,
             max_claims=max_claims,
@@ -426,7 +522,7 @@ async def verify_fact_consistency(
 
         return safe_json_serialize(result)
 
-    except EnhancedCoTException as e:
+    except MatrixMindException as e:
         error = ToolExecutionError("verify_fact_consistency", str(e))
         logger.error(f"Verification failed: {e}")
         return json.dumps(error.to_dict())
@@ -551,32 +647,105 @@ async def recommend_reasoning_strategy(
 
 
 # ============================================================================
+# TOOL 6: CHECK STATUS
+# ============================================================================
+
+
+@mcp.tool
+async def check_status(ctx: Context | None = None) -> str:
+    """Get server and model status for debugging.
+
+    Returns comprehensive status information including model state,
+    device info, memory usage, and disk space. Useful for debugging
+    deployment issues and monitoring.
+
+    Args:
+        None required
+
+    Returns:
+        JSON with model_status (state, device, memory, disk),
+        server_info (name, transport), and llm_config
+
+    Status fields:
+        - state: not_started, downloading, loading, ready, failed
+        - device: cpu or cuda
+        - gpu_memory_*: GPU memory stats (if using CUDA)
+        - disk_free_mb: Available disk space
+        - model_size_mb: Estimated model size
+
+    Use when:
+        - Debugging why tools aren't working
+        - Checking if model finished loading
+        - Monitoring resource usage
+        - Verifying configuration
+
+    Example:
+        check_status()
+
+    """
+    try:
+        model_manager = ModelManager.get_instance()
+        model_status = model_manager.get_status()
+
+        result: dict[str, Any] = {
+            "model_status": model_status,
+            "server_info": {
+                "name": SERVER_NAME,
+                "transport": SERVER_TRANSPORT,
+            },
+            "llm_config": {
+                "model": OPENAI_MODEL,
+                "base_url": OPENAI_BASE_URL or "https://api.openai.com",
+                "api_key_set": bool(OPENAI_API_KEY),
+                "timeout": LLM_TIMEOUT,
+                "max_retries": LLM_MAX_RETRIES,
+            },
+            "embedding_config": {
+                "model": _get_embedding_model_name(),
+            },
+        }
+
+        if ctx:
+            state = model_status.get("state", "unknown")
+            device = model_status.get("device", "unknown")
+            await ctx.info(f"Model state: {state}, Device: {device}")
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("check_status", str(e))
+        logger.error(f"Status check failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+# ============================================================================
 # SERVER ENTRY POINT
 # ============================================================================
 
 
 def main() -> None:
-    """Run the Enhanced CoT MCP server."""
-    transport = config["server"].get("transport", "stdio")
+    """Run the MatrixMind MCP server."""
+    logger.info(f"Starting {SERVER_NAME} (transport: {SERVER_TRANSPORT})")
 
-    logger.info(f"Starting Enhanced CoT MCP Server (transport: {transport})")
+    # Initialize embedding model in background (non-blocking)
+    _init_model_manager()
 
-    if transport == "stdio":
+    if SERVER_TRANSPORT == "stdio":
         mcp.run(transport="stdio")
-    elif transport == "http":
+    elif SERVER_TRANSPORT == "http":
         mcp.run(
             transport="streamable-http",
-            host=config["server"].get("host", "localhost"),
-            port=config["server"].get("port", 8000),
+            host=SERVER_HOST,
+            port=SERVER_PORT,
         )
-    elif transport == "sse":
+    elif SERVER_TRANSPORT == "sse":
         mcp.run(
             transport="sse",
-            host=config["server"].get("host", "localhost"),
-            port=config["server"].get("port", 8000),
+            host=SERVER_HOST,
+            port=SERVER_PORT,
         )
     else:
-        logger.warning(f"Unknown transport '{transport}', falling back to stdio")
+        logger.warning(f"Unknown transport '{SERVER_TRANSPORT}', falling back to stdio")
         mcp.run(transport="stdio")
 
 

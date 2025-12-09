@@ -130,6 +130,179 @@ class FactVerificationTool:
             logger.error(f"Verification failed: {e}")
             raise VerificationException(f"Verification failed: {e!s}") from e
 
+    async def verify_async(
+        self,
+        answer: str,
+        context: str,
+        max_claims: int = 10,
+        confidence_threshold: float = 0.7,
+    ) -> VerificationResult:
+        """Verify answer claims against context (async version).
+
+        Uses async LLM calls for claim extraction and verification,
+        enabling non-blocking operation in async contexts.
+
+        Args:
+            answer: Answer text to verify.
+            context: Factual context for verification.
+            max_claims: Maximum claims to extract and verify.
+            confidence_threshold: Threshold for "verified" status (0-1).
+
+        Returns:
+            VerificationResult with verification status and details.
+
+        Raises:
+            VerificationException: If verification fails due to invalid input.
+
+        """
+        # Validate inputs
+        if not answer or not answer.strip():
+            raise VerificationException("Answer cannot be empty")
+
+        if not context or not context.strip():
+            raise VerificationException("Context cannot be empty")
+
+        if not 1 <= max_claims <= 20:
+            raise VerificationException(f"max_claims must be 1-20, got {max_claims}")
+
+        try:
+            # Extract claims from answer (async)
+            claims = await self._extract_claims_async(answer, max_claims)
+
+            if not claims:
+                return VerificationResult(
+                    verified=True,
+                    confidence=0.5,
+                    claims_verified=0,
+                    claims_total=0,
+                    reason="No verifiable claims found in answer",
+                    claim_details=[],
+                )
+
+            # Verify each claim (async, in parallel)
+            import asyncio
+
+            tasks = [self._verify_claim_async(claim, context) for claim in claims]
+            claim_details = await asyncio.gather(*tasks)
+
+            verified_count = sum(1 for r in claim_details if r.get("supported", False))
+
+            # Calculate confidence
+            confidence = verified_count / len(claims) if claims else 0.5
+            is_verified = confidence >= confidence_threshold
+
+            return VerificationResult(
+                verified=is_verified,
+                confidence=confidence,
+                claims_verified=verified_count,
+                claims_total=len(claims),
+                reason=f"Verified {verified_count}/{len(claims)} claims against context",
+                claim_details=list(claim_details),
+            )
+
+        except VerificationException:
+            raise
+        except Exception as e:
+            logger.error(f"Async verification failed: {e}")
+            raise VerificationException(f"Verification failed: {e!s}") from e
+
+    async def _extract_claims_async(self, text: str, max_claims: int) -> list[str]:
+        """Extract factual claims from text (async version).
+
+        Args:
+            text: Text to extract claims from.
+            max_claims: Maximum number of claims.
+
+        Returns:
+            List of claim strings.
+
+        """
+        try:
+            prompt = f"""Extract the key FACTUAL CLAIMS from this text that can be verified.
+Each claim should be a single, specific statement of fact.
+
+Text: {text}
+
+List up to {max_claims} factual claims, one per line (just the claim, no numbering):"""
+
+            response = await self.llm.generate_async(prompt, max_tokens=500, temperature=0.3)
+
+            # Parse response into claims
+            lines = response.strip().split("\n")
+            claims = []
+
+            for line in lines:
+                # Clean up line
+                claim = line.strip().lstrip("0123456789.-) ").strip()
+                if claim and len(claim.split()) >= 3:  # At least 3 words
+                    claims.append(claim)
+
+                if len(claims) >= max_claims:
+                    break
+
+            return claims
+
+        except Exception as e:
+            logger.warning(f"Async claim extraction failed: {e}")
+            # Fallback: simple sentence splitting
+            sentences = [s.strip() for s in text.split(".") if s.strip()]
+            return [s for s in sentences if len(s.split()) >= 5][:max_claims]
+
+    async def _verify_claim_async(self, claim: str, context: str) -> dict[str, Any]:
+        """Verify a single claim against context (async version).
+
+        Args:
+            claim: Claim to verify.
+            context: Context to check against.
+
+        Returns:
+            Dict with claim, supported (bool), confidence, and reason.
+
+        """
+        try:
+            prompt = f"""Is this claim supported by the given context?
+
+CLAIM: {claim}
+
+CONTEXT: {context[:1500]}{"..." if len(context) > 1500 else ""}
+
+Answer with:
+- SUPPORTED: if the context clearly supports this claim
+- CONTRADICTED: if the context contradicts this claim
+- UNCLEAR: if the context doesn't contain relevant information
+
+Then briefly explain why (1 sentence):"""
+
+            response = await self.llm.generate_async(prompt, max_tokens=100, temperature=0.2)
+            response_lower = response.lower()
+
+            # Parse response
+            if "supported" in response_lower[:50]:
+                supported = True
+                confidence = 0.9
+            elif "contradicted" in response_lower[:50]:
+                supported = False
+                confidence = 0.9
+            else:
+                supported = False
+                confidence = 0.5
+
+            return {
+                "claim": claim[:100] + "..." if len(claim) > 100 else claim,
+                "supported": supported,
+                "confidence": confidence,
+                "reason": response[:150] if response else "No explanation",
+            }
+
+        except Exception as e:
+            logger.warning(f"Async claim verification failed: {e}")
+            return {
+                "claim": claim[:100],
+                "supported": False,
+                "confidence": 0.5,
+                "reason": f"Verification error: {e!s}",
+            }
+
     def _extract_claims(self, text: str, max_claims: int) -> list[str]:
         """Extract factual claims from text.
 

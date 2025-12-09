@@ -1,42 +1,54 @@
-"""Custom exceptions for Enhanced CoT MCP."""
+"""Custom exceptions for MatrixMind MCP."""
 
 from __future__ import annotations
 
 from typing import Any
 
 
-class EnhancedCoTException(Exception):
-    """Base exception for Enhanced CoT MCP."""
+class MatrixMindException(Exception):
+    """Base exception for MatrixMind MCP."""
 
     pass
 
 
-class CompressionException(EnhancedCoTException):
+class CompressionException(MatrixMindException):
     """Raised during compression failures."""
 
     pass
 
 
-class ReasoningException(EnhancedCoTException):
+class ReasoningException(MatrixMindException):
     """Raised during reasoning failures."""
 
     pass
 
 
-class VerificationException(EnhancedCoTException):
+class VerificationException(MatrixMindException):
     """Raised during verification failures."""
 
     pass
 
 
-class LLMException(EnhancedCoTException):
+class LLMException(MatrixMindException):
     """Raised during LLM API calls."""
 
     pass
 
 
-class ConfigException(EnhancedCoTException):
+class ConfigException(MatrixMindException):
     """Raised during configuration issues."""
+
+    pass
+
+
+class ModelNotReadyException(MatrixMindException):
+    """Raised when a tool is called before the embedding model is ready.
+
+    This typically occurs when:
+    - The model is still downloading (first run)
+    - The model is loading into memory
+    - The model failed to load due to network/disk issues
+    """
 
     pass
 

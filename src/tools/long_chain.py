@@ -9,6 +9,7 @@ methods for serial problems (66% vs 36% on constraint tasks).
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -172,6 +173,260 @@ class LongChainOfThoughtTool:
         except Exception as e:
             logger.error(f"Long chain reasoning failed: {e}")
             raise ReasoningException(f"Long chain reasoning failed: {e!s}") from e
+
+    async def reason_async(
+        self,
+        problem: str,
+        num_steps: int = 15,
+        verify_intermediate: bool = True,
+        verification_frequency: int = 3,
+    ) -> ReasoningResult:
+        """Execute long-chain sequential reasoning with async verification.
+
+        P2 Optimization: Verification is performed as fire-and-forget tasks,
+        allowing step generation to continue without waiting for verification
+        results. Verifications are collected at the end.
+
+        Args:
+            problem: Problem statement to solve.
+            num_steps: Number of reasoning steps (1-50).
+            verify_intermediate: Whether to verify steps periodically.
+            verification_frequency: Verify every N steps.
+
+        Returns:
+            ReasoningResult with answer, steps, and verification info.
+
+        Raises:
+            ReasoningException: If reasoning fails.
+
+        """
+        # Validate inputs
+        if not problem or not problem.strip():
+            raise ReasoningException("Problem cannot be empty")
+
+        if not 1 <= num_steps <= 50:
+            raise ReasoningException(f"num_steps must be 1-50, got {num_steps}")
+
+        try:
+            # Initialize reasoning chain
+            reasoning_chain: list[str] = []
+            pending_verifications: list[asyncio.Task[dict[str, Any]]] = []
+
+            # Generate reasoning steps
+            for step_num in range(1, num_steps + 1):
+                # Build context from recent steps
+                recent_context = self._build_recent_context(reasoning_chain, max_steps=5)
+
+                # Generate next step (async)
+                next_step = await self._generate_step_async(
+                    problem=problem,
+                    step_num=step_num,
+                    total_steps=num_steps,
+                    recent_context=recent_context,
+                )
+
+                if not next_step:
+                    logger.warning(f"Step {step_num} generation failed, stopping chain")
+                    break
+
+                reasoning_chain.append(next_step)
+
+                # P2 Optimization: Fire-and-forget verification
+                if verify_intermediate and step_num % verification_frequency == 0:
+                    task = asyncio.create_task(
+                        self._verify_step_async(
+                            problem=problem,
+                            chain=reasoning_chain.copy(),  # Copy to avoid race
+                            step_num=step_num,
+                        )
+                    )
+                    pending_verifications.append(task)
+
+            # Collect verification results at the end
+            verifications: list[dict[str, Any]] = []
+            verification_passed = 0
+            verification_total = 0
+
+            if pending_verifications:
+                results = await asyncio.gather(*pending_verifications, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning(f"Verification task failed: {result}")
+                        verifications.append(
+                            {"step": -1, "is_valid": True, "reason": f"Error: {result}"}
+                        )
+                        verification_total += 1
+                    elif isinstance(result, dict):
+                        verifications.append(result)
+                        verification_total += 1
+                        if result.get("is_valid", False):
+                            verification_passed += 1
+
+            # Extract final answer (async)
+            final_answer = await self._extract_answer_async(problem, reasoning_chain)
+
+            # Calculate confidence
+            if verification_total > 0:
+                verification_ratio = verification_passed / verification_total
+                confidence = 0.5 + 0.4 * verification_ratio
+            else:
+                confidence = 0.7  # Default when no verification
+
+            return ReasoningResult(
+                answer=final_answer,
+                confidence=confidence,
+                reasoning_steps=reasoning_chain,
+                verification_results={
+                    "total_verifications": verification_total,
+                    "passed": verification_passed,
+                    "failed": verification_total - verification_passed,
+                    "details": verifications[-3:] if verifications else [],
+                },
+                tokens_used=self.llm.estimate_tokens("\n".join(reasoning_chain)),
+                reasoning_trace={
+                    "total_steps": len(reasoning_chain),
+                    "requested_steps": num_steps,
+                    "verify_enabled": verify_intermediate,
+                    "async_verification": True,
+                },
+            )
+
+        except ReasoningException:
+            raise
+        except Exception as e:
+            logger.error(f"Long chain async reasoning failed: {e}")
+            raise ReasoningException(f"Long chain reasoning failed: {e!s}") from e
+
+    async def _generate_step_async(
+        self,
+        problem: str,
+        step_num: int,
+        total_steps: int,
+        recent_context: str,
+    ) -> str | None:
+        """Async version of step generation.
+
+        Args:
+            problem: Original problem.
+            step_num: Current step number.
+            total_steps: Total expected steps.
+            recent_context: Context from recent steps.
+
+        Returns:
+            Generated step text, or None if failed.
+
+        """
+        try:
+            prompt = f"""Problem: {problem}
+
+Previous reasoning:
+{recent_context if recent_context else "(Starting fresh)"}
+
+Generate Step {step_num}/{total_steps}:
+- Build directly on previous reasoning
+- Make one clear logical advancement
+- Be specific and precise (2-4 sentences)
+
+Step {step_num}:"""
+
+            response = await self.llm.generate_async(
+                prompt=prompt,
+                max_tokens=400,
+                temperature=0.5,
+            )
+
+            return response.strip() if response else None
+
+        except Exception as e:
+            logger.warning(f"Step {step_num} generation error: {e}")
+            return None
+
+    async def _verify_step_async(
+        self,
+        problem: str,
+        chain: list[str],
+        step_num: int,
+    ) -> dict[str, Any]:
+        """Async version of step verification.
+
+        Args:
+            problem: Original problem.
+            chain: Full reasoning chain so far.
+            step_num: Step to verify.
+
+        Returns:
+            Verification result dict with is_valid, reason, step.
+
+        """
+        try:
+            current_step = chain[step_num - 1] if step_num <= len(chain) else ""
+            prev_step = chain[step_num - 2] if step_num > 1 and step_num - 1 <= len(chain) else ""
+
+            prompt = f"""Verify this reasoning step for logical consistency:
+
+Problem: {problem}
+
+Previous step: {prev_step[:200] if prev_step else "(none)"}
+
+Current step to verify: {current_step[:300]}
+
+Is this step:
+1. Logically sound (no logical errors)?
+2. Consistent with previous reasoning?
+3. Making valid progress toward the solution?
+
+Answer with YES if valid, NO if problematic. Then briefly explain (1 sentence):"""
+
+            response = await self.llm.generate_async(prompt, max_tokens=150, temperature=0.3)
+
+            is_valid = response.lower().startswith("yes") or "yes" in response.lower()[:20]
+
+            return {
+                "step": step_num,
+                "is_valid": is_valid,
+                "reason": response[:100] if response else "No response",
+            }
+
+        except Exception as e:
+            logger.warning(f"Async verification failed for step {step_num}: {e}")
+            return {
+                "step": step_num,
+                "is_valid": True,  # Fail open
+                "reason": f"Verification error: {e!s}",
+            }
+
+    async def _extract_answer_async(self, problem: str, chain: list[str]) -> str:
+        """Async version of answer extraction.
+
+        Args:
+            problem: Original problem.
+            chain: Complete reasoning chain.
+
+        Returns:
+            Extracted answer string.
+
+        """
+        if not chain:
+            return "Unable to generate answer"
+
+        try:
+            # Use last few steps as context
+            last_steps = "\n".join(chain[-3:]) if len(chain) >= 3 else "\n".join(chain)
+
+            prompt = f"""Problem: {problem}
+
+Final reasoning steps:
+{last_steps}
+
+Based on the reasoning chain above, what is the FINAL ANSWER to the problem?
+Provide a direct, concise answer (1-2 sentences):"""
+
+            response = await self.llm.generate_async(prompt, max_tokens=200, temperature=0.3)
+            return response.strip() if response else chain[-1].split("\n")[0]
+
+        except Exception as e:
+            logger.warning(f"Async answer extraction failed: {e}")
+            return chain[-1].split("\n")[0] if chain else "Unable to extract answer"
 
     def _generate_step(
         self,
