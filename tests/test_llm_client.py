@@ -670,3 +670,210 @@ class TestLLMClientModelConfig:
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
             client = LLMClient(api_key="sk-test", model="gemma-3-27b")
             assert client.default_temperature == 1.0  # Gemma's optimal is higher
+
+
+class TestLLMClientContextTruncation:
+    """Test LLMClient automatic context truncation."""
+
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        """Create LLM client for testing."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            return LLMClient(api_key="sk-test", model="gpt-5.1")
+
+    def test_prepare_messages_no_truncation_needed(self, client: LLMClient) -> None:
+        """Test _prepare_messages with short prompt (no truncation)."""
+        messages = client._prepare_messages(
+            prompt="What is 2+2?",
+            system_prompt="You are a math assistant.",
+            max_tokens=1000,
+        )
+
+        assert len(messages) == 2
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "You are a math assistant."
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"] == "What is 2+2?"
+
+    def test_prepare_messages_auto_truncates_long_prompt(self, client: LLMClient) -> None:
+        """Test _prepare_messages automatically truncates long prompts."""
+        # GPT-5 has 128K context, but let's create a prompt that would exceed it
+        # if we request a large output reservation
+        # With 128K context and 16K max output, we have ~112K for input
+        # Create a prompt that would be too long
+        long_text = "x" * 500000  # ~125K tokens at 4 chars/token
+
+        messages = client._prepare_messages(
+            prompt=long_text,
+            max_tokens=16000,
+            auto_truncate=True,
+        )
+
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        # Prompt should be truncated
+        assert len(messages[0]["content"]) < len(long_text)
+
+    def test_prepare_messages_raises_when_auto_truncate_false(self, client: LLMClient) -> None:
+        """Test _prepare_messages raises when auto_truncate=False and prompt too long."""
+        from src.utils.errors import LLMException
+
+        long_text = "x" * 600000  # Way too long
+
+        with pytest.raises(LLMException, match="exceeds available context"):
+            client._prepare_messages(
+                prompt=long_text,
+                max_tokens=16000,
+                auto_truncate=False,
+            )
+
+    def test_prepare_messages_with_system_prompt_reserves_space(self, client: LLMClient) -> None:
+        """Test that system prompt space is reserved when truncating."""
+        # Create a prompt that's close to the limit
+        long_text = "x" * 400000
+
+        # With system prompt, less space available for user prompt
+        with_system = client._prepare_messages(
+            prompt=long_text,
+            system_prompt="You are a helpful assistant." * 100,  # ~500 chars
+            max_tokens=16000,
+            auto_truncate=True,
+        )
+
+        without_system = client._prepare_messages(
+            prompt=long_text,
+            max_tokens=16000,
+            auto_truncate=True,
+        )
+
+        # With system prompt, user content should be shorter
+        user_content_with_system = with_system[-1]["content"]
+        user_content_without_system = without_system[-1]["content"]
+
+        # The difference should account for system prompt space
+        assert len(user_content_with_system) <= len(user_content_without_system)
+
+    def test_prepare_messages_truncation_strategy_keep_start(self, client: LLMClient) -> None:
+        """Test truncation with KEEP_START strategy."""
+        from src.models.model_config import TruncationStrategy
+
+        # Create prompt with distinct start and end
+        long_text = "START_MARKER_" + "x" * 500000 + "_END_MARKER"
+
+        messages = client._prepare_messages(
+            prompt=long_text,
+            max_tokens=16000,
+            truncation_strategy=TruncationStrategy.KEEP_START,
+            auto_truncate=True,
+        )
+
+        content = messages[0]["content"]
+        assert content.startswith("START_MARKER_")
+        assert "_END_MARKER" not in content
+
+    def test_prepare_messages_truncation_strategy_keep_end(self, client: LLMClient) -> None:
+        """Test truncation with KEEP_END strategy (default)."""
+        from src.models.model_config import TruncationStrategy
+
+        # Create prompt with distinct start and end
+        long_text = "START_MARKER_" + "x" * 500000 + "_END_MARKER"
+
+        messages = client._prepare_messages(
+            prompt=long_text,
+            max_tokens=16000,
+            truncation_strategy=TruncationStrategy.KEEP_END,
+            auto_truncate=True,
+        )
+
+        content = messages[0]["content"]
+        assert "START_MARKER_" not in content
+        assert content.endswith("_END_MARKER")
+
+    def test_prepare_messages_accounts_for_token_scaling(self) -> None:
+        """Test that reasoning model token scaling is considered in truncation."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # DeepSeek R1 has 3x token multiplier
+            client = LLMClient(api_key="sk-test", model="deepseek-r1")
+
+            # With 64K context and 8K max output (scaled to 24K), available is ~40K
+            long_text = "x" * 200000  # ~50K tokens
+
+            messages = client._prepare_messages(
+                prompt=long_text,
+                max_tokens=8000,  # Will be scaled to 24000
+                auto_truncate=True,
+            )
+
+            # Should be truncated more aggressively due to token scaling
+            assert len(messages[0]["content"]) < len(long_text)
+
+    def test_generate_with_auto_truncate(self) -> None:
+        """Test generate() method respects auto_truncate parameter."""
+        with (
+            patch("src.models.llm_client.OpenAI") as mock_openai,
+            patch("src.models.llm_client.AsyncOpenAI"),
+        ):
+            mock_client = MagicMock()
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock(message=MagicMock(content="42"))]
+            mock_client.chat.completions.create.return_value = mock_response
+            mock_openai.return_value = mock_client
+
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
+
+            # Very long prompt that needs truncation
+            long_prompt = "x" * 600000
+
+            result = client.generate(
+                prompt=long_prompt,
+                max_tokens=16000,
+                auto_truncate=True,
+            )
+
+            assert result == "42"
+            # Verify the API was called (truncation happened internally)
+            mock_client.chat.completions.create.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generate_async_with_auto_truncate(self) -> None:
+        """Test generate_async() method respects auto_truncate parameter."""
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+        ):
+            mock_client = AsyncMock()
+            mock_response = MagicMock()
+            mock_response.choices = [MagicMock(message=MagicMock(content="42"))]
+            mock_client.chat.completions.create.return_value = mock_response
+            mock_async_openai.return_value = mock_client
+
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
+
+            # Very long prompt that needs truncation
+            long_prompt = "x" * 600000
+
+            result = await client.generate_async(
+                prompt=long_prompt,
+                max_tokens=16000,
+                auto_truncate=True,
+            )
+
+            assert result == "42"
+            # Verify the API was called (truncation happened internally)
+            mock_client.chat.completions.create.assert_called_once()
+
+    def test_generate_raises_without_auto_truncate(self) -> None:
+        """Test generate() raises when auto_truncate=False and prompt too long."""
+        from src.utils.errors import LLMException
+
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
+
+            long_prompt = "x" * 600000
+
+            with pytest.raises(LLMException, match="exceeds available context"):
+                client.generate(
+                    prompt=long_prompt,
+                    max_tokens=16000,
+                    auto_truncate=False,
+                )

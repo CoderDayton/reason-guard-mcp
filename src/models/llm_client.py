@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from loguru import logger
 from openai import AsyncOpenAI, OpenAI
 
-from src.models.model_config import ModelConfig, get_model_config
+from src.models.model_config import ModelConfig, TruncationStrategy, get_model_config
 from src.utils.errors import LLMException
 from src.utils.retry import retry_with_backoff
 
@@ -208,6 +208,8 @@ class LLMClient:
         temperature: float | None = None,
         top_p: float | None = None,
         system_prompt: str | None = None,
+        auto_truncate: bool = True,
+        truncation_strategy: TruncationStrategy = TruncationStrategy.KEEP_END,
     ) -> str:
         """Generate text using LLM (synchronous).
 
@@ -219,21 +221,29 @@ class LLMClient:
             top_p: Top-p (nucleus) sampling parameter. If None, uses
                 the model's optimal top_p from config.
             system_prompt: Optional system message to set context.
+            auto_truncate: If True, automatically truncate long prompts to fit
+                context window. If False, raise LLMException on overflow.
+            truncation_strategy: How to truncate if prompt exceeds context.
+                KEEP_END keeps recent context (default, usually most relevant).
+                KEEP_START keeps beginning. KEEP_BOTH_ENDS keeps start and end.
 
         Returns:
             Generated text response.
 
         Raises:
-            LLMException: If generation fails after retries.
+            LLMException: If generation fails after retries, or if auto_truncate
+                is False and prompt exceeds context window.
 
         """
         try:
-            messages: list[dict[str, str]] = []
-
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-
-            messages.append({"role": "user", "content": prompt})
+            # Prepare messages with automatic truncation if needed
+            messages = self._prepare_messages(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                truncation_strategy=truncation_strategy,
+                auto_truncate=auto_truncate,
+            )
 
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
@@ -251,6 +261,9 @@ class LLMClient:
             content = response.choices[0].message.content
             return content or ""
 
+        except LLMException:
+            # Re-raise LLMException (e.g., from _prepare_messages)
+            raise
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             raise LLMException(f"Generation failed: {e!s}") from e
@@ -263,6 +276,8 @@ class LLMClient:
         temperature: float | None = None,
         top_p: float | None = None,
         system_prompt: str | None = None,
+        auto_truncate: bool = True,
+        truncation_strategy: TruncationStrategy = TruncationStrategy.KEEP_END,
     ) -> str:
         """Generate text using LLM (asynchronous).
 
@@ -274,21 +289,29 @@ class LLMClient:
             top_p: Top-p (nucleus) sampling parameter. If None, uses
                 the model's optimal top_p from config.
             system_prompt: Optional system message to set context.
+            auto_truncate: If True, automatically truncate long prompts to fit
+                context window. If False, raise LLMException on overflow.
+            truncation_strategy: How to truncate if prompt exceeds context.
+                KEEP_END keeps recent context (default, usually most relevant).
+                KEEP_START keeps beginning. KEEP_BOTH_ENDS keeps start and end.
 
         Returns:
             Generated text response.
 
         Raises:
-            LLMException: If generation fails after retries.
+            LLMException: If generation fails after retries, or if auto_truncate
+                is False and prompt exceeds context window.
 
         """
         try:
-            messages: list[dict[str, str]] = []
-
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-
-            messages.append({"role": "user", "content": prompt})
+            # Prepare messages with automatic truncation if needed
+            messages = self._prepare_messages(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+                truncation_strategy=truncation_strategy,
+                auto_truncate=auto_truncate,
+            )
 
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
@@ -382,6 +405,9 @@ class LLMClient:
 
             return content or ""
 
+        except LLMException:
+            # Re-raise LLMException (e.g., from _prepare_messages)
+            raise
         except Exception as e:
             logger.error(f"Async LLM generation failed: {e}")
             raise LLMException(f"Async generation failed: {e!s}") from e
@@ -417,6 +443,89 @@ class LLMClient:
             total += 4
             total += self.estimate_tokens(msg.get("content", ""))
         return total
+
+    def _prepare_messages(
+        self,
+        prompt: str,
+        system_prompt: str | None = None,
+        max_tokens: int = 2000,
+        truncation_strategy: TruncationStrategy = TruncationStrategy.KEEP_END,
+        auto_truncate: bool = True,
+    ) -> list[dict[str, str]]:
+        """Prepare messages with context-aware truncation.
+
+        Automatically truncates the user prompt if it would exceed the model's
+        context window, leaving room for the system prompt and expected output.
+
+        Args:
+            prompt: User prompt/question.
+            system_prompt: Optional system message to set context.
+            max_tokens: Maximum tokens reserved for response.
+            truncation_strategy: How to truncate if prompt exceeds context.
+                KEEP_END is default since recent context is usually more relevant.
+            auto_truncate: If True, automatically truncate long prompts.
+                If False, raise LLMException when prompt exceeds context.
+
+        Returns:
+            List of message dicts ready for API call.
+
+        Raises:
+            LLMException: If auto_truncate=False and prompt exceeds context.
+
+        """
+        messages: list[dict[str, str]] = []
+
+        # Calculate tokens used by system prompt
+        system_tokens = 0
+        if system_prompt:
+            system_tokens = self.estimate_tokens(system_prompt) + 4  # +4 for message overhead
+            messages.append({"role": "system", "content": system_prompt})
+
+        # Calculate available tokens for user prompt
+        # Reserve: output tokens + system tokens + message overhead
+        scaled_output_tokens = self._scale_tokens(max_tokens)
+        additional_tokens = system_tokens + 4  # +4 for user message overhead
+
+        # Check if prompt fits
+        if not self._model_config.fits_in_context(
+            prompt,
+            reserve_for_output=scaled_output_tokens,
+            additional_tokens=additional_tokens,
+        ):
+            estimated_prompt_tokens = self._model_config.estimate_tokens(prompt)
+            available = self._model_config.get_available_tokens(
+                reserve_for_output=scaled_output_tokens,
+                used_tokens=additional_tokens,
+            )
+
+            if auto_truncate:
+                # Use ERROR strategy internally if auto_truncate is False
+                effective_strategy = truncation_strategy
+                truncated_prompt = self._model_config.truncate_to_fit(
+                    prompt,
+                    reserve_for_output=scaled_output_tokens,
+                    additional_tokens=additional_tokens,
+                    strategy=effective_strategy,
+                )
+
+                logger.warning(
+                    f"Prompt truncated to fit context window: "
+                    f"{estimated_prompt_tokens} → "
+                    f"{self._model_config.estimate_tokens(truncated_prompt)} tokens "
+                    f"(available: {available}, strategy: {truncation_strategy.value})"
+                )
+                prompt = truncated_prompt
+            else:
+                raise LLMException(
+                    f"Prompt ({estimated_prompt_tokens} tokens) exceeds available context "
+                    f"({available} tokens) for model {self.model}. "
+                    f"Context window: {self._model_config.max_context_length}, "
+                    f"reserved for output: {scaled_output_tokens}, "
+                    f"system prompt: {system_tokens} tokens."
+                )
+
+        messages.append({"role": "user", "content": prompt})
+        return messages
 
     def _extract_answer_from_reasoning(self, reasoning_content: str) -> str:
         """Extract the final answer from reasoning model output.
