@@ -177,6 +177,11 @@ class LLMClient:
                 finish_reason = choice.finish_reason
                 content = choice.message.content
 
+                # Handle <think> tags in content (DeepSeek, Qwen, etc.)
+                # These models return: <think>reasoning...</think>actual answer
+                if content:
+                    content = self._strip_think_tags(content)
+
                 # Some APIs return content in alternative fields
                 if not content:
                     msg = choice.message
@@ -329,3 +334,62 @@ class LLMClient:
             return last_para[:500]
 
         return reasoning_content[:500]
+
+    def _strip_think_tags(self, content: str) -> str:
+        """Strip <think>...</think> tags and return the answer portion.
+
+        Some reasoning models (DeepSeek, Qwen, etc.) return responses in format:
+        <think>chain of thought reasoning...</think>actual answer
+
+        This method extracts just the answer after the closing </think> tag.
+        If the content is entirely within think tags with no answer after,
+        it extracts the answer from the thinking content.
+
+        Args:
+            content: Raw response content that may contain think tags.
+
+        Returns:
+            The answer portion, or extracted answer from thinking if no
+            content exists after the tags.
+
+        """
+        import re
+
+        # Check for <think> tags (case-insensitive, handles whitespace)
+        think_pattern = re.compile(r"<think>\s*(.*?)\s*</think>\s*(.*)", re.DOTALL | re.IGNORECASE)
+        match = think_pattern.search(content)
+
+        if match:
+            thinking_content = match.group(1).strip()
+            answer_content = match.group(2).strip()
+
+            if answer_content:
+                # There's content after </think>, that's the answer
+                logger.debug(
+                    f"Stripped <think> tags: {len(thinking_content)} chars thinking, "
+                    f"{len(answer_content)} chars answer"
+                )
+                return answer_content
+            elif thinking_content:
+                # Only thinking content, no answer - extract from thinking
+                logger.debug(
+                    f"Only <think> content found ({len(thinking_content)} chars), "
+                    "extracting answer from thinking"
+                )
+                return self._extract_answer_from_reasoning(thinking_content)
+
+        # Check for unclosed <think> tag (model hit token limit during thinking)
+        unclosed_pattern = re.compile(r"<think>\s*(.*)", re.DOTALL | re.IGNORECASE)
+        unclosed_match = unclosed_pattern.search(content)
+
+        if unclosed_match and "</think>" not in content.lower():
+            thinking_content = unclosed_match.group(1).strip()
+            if thinking_content:
+                logger.debug(
+                    f"Unclosed <think> tag found ({len(thinking_content)} chars), "
+                    "extracting answer from partial thinking"
+                )
+                return self._extract_answer_from_reasoning(thinking_content)
+
+        # No think tags, return content as-is
+        return content

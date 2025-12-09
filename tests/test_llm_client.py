@@ -364,3 +364,67 @@ class TestLLMClientReasoningExtraction:
         result = client._extract_answer_from_reasoning(reasoning)
         assert "Einstein" in result
         assert "We need to" not in result
+
+
+class TestLLMClientThinkTagStripping:
+    """Test LLMClient <think> tag handling."""
+
+    @pytest.fixture
+    def client(self) -> LLMClient:
+        """Create LLM client for testing."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            return LLMClient(api_key="sk-test")
+
+    def test_strip_no_think_tags(self, client: LLMClient) -> None:
+        """Test content without think tags is returned as-is."""
+        content = "Einstein developed special relativity in 1905."
+        result = client._strip_think_tags(content)
+        assert result == content
+
+    def test_strip_think_tags_with_answer(self, client: LLMClient) -> None:
+        """Test extraction of answer after </think> tag."""
+        content = """<think>
+        Let me analyze this question about Einstein.
+        He made many contributions to physics.
+        </think>Einstein's key contributions include special and general relativity."""
+        result = client._strip_think_tags(content)
+        assert "Einstein's key contributions" in result
+        assert "<think>" not in result
+        assert "Let me analyze" not in result
+
+    def test_strip_think_tags_only_thinking(self, client: LLMClient) -> None:
+        """Test extraction when only thinking content exists."""
+        content = """<think>
+        Einstein developed special relativity in 1905.
+        Thus: His key contribution was unifying space and time.
+        </think>"""
+        result = client._strip_think_tags(content)
+        # Should extract answer from thinking content
+        assert "unifying space and time" in result or "1905" in result
+
+    def test_strip_unclosed_think_tag(self, client: LLMClient) -> None:
+        """Test handling of unclosed <think> tag (token limit hit)."""
+        content = """<think>
+        Einstein's theory of relativity changed physics.
+        Thus: He unified space and time into spacetime."""
+        result = client._strip_think_tags(content)
+        # Should extract from partial thinking
+        assert "spacetime" in result or "relativity" in result
+
+    def test_strip_think_tags_case_insensitive(self, client: LLMClient) -> None:
+        """Test that think tag matching is case-insensitive."""
+        content = """<THINK>Some reasoning here</THINK>The actual answer."""
+        result = client._strip_think_tags(content)
+        assert result == "The actual answer."
+
+    def test_strip_think_tags_with_whitespace(self, client: LLMClient) -> None:
+        """Test handling of whitespace around think tags."""
+        content = """<think>
+
+        Some reasoning
+
+        </think>
+
+        Clean answer here."""
+        result = client._strip_think_tags(content)
+        assert result == "Clean answer here."
