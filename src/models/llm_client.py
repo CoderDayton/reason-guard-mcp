@@ -42,7 +42,7 @@ class LLMClient:
     - Model-specific optimal sampling parameters
 
     Example:
-        client = LLMClient(model="gpt-4-turbo")
+        client = LLMClient(model="gpt-5.1")
         response = client.generate("What is 2+2?")
         print(response)  # "4"
 
@@ -60,7 +60,7 @@ class LLMClient:
         self,
         api_key: str | None = None,
         base_url: str | None = None,
-        model: str = "gpt-4-turbo",
+        model: str = "gpt-5.1",
         timeout: int = 60,
         max_retries: int = 3,
         reasoning_token_multiplier: float | None = None,

@@ -21,7 +21,7 @@ class TestLLMClientInit:
         ):
             client = LLMClient(api_key="sk-test-key")
 
-            assert client.model == "gpt-4-turbo"
+            assert client.model == "gpt-5.1"
             assert client.timeout == 60
             assert client.max_retries == 3
 
@@ -91,7 +91,7 @@ class TestLLMClientReasoningModelDetection:
     def test_standard_model_no_scaling(self) -> None:
         """Test standard models have 1.0x token multiplier."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
-            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
             assert client._is_reasoning_model is False
             assert client._token_multiplier == 1.0
             assert client._scale_tokens(300) == 300
@@ -141,7 +141,7 @@ class TestLLMClientReasoningModelDetection:
             # Standard model with explicit high multiplier
             client = LLMClient(
                 api_key="sk-test",
-                model="gpt-4-turbo",
+                model="gpt-5.1",
                 reasoning_token_multiplier=2.5,
             )
             assert client._token_multiplier == 2.5
@@ -588,9 +588,9 @@ class TestLLMClientModelConfig:
     def test_model_config_stored(self) -> None:
         """Test that model config is stored on client initialization."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
-            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
             assert hasattr(client, "_model_config")
-            assert client._model_config.name == "OpenAI GPT-4"
+            assert client._model_config.name == "OpenAI GPT-5"
 
     def test_model_config_temperature_used(self) -> None:
         """Test that model config temperature is used as default."""
@@ -609,7 +609,7 @@ class TestLLMClientModelConfig:
     def test_build_sampling_params_basic(self) -> None:
         """Test _build_sampling_params returns correct parameters."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
-            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
             params = client._build_sampling_params()
             assert "temperature" in params
             assert params["temperature"] == 0.7  # GPT-4 default
@@ -618,7 +618,7 @@ class TestLLMClientModelConfig:
     def test_build_sampling_params_with_override(self) -> None:
         """Test _build_sampling_params with user overrides."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
-            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            client = LLMClient(api_key="sk-test", model="gpt-5.1")
             params = client._build_sampling_params(temperature=0.3, top_p=0.5)
             assert params["temperature"] == 0.3
             assert params["top_p"] == 0.5

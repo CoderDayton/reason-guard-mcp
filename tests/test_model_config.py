@@ -11,6 +11,7 @@ from src.models.model_config import (
     DEFAULT_CONFIG,
     GEMMA_CONFIG,
     GPT4_CONFIG,
+    GPT5_CONFIG,
     LLAMA4_CONFIG,
     MISTRAL_SMALL_CONFIG,
     O1_CONFIG,
@@ -217,8 +218,14 @@ class TestGetModelConfig:
         assert config == DEFAULT_CONFIG
 
     # OpenAI models
+    def test_gpt5_detection(self) -> None:
+        """Test GPT-5 model detection."""
+        for model in ["gpt-5", "gpt-5.1", "gpt-5.1-mini", "GPT5"]:
+            config = get_model_config(model)
+            assert config == GPT5_CONFIG, f"Failed for {model}"
+
     def test_gpt4_detection(self) -> None:
-        """Test GPT-4 model detection."""
+        """Test GPT-4 model detection (legacy)."""
         for model in ["gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "GPT4"]:
             config = get_model_config(model)
             assert config == GPT4_CONFIG, f"Failed for {model}"

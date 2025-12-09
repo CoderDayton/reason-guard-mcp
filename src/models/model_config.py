@@ -187,22 +187,27 @@ _WITH_TOP_K = frozenset(
 # Model Family Configurations
 # =============================================================================
 
-# OpenAI GPT-4 family
-GPT4_CONFIG = ModelConfig(
-    name="OpenAI GPT-4",
+# OpenAI GPT-5 family (latest)
+GPT5_CONFIG = ModelConfig(
+    name="OpenAI GPT-5",
     temperature=0.7,
     top_p=0.95,
     capabilities=_STANDARD_CAPS,
     notes="General: 0.7, Coding: 0.0-0.3. Alter temp OR top_p, not both recommended.",
 )
 
-GPT4_CODING_CONFIG = ModelConfig(
-    name="OpenAI GPT-4 (Coding)",
+GPT5_CODING_CONFIG = ModelConfig(
+    name="OpenAI GPT-5 (Coding)",
     temperature=0.2,
     top_p=0.95,
     capabilities=_STANDARD_CAPS,
     notes="Lower temperature for deterministic code generation.",
 )
+
+# OpenAI GPT-4 family (legacy, same settings as GPT-5)
+GPT4_CONFIG = GPT5_CONFIG  # Alias for backward compatibility
+
+GPT4_CODING_CONFIG = GPT5_CODING_CONFIG  # Alias for backward compatibility
 
 # OpenAI o1/o3 reasoning models - fixed sampling, no params supported
 O1_CONFIG = ModelConfig(
@@ -421,7 +426,10 @@ GROQ_CONFIG = ModelConfig(
 MODEL_PATTERNS: list[tuple[re.Pattern[str], ModelConfig]] = [
     # OpenAI reasoning models (o1, o3, o1-mini, o1-preview, o3-mini)
     (re.compile(r"\b(o1|o3)(-mini|-preview)?\b", re.IGNORECASE), O1_CONFIG),
-    # OpenAI GPT-4 variants
+    # OpenAI GPT-5 variants (latest)
+    (re.compile(r"gpt-5.*codex|gpt-5.*code", re.IGNORECASE), GPT5_CODING_CONFIG),
+    (re.compile(r"gpt-5|gpt5", re.IGNORECASE), GPT5_CONFIG),
+    # OpenAI GPT-4 variants (legacy)
     (re.compile(r"gpt-4.*codex|gpt-4.*code", re.IGNORECASE), GPT4_CODING_CONFIG),
     (re.compile(r"gpt-4|gpt4", re.IGNORECASE), GPT4_CONFIG),
     (re.compile(r"gpt-3\.5|gpt3\.5", re.IGNORECASE), GPT4_CONFIG),  # Similar settings
@@ -459,7 +467,7 @@ def get_model_config(model_name: str) -> ModelConfig:
     """Get optimal configuration for a model based on its name.
 
     Args:
-        model_name: The model identifier string (e.g., "gpt-4-turbo",
+        model_name: The model identifier string (e.g., "gpt-5.1",
             "deepseek-chat", "claude-3-opus").
 
     Returns:
