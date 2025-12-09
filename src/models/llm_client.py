@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 from openai import AsyncOpenAI, OpenAI
 
+from src.models.model_config import ModelConfig, get_model_config
 from src.utils.errors import LLMException
 from src.utils.retry import retry_with_backoff
 
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
     pass
 
 # Patterns that identify reasoning models needing higher token limits
+# Note: This is kept for backward compatibility with token scaling logic.
+# For comprehensive model detection, use model_config.get_model_config()
 REASONING_MODEL_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"minimax", re.IGNORECASE),
     re.compile(r"deepseek", re.IGNORECASE),
@@ -36,6 +39,7 @@ class LLMClient:
     - Token estimation utilities
     - Structured error handling
     - Auto-detection of reasoning models with token multiplier
+    - Model-specific optimal sampling parameters
 
     Example:
         client = LLMClient(model="gpt-4-turbo")
@@ -45,6 +49,10 @@ class LLMClient:
         # For reasoning models, tokens are auto-scaled:
         client = LLMClient(model="deepseek-reasoner")
         # max_tokens=300 becomes 900 (3x multiplier)
+
+        # Model-specific configs are auto-applied:
+        client = LLMClient(model="claude-3-opus")
+        # Uses Claude's optimal params, handles mutual exclusion of temp/top_p
 
     """
 
@@ -56,7 +64,7 @@ class LLMClient:
         timeout: int = 60,
         max_retries: int = 3,
         reasoning_token_multiplier: float | None = None,
-        default_temperature: float = 0.7,
+        default_temperature: float | None = None,
     ) -> None:
         """Initialize LLM client.
 
@@ -70,6 +78,7 @@ class LLMClient:
                 reasoning models. If None, auto-detects based on model name
                 (3.0x for reasoning models, 1.0x for standard models).
             default_temperature: Default sampling temperature (0.0-2.0).
+                If None, uses model-specific optimal temperature from config.
                 Lower = more deterministic, higher = more creative.
                 Can be overridden per-call.
 
@@ -84,10 +93,22 @@ class LLMClient:
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
-        self.default_temperature = default_temperature
 
-        # Auto-detect if this is a reasoning model
-        self._is_reasoning_model = self._detect_reasoning_model(model)
+        # Get model-specific configuration
+        self._model_config: ModelConfig = get_model_config(model)
+
+        # Temperature priority: explicit arg > model config > fallback 0.7
+        if default_temperature is not None:
+            self.default_temperature = default_temperature
+        elif self._model_config.temperature is not None:
+            self.default_temperature = self._model_config.temperature
+        else:
+            self.default_temperature = 0.7
+
+        # Auto-detect if this is a reasoning model (use both methods for token scaling)
+        self._is_reasoning_model = (
+            self._detect_reasoning_model(model) or self._model_config.is_reasoning_model
+        )
 
         # Set token multiplier: explicit > auto-detect > default
         if reasoning_token_multiplier is not None:
@@ -114,10 +135,14 @@ class LLMClient:
         if self._is_reasoning_model:
             logger.info(
                 f"LLM client initialized with reasoning model: {model} "
-                f"(token multiplier: {self._token_multiplier}x)"
+                f"(token multiplier: {self._token_multiplier}x, "
+                f"config: {self._model_config.name})"
             )
         else:
-            logger.info(f"LLM client initialized with model: {model}")
+            logger.info(
+                f"LLM client initialized with model: {model} "
+                f"(config: {self._model_config.name}, temp: {self.default_temperature})"
+            )
 
     @staticmethod
     def _detect_reasoning_model(model_name: str) -> bool:
@@ -144,13 +169,44 @@ class LLMClient:
         """
         return int(max_tokens * self._token_multiplier)
 
+    def _build_sampling_params(
+        self,
+        temperature: float | None = None,
+        top_p: float | None = None,
+    ) -> dict[str, Any]:
+        """Build sampling parameters respecting model capabilities.
+
+        Uses model-specific config to determine which parameters to include
+        and handles edge cases like:
+        - Models that don't support temperature (o1, o3)
+        - Models with mutually exclusive temp/top_p (Claude)
+        - Models with optimal top_k values (Gemma, Qwen)
+
+        Args:
+            temperature: User-specified temperature (None = use config default).
+            top_p: User-specified top_p (None = use config default).
+
+        Returns:
+            Dict with API-compatible sampling parameters.
+
+        """
+        # Get effective temperature: user override > default_temperature
+        eff_temp = temperature if temperature is not None else self.default_temperature
+
+        # Get model-aware params using config
+        return self._model_config.to_api_params(
+            temperature_override=eff_temp,
+            top_p_override=top_p,
+            prefer_temperature=True,  # Prefer temp when mutually exclusive
+        )
+
     @retry_with_backoff(max_attempts=3, base_delay=1.0)
     def generate(
         self,
         prompt: str,
         max_tokens: int = 2000,
         temperature: float | None = None,
-        top_p: float = 0.9,
+        top_p: float | None = None,
         system_prompt: str | None = None,
     ) -> str:
         """Generate text using LLM (synchronous).
@@ -159,8 +215,9 @@ class LLMClient:
             prompt: User prompt/question.
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature (0.0-2.0). If None, uses
-                the client's default_temperature.
-            top_p: Top-p (nucleus) sampling parameter.
+                the model's optimal temperature from config.
+            top_p: Top-p (nucleus) sampling parameter. If None, uses
+                the model's optimal top_p from config.
             system_prompt: Optional system message to set context.
 
         Returns:
@@ -181,17 +238,14 @@ class LLMClient:
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
 
-            # Use provided temperature or fall back to default
-            actual_temperature = (
-                temperature if temperature is not None else self.default_temperature
-            )
+            # Build sampling params using model config
+            sampling_params = self._build_sampling_params(temperature, top_p)
 
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=scaled_tokens,
-                temperature=actual_temperature,
-                top_p=top_p,
+                **sampling_params,
             )
 
             content = response.choices[0].message.content
@@ -207,7 +261,7 @@ class LLMClient:
         prompt: str,
         max_tokens: int = 2000,
         temperature: float | None = None,
-        top_p: float = 0.9,
+        top_p: float | None = None,
         system_prompt: str | None = None,
     ) -> str:
         """Generate text using LLM (asynchronous).
@@ -216,8 +270,9 @@ class LLMClient:
             prompt: User prompt/question.
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature (0.0-2.0). If None, uses
-                the client's default_temperature.
-            top_p: Top-p (nucleus) sampling parameter.
+                the model's optimal temperature from config.
+            top_p: Top-p (nucleus) sampling parameter. If None, uses
+                the model's optimal top_p from config.
             system_prompt: Optional system message to set context.
 
         Returns:
@@ -238,10 +293,8 @@ class LLMClient:
             # Scale tokens for reasoning models
             scaled_tokens = self._scale_tokens(max_tokens)
 
-            # Use provided temperature or fall back to default
-            actual_temperature = (
-                temperature if temperature is not None else self.default_temperature
-            )
+            # Build sampling params using model config
+            sampling_params = self._build_sampling_params(temperature, top_p)
 
             logger.debug(
                 f"Sending async request to {self.model} with {len(prompt)} char prompt"
@@ -250,14 +303,14 @@ class LLMClient:
                     if scaled_tokens != max_tokens
                     else ""
                 )
+                + f" (params: {sampling_params})"
             )
 
             response = await self.async_client.chat.completions.create(
                 model=self.model,
                 messages=messages,  # type: ignore[arg-type]
                 max_tokens=scaled_tokens,
-                temperature=actual_temperature,
-                top_p=top_p,
+                **sampling_params,
             )
 
             # Extract content with fallback for non-standard API responses

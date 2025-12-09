@@ -580,3 +580,93 @@ print("code")
 ```"""
         result = client._validate_and_clean_content(content)
         assert result == content
+
+
+class TestLLMClientModelConfig:
+    """Test LLMClient model configuration integration."""
+
+    def test_model_config_stored(self) -> None:
+        """Test that model config is stored on client initialization."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            assert hasattr(client, "_model_config")
+            assert client._model_config.name == "OpenAI GPT-4"
+
+    def test_model_config_temperature_used(self) -> None:
+        """Test that model config temperature is used as default."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # DeepSeek V3 has optimal temp of 0.3
+            client = LLMClient(api_key="sk-test", model="deepseek-chat")
+            assert client.default_temperature == 0.3
+
+    def test_explicit_temperature_overrides_config(self) -> None:
+        """Test that explicit temperature overrides model config."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # DeepSeek V3 has optimal temp of 0.3, but we override to 0.8
+            client = LLMClient(api_key="sk-test", model="deepseek-chat", default_temperature=0.8)
+            assert client.default_temperature == 0.8
+
+    def test_build_sampling_params_basic(self) -> None:
+        """Test _build_sampling_params returns correct parameters."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            params = client._build_sampling_params()
+            assert "temperature" in params
+            assert params["temperature"] == 0.7  # GPT-4 default
+            assert "top_p" in params
+
+    def test_build_sampling_params_with_override(self) -> None:
+        """Test _build_sampling_params with user overrides."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gpt-4-turbo")
+            params = client._build_sampling_params(temperature=0.3, top_p=0.5)
+            assert params["temperature"] == 0.3
+            assert params["top_p"] == 0.5
+
+    def test_build_sampling_params_o1_model(self) -> None:
+        """Test _build_sampling_params for o1 model (no temp/top_p support)."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="o1")
+            params = client._build_sampling_params()
+            # o1 doesn't support temperature or top_p
+            assert "temperature" not in params
+            assert "top_p" not in params
+
+    def test_build_sampling_params_claude_mutual_exclusion(self) -> None:
+        """Test _build_sampling_params for Claude (mutually exclusive temp/top_p)."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="claude-3-opus")
+            params = client._build_sampling_params()
+            # Claude supports both but they're mutually exclusive - should only have one
+            assert "temperature" in params
+            assert "top_p" not in params  # prefer_temperature=True
+
+    def test_model_config_qwen_non_thinking(self) -> None:
+        """Test Qwen non-thinking mode config."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="qwen-72b")
+            assert client.default_temperature == 0.7
+            # Qwen non-thinking is NOT marked as reasoning model in llm_client patterns
+            # but model_config knows it's not a reasoning model
+            assert client._model_config.is_reasoning_model is False
+
+    def test_model_config_deepseek_r1_reasoning(self) -> None:
+        """Test DeepSeek R1 is detected as reasoning via model config."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="deepseek-r1")
+            assert client._is_reasoning_model is True
+            assert client._model_config.is_reasoning_model is True
+            assert client.default_temperature == 0.6  # R1 optimal
+
+    def test_unknown_model_uses_default_config(self) -> None:
+        """Test unknown models use default configuration."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="unknown-model-xyz")
+            assert client._model_config.name == "default"
+            assert client.default_temperature == 0.7
+
+    def test_gemma_uses_higher_temperature(self) -> None:
+        """Test Gemma uses its optimal higher temperature."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            client = LLMClient(api_key="sk-test", model="gemma-3-27b")
+            assert client.default_temperature == 1.0  # Gemma's optimal is higher

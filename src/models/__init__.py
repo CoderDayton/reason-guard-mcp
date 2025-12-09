@@ -18,9 +18,19 @@ from .knowledge_graph import (
     RelationType,
 )
 from .llm_client import LLMClient
+from .model_config import (
+    DEFAULT_CONFIG,
+    ModelCapability,
+    ModelConfig,
+    get_api_params,
+    get_effective_temperature,
+    get_model_config,
+    is_reasoning_model,
+)
 
 __all__ = [
     "ContextEncoder",
+    "DEFAULT_CONFIG",
     "EncoderConfig",
     "EncoderException",
     "EncodingResult",
@@ -30,8 +40,14 @@ __all__ = [
     "KnowledgeGraphException",
     "KnowledgeGraphExtractor",
     "LLMClient",
+    "ModelCapability",
+    "ModelConfig",
     "PoolingStrategy",
     "Relation",
     "RelationType",
     "encode_text",
+    "get_api_params",
+    "get_effective_temperature",
+    "get_model_config",
+    "is_reasoning_model",
 ]
