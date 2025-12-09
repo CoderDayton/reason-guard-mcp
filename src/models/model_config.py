@@ -340,46 +340,15 @@ _WITH_TOP_K = frozenset(
 # Model Family Configurations
 # =============================================================================
 
-# OpenAI GPT-5 family (latest)
-GPT5_CONFIG = ModelConfig(
-    name="OpenAI GPT-5",
+# OpenAI GPT family (GPT-4, GPT-4o, GPT-5, etc.)
+GPT_CONFIG = ModelConfig(
+    name="OpenAI GPT",
     temperature=0.7,
     top_p=0.95,
     max_context_length=128_000,
     max_output_tokens=16_384,
     capabilities=_STANDARD_CAPS,
     notes="General: 0.7, Coding: 0.0-0.3. Alter temp OR top_p, not both recommended.",
-)
-
-GPT5_CODING_CONFIG = ModelConfig(
-    name="OpenAI GPT-5 (Coding)",
-    temperature=0.2,
-    top_p=0.95,
-    max_context_length=128_000,
-    max_output_tokens=16_384,
-    capabilities=_STANDARD_CAPS,
-    notes="Lower temperature for deterministic code generation.",
-)
-
-# OpenAI GPT-4 family (legacy, same context as GPT-5)
-GPT4_CONFIG = ModelConfig(
-    name="OpenAI GPT-4",
-    temperature=0.7,
-    top_p=0.95,
-    max_context_length=128_000,
-    max_output_tokens=16_384,
-    capabilities=_STANDARD_CAPS,
-    notes="General: 0.7, Coding: 0.0-0.3. Alter temp OR top_p, not both recommended.",
-)
-
-GPT4_CODING_CONFIG = ModelConfig(
-    name="OpenAI GPT-4 (Coding)",
-    temperature=0.2,
-    top_p=0.95,
-    max_context_length=128_000,
-    max_output_tokens=16_384,
-    capabilities=_STANDARD_CAPS,
-    notes="Lower temperature for deterministic code generation.",
 )
 
 # OpenAI o1/o3 reasoning models - fixed sampling, no params supported
@@ -422,24 +391,14 @@ DEEPSEEK_R1_CONFIG = ModelConfig(
 )
 
 # Mistral family
-MISTRAL_SMALL_CONFIG = ModelConfig(
-    name="Mistral Small 3.2",
-    temperature=0.15,
-    top_p=None,
-    max_context_length=32_000,
-    max_output_tokens=8_192,
-    capabilities=frozenset({ModelCapability.SUPPORTS_TEMPERATURE}),
-    notes="Very low temperature recommended for Mistral Small.",
-)
-
-MISTRAL_LARGE_CONFIG = ModelConfig(
-    name="Mistral Large/Medium",
+MISTRAL_CONFIG = ModelConfig(
+    name="Mistral",
     temperature=0.7,
     top_p=0.95,
     max_context_length=128_000,
     max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
-    notes="Standard settings for Mistral Large/Medium models.",
+    notes="Standard settings for Mistral models.",
 )
 
 MAGISTRAL_CONFIG = ModelConfig(
@@ -496,25 +455,15 @@ QWEN_NON_THINKING_CONFIG = ModelConfig(
     notes="For non-thinking mode. presence_penalty=1.5 reduces repetition.",
 )
 
-# Llama family
-LLAMA4_CONFIG = ModelConfig(
-    name="Llama 4",
+# Llama family (Llama 3, Llama 4, etc.)
+LLAMA_CONFIG = ModelConfig(
+    name="Meta Llama",
     temperature=0.6,
     top_p=0.9,
     max_context_length=128_000,
     max_output_tokens=8_192,
     capabilities=_STANDARD_CAPS,
     notes="From Meta's generation_config.json.",
-)
-
-LLAMA3_CONFIG = ModelConfig(
-    name="Llama 3",
-    temperature=0.6,
-    top_p=0.9,
-    max_context_length=128_000,
-    max_output_tokens=8_192,
-    capabilities=_STANDARD_CAPS,
-    notes="Standard settings for Llama 3 family.",
 )
 
 # Google Gemma family
@@ -662,26 +611,19 @@ GLM_REASONING_CONFIG = ModelConfig(
 MODEL_PATTERNS: list[tuple[re.Pattern[str], ModelConfig]] = [
     # OpenAI reasoning models (o1, o3, o1-mini, o1-preview, o3-mini)
     (re.compile(r"\b(o1|o3)(-mini|-preview)?\b", re.IGNORECASE), O1_CONFIG),
-    # OpenAI GPT-5 variants (latest)
-    (re.compile(r"gpt-5.*codex|gpt-5.*code", re.IGNORECASE), GPT5_CODING_CONFIG),
-    (re.compile(r"gpt-5|gpt5", re.IGNORECASE), GPT5_CONFIG),
-    # OpenAI GPT-4 variants (legacy)
-    (re.compile(r"gpt-4.*codex|gpt-4.*code", re.IGNORECASE), GPT4_CODING_CONFIG),
-    (re.compile(r"gpt-4|gpt4", re.IGNORECASE), GPT4_CONFIG),
-    (re.compile(r"gpt-3\.5|gpt3\.5", re.IGNORECASE), GPT4_CONFIG),  # Similar settings
+    # OpenAI GPT family (GPT-3.5, GPT-4, GPT-4o, GPT-5, etc.)
+    (re.compile(r"gpt", re.IGNORECASE), GPT_CONFIG),
     # DeepSeek
     (re.compile(r"deepseek.*r1|deepseek.*reason", re.IGNORECASE), DEEPSEEK_R1_CONFIG),
     (re.compile(r"deepseek", re.IGNORECASE), DEEPSEEK_V3_CONFIG),
     # Mistral
     (re.compile(r"magistral|mistral.*reason", re.IGNORECASE), MAGISTRAL_CONFIG),
-    (re.compile(r"mistral.*small", re.IGNORECASE), MISTRAL_SMALL_CONFIG),
-    (re.compile(r"mistral", re.IGNORECASE), MISTRAL_LARGE_CONFIG),
+    (re.compile(r"mistral", re.IGNORECASE), MISTRAL_CONFIG),
     # Qwen - check for thinking mode indicators
     (re.compile(r"qwen.*think|qwq", re.IGNORECASE), QWEN_THINKING_CONFIG),
     (re.compile(r"qwen", re.IGNORECASE), QWEN_NON_THINKING_CONFIG),
     # Llama
-    (re.compile(r"llama.*4|llama-4", re.IGNORECASE), LLAMA4_CONFIG),
-    (re.compile(r"llama", re.IGNORECASE), LLAMA3_CONFIG),
+    (re.compile(r"llama", re.IGNORECASE), LLAMA_CONFIG),
     # Google
     (re.compile(r"gemma", re.IGNORECASE), GEMMA_CONFIG),
     (re.compile(r"gemini", re.IGNORECASE), GEMINI_CONFIG),

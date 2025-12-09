@@ -13,10 +13,9 @@ from src.models.model_config import (
     DEFAULT_MAX_OUTPUT_TOKENS,
     GEMINI_CONFIG,
     GEMMA_CONFIG,
-    GPT4_CONFIG,
-    GPT5_CONFIG,
-    LLAMA4_CONFIG,
-    MISTRAL_SMALL_CONFIG,
+    GPT_CONFIG,
+    LLAMA_CONFIG,
+    MISTRAL_CONFIG,
     O1_CONFIG,
     QWEN_NON_THINKING_CONFIG,
     QWEN_THINKING_CONFIG,
@@ -222,17 +221,19 @@ class TestGetModelConfig:
         assert config == DEFAULT_CONFIG
 
     # OpenAI models
-    def test_gpt5_detection(self) -> None:
-        """Test GPT-5 model detection."""
-        for model in ["gpt-5", "gpt-5.1", "gpt-5.1-mini", "GPT5"]:
+    def test_gpt_detection(self) -> None:
+        """Test GPT model family detection (GPT-3.5, GPT-4, GPT-5, etc.)."""
+        for model in [
+            "gpt-5",
+            "gpt-5.1",
+            "gpt-4",
+            "gpt-4-turbo",
+            "gpt-4o",
+            "gpt-3.5-turbo",
+            "GPT4",
+        ]:
             config = get_model_config(model)
-            assert config == GPT5_CONFIG, f"Failed for {model}"
-
-    def test_gpt4_detection(self) -> None:
-        """Test GPT-4 model detection (legacy)."""
-        for model in ["gpt-4", "gpt-4-turbo", "gpt-4o", "gpt-4o-mini", "GPT4"]:
-            config = get_model_config(model)
-            assert config == GPT4_CONFIG, f"Failed for {model}"
+            assert config == GPT_CONFIG, f"Failed for {model}"
 
     def test_o1_detection(self) -> None:
         """Test OpenAI o1/o3 reasoning model detection."""
@@ -257,11 +258,11 @@ class TestGetModelConfig:
             assert config.is_reasoning_model
 
     # Mistral models
-    def test_mistral_small_detection(self) -> None:
-        """Test Mistral Small detection."""
-        config = get_model_config("mistral-small-3.2")
-        assert config == MISTRAL_SMALL_CONFIG
-        assert config.temperature == 0.15  # Very low temp
+    def test_mistral_detection(self) -> None:
+        """Test Mistral model family detection."""
+        for model in ["mistral-small-3.2", "mistral-large", "mistral-7b"]:
+            config = get_model_config(model)
+            assert config == MISTRAL_CONFIG, f"Failed for {model}"
 
     # Qwen models
     def test_qwen_thinking_detection(self) -> None:
@@ -279,11 +280,11 @@ class TestGetModelConfig:
             assert not config.is_reasoning_model
 
     # Llama models
-    def test_llama4_detection(self) -> None:
-        """Test Llama 4 detection."""
-        for model in ["llama-4", "llama4", "Llama-4-70b"]:
+    def test_llama_detection(self) -> None:
+        """Test Llama model family detection."""
+        for model in ["llama-4", "llama4", "llama-3", "llama-2", "Llama-70b"]:
             config = get_model_config(model)
-            assert config == LLAMA4_CONFIG, f"Failed for {model}"
+            assert config == LLAMA_CONFIG, f"Failed for {model}"
 
     # Google models
     def test_gemma_detection(self) -> None:
@@ -433,10 +434,10 @@ class TestModelConfigValues:
         assert config.presence_penalty == 1.5
         assert not config.is_reasoning_model
 
-    def test_mistral_small_values(self) -> None:
-        """Test Mistral Small 3.2 optimal values."""
-        config = MISTRAL_SMALL_CONFIG
-        assert config.temperature == 0.15  # Very low
+    def test_mistral_values(self) -> None:
+        """Test Mistral optimal values."""
+        config = MISTRAL_CONFIG
+        assert config.temperature == 0.7
         assert not config.is_reasoning_model
 
     def test_gemma_values(self) -> None:
@@ -446,9 +447,9 @@ class TestModelConfigValues:
         assert config.top_p == 0.96
         assert config.top_k == 64
 
-    def test_llama4_values(self) -> None:
-        """Test Llama 4 optimal values."""
-        config = LLAMA4_CONFIG
+    def test_llama_values(self) -> None:
+        """Test Llama optimal values."""
+        config = LLAMA_CONFIG
         assert config.temperature == 0.6
         assert config.top_p == 0.9
 
@@ -473,8 +474,8 @@ class TestEdgeCases:
     def test_case_insensitive_matching(self) -> None:
         """Test that model matching is case-insensitive."""
         models = [
-            ("GPT-4", GPT4_CONFIG),
-            ("gpt-4", GPT4_CONFIG),
+            ("GPT-4", GPT_CONFIG),
+            ("gpt-4", GPT_CONFIG),
             ("CLAUDE-3-OPUS", CLAUDE_CONFIG),
             ("DeepSeek-R1", DEEPSEEK_R1_CONFIG),
         ]
@@ -502,9 +503,9 @@ class TestEdgeCases:
         """Test partial model names don't cause false positives."""
         # "o1" should match o1 config, but "model-01" should not
         assert get_model_config("o1") == O1_CONFIG
-        # "o10" contains "o1" but is a different model - pattern uses word boundary
+        # "gpt-4o-mini" contains "gpt" and should match GPT config
         config = get_model_config("gpt-4o-mini")
-        assert config == GPT4_CONFIG  # Should match gpt-4, not o1
+        assert config == GPT_CONFIG
 
     def test_frozen_config_immutable(self) -> None:
         """Test that ModelConfig is immutable (frozen dataclass)."""
@@ -743,15 +744,10 @@ class TestContextWindowManagement:
 class TestContextLengthValues:
     """Tests for actual context length values in model configs."""
 
-    def test_gpt5_context_length(self) -> None:
-        """Test GPT-5 has correct context length."""
-        assert GPT5_CONFIG.max_context_length == 128_000
-        assert GPT5_CONFIG.max_output_tokens == 16_384
-
-    def test_gpt4_context_length(self) -> None:
-        """Test GPT-4 has correct context length."""
-        assert GPT4_CONFIG.max_context_length == 128_000
-        assert GPT4_CONFIG.max_output_tokens == 16_384
+    def test_gpt_context_length(self) -> None:
+        """Test GPT family has correct context length."""
+        assert GPT_CONFIG.max_context_length == 128_000
+        assert GPT_CONFIG.max_output_tokens == 16_384
 
     def test_o1_context_length(self) -> None:
         """Test o1/o3 has larger context for reasoning."""
@@ -772,9 +768,9 @@ class TestContextLengthValues:
         """Test Gemini 1.5 Pro has 2M context."""
         assert GEMINI_CONFIG.max_context_length == 2_000_000
 
-    def test_llama4_context_length(self) -> None:
-        """Test Llama 4 has correct context length."""
-        assert LLAMA4_CONFIG.max_context_length == 128_000
+    def test_llama_context_length(self) -> None:
+        """Test Llama has correct context length."""
+        assert LLAMA_CONFIG.max_context_length == 128_000
 
     def test_default_context_constants(self) -> None:
         """Test default context constants are exported."""

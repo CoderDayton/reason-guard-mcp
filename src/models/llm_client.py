@@ -16,19 +16,6 @@ from src.utils.retry import retry_with_backoff
 if TYPE_CHECKING:
     pass
 
-# Patterns that identify reasoning models needing higher token limits
-# Note: This is kept for backward compatibility with token scaling logic.
-# For comprehensive model detection, use model_config.get_model_config()
-REASONING_MODEL_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"minimax", re.IGNORECASE),
-    re.compile(r"deepseek", re.IGNORECASE),
-    re.compile(r"qwen", re.IGNORECASE),
-    re.compile(r"\bo1\b", re.IGNORECASE),  # o1, o1-preview, o1-mini
-    re.compile(r"reasoning", re.IGNORECASE),
-    re.compile(r"think", re.IGNORECASE),
-    re.compile(r"glm.*tee", re.IGNORECASE),  # GLM-4 TEE reasoning variant
-]
-
 
 class LLMClient:
     """Wrapper around OpenAI LLM with retry logic and structured error handling.
@@ -106,10 +93,9 @@ class LLMClient:
         else:
             self.default_temperature = 0.7
 
-        # Auto-detect if this is a reasoning model (use both methods for token scaling)
-        self._is_reasoning_model = (
-            self._detect_reasoning_model(model) or self._model_config.is_reasoning_model
-        )
+        # Use model config to determine if this is a reasoning model (for token scaling)
+        # Runtime detection of reasoning_content field handles unknown reasoning models
+        self._is_reasoning_model = self._model_config.is_reasoning_model
 
         # Set token multiplier: explicit > auto-detect > default
         if reasoning_token_multiplier is not None:
@@ -144,19 +130,6 @@ class LLMClient:
                 f"LLM client initialized with model: {model} "
                 f"(config: {self._model_config.name}, temp: {self.default_temperature})"
             )
-
-    @staticmethod
-    def _detect_reasoning_model(model_name: str) -> bool:
-        """Detect if model is a reasoning model based on name patterns.
-
-        Args:
-            model_name: The model identifier string.
-
-        Returns:
-            True if model appears to be a reasoning model.
-
-        """
-        return any(pattern.search(model_name) for pattern in REASONING_MODEL_PATTERNS)
 
     def _scale_tokens(self, max_tokens: int) -> int:
         """Scale max_tokens by the reasoning multiplier.
@@ -366,6 +339,15 @@ class LLMClient:
                     # 3. output - used by some providers
                     reasoning_content = msg_dict.get("reasoning_content")
                     if reasoning_content:
+                        # Runtime detection: model returned reasoning_content
+                        # This handles unknown reasoning models not in our config
+                        if not self._is_reasoning_model:
+                            logger.info(
+                                f"Model '{self.model}' returned reasoning_content field "
+                                f"(runtime-detected reasoning model). Consider adding "
+                                f"reasoning_token_multiplier=3.0 for better token allocation."
+                            )
+
                         # Warn if reasoning model hit token limit - answer may be incomplete
                         if finish_reason == "length":
                             logger.warning(
@@ -552,8 +534,6 @@ class LLMClient:
         if not reasoning_content:
             return ""
 
-        import re
-
         # Common patterns that indicate the start of a final answer
         answer_markers = [
             "Thus we can produce:",
@@ -661,8 +641,6 @@ class LLMClient:
             content exists after the tags.
 
         """
-        import re
-
         # Check for <think> tags (case-insensitive, handles whitespace)
         think_pattern = re.compile(r"<think>\s*(.*?)\s*</think>\s*(.*)", re.DOTALL | re.IGNORECASE)
         match = think_pattern.search(content)

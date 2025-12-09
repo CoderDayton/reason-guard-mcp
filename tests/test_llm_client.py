@@ -111,11 +111,19 @@ class TestLLMClientReasoningModelDetection:
             assert client._is_reasoning_model is True
             assert client._token_multiplier == 3.0
 
-    def test_qwen_detected_as_reasoning(self) -> None:
-        """Test Qwen models are detected as reasoning models."""
+    def test_qwen_thinking_detected_as_reasoning(self) -> None:
+        """Test Qwen thinking-mode models are detected as reasoning models."""
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
-            client = LLMClient(api_key="sk-test", model="qwen-2.5-coder")
+            # Qwen thinking mode (with /think or qwq) is reasoning
+            client = LLMClient(api_key="sk-test", model="qwq-32b")
             assert client._is_reasoning_model is True
+
+    def test_qwen_non_thinking_not_reasoning(self) -> None:
+        """Test Qwen non-thinking models are NOT detected as reasoning models."""
+        with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
+            # Qwen non-thinking mode is NOT a reasoning model
+            client = LLMClient(api_key="sk-test", model="qwen-2.5-coder")
+            assert client._is_reasoning_model is False
 
     def test_o1_detected_as_reasoning(self) -> None:
         """Test o1 models are detected as reasoning models."""
@@ -440,6 +448,95 @@ class TestLLMClientReasoningExtraction:
         assert "We need to" not in result
 
 
+class TestLLMClientRuntimeReasoningDetection:
+    """Test runtime detection of reasoning models via reasoning_content field."""
+
+    @pytest.mark.asyncio
+    async def test_runtime_detection_logs_for_unknown_reasoning_model(self) -> None:
+        """Test that unknown models returning reasoning_content get logged."""
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+            patch("src.models.llm_client.logger") as mock_logger,
+        ):
+            # Create client with unknown model (not in model_config)
+            client = LLMClient(api_key="sk-test", model="unknown-reasoning-model-xyz")
+            assert client._is_reasoning_model is False  # Not pre-detected
+
+            # Mock response with reasoning_content (runtime detection)
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None
+            mock_message.model_dump.return_value = {
+                "content": None,
+                "role": "assistant",
+                "reasoning_content": "Let me think... Thus: The answer is 42.",
+            }
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "stop"
+
+            mock_response = MagicMock()
+            mock_response.choices = [mock_choice]
+
+            mock_async_openai.return_value.chat.completions.create = AsyncMock(
+                return_value=mock_response
+            )
+            client.async_client = mock_async_openai.return_value
+
+            result = await client.generate_async("What is the answer?")
+
+            # Should extract answer from reasoning
+            assert "42" in result
+
+            # Should log info about runtime detection
+            mock_logger.info.assert_any_call(
+                "Model 'unknown-reasoning-model-xyz' returned reasoning_content field "
+                "(runtime-detected reasoning model). Consider adding "
+                "reasoning_token_multiplier=3.0 for better token allocation."
+            )
+
+    @pytest.mark.asyncio
+    async def test_known_reasoning_model_no_extra_log(self) -> None:
+        """Test that known reasoning models don't get the runtime detection log."""
+        with (
+            patch("src.models.llm_client.OpenAI"),
+            patch("src.models.llm_client.AsyncOpenAI") as mock_async_openai,
+            patch("src.models.llm_client.logger") as mock_logger,
+        ):
+            # Create client with known reasoning model
+            client = LLMClient(api_key="sk-test", model="deepseek-r1")
+            assert client._is_reasoning_model is True  # Pre-detected
+
+            # Mock response with reasoning_content
+            mock_message = MagicMock(spec=["content", "model_dump"])
+            mock_message.content = None
+            mock_message.model_dump.return_value = {
+                "content": None,
+                "role": "assistant",
+                "reasoning_content": "Thus: The answer is 42.",
+            }
+
+            mock_choice = MagicMock(spec=["message", "finish_reason"])
+            mock_choice.message = mock_message
+            mock_choice.finish_reason = "stop"
+
+            mock_response = MagicMock()
+            mock_response.choices = [mock_choice]
+
+            mock_async_openai.return_value.chat.completions.create = AsyncMock(
+                return_value=mock_response
+            )
+            client.async_client = mock_async_openai.return_value
+
+            await client.generate_async("What is the answer?")
+
+            # Should NOT log the runtime detection message for known models
+            for call in mock_logger.info.call_args_list:
+                if call.args:
+                    assert "runtime-detected reasoning model" not in call.args[0]
+
+
 class TestLLMClientThinkTagStripping:
     """Test LLMClient <think> tag handling."""
 
@@ -590,7 +687,7 @@ class TestLLMClientModelConfig:
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
             client = LLMClient(api_key="sk-test", model="gpt-5.1")
             assert hasattr(client, "_model_config")
-            assert client._model_config.name == "OpenAI GPT-5"
+            assert client._model_config.name == "OpenAI GPT"
 
     def test_model_config_temperature_used(self) -> None:
         """Test that model config temperature is used as default."""
@@ -646,9 +743,9 @@ class TestLLMClientModelConfig:
         with patch("src.models.llm_client.OpenAI"), patch("src.models.llm_client.AsyncOpenAI"):
             client = LLMClient(api_key="sk-test", model="qwen-72b")
             assert client.default_temperature == 0.7
-            # Qwen non-thinking is NOT marked as reasoning model in llm_client patterns
-            # but model_config knows it's not a reasoning model
+            # Qwen non-thinking is NOT a reasoning model
             assert client._model_config.is_reasoning_model is False
+            assert client._is_reasoning_model is False
 
     def test_model_config_deepseek_r1_reasoning(self) -> None:
         """Test DeepSeek R1 is detected as reasoning via model config."""
