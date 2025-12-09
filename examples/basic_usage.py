@@ -1,4 +1,4 @@
-"""Basic usage examples for Enhanced CoT MCP Server.
+"""Basic usage examples for MatrixMind MCP Server.
 
 Run after starting the server:
     fastmcp run src/server.py
@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+from dotenv import load_dotenv
+from mcp.types import TextContent
+
+load_dotenv()
 
 
 async def main() -> None:
@@ -33,7 +38,7 @@ async def main() -> None:
 
         long_text = (
             """
-        The Theory of Relativity, developed by Albert Einstein, 
+        The Theory of Relativity, developed by Albert Einstein,
         fundamentally changed our understanding of space and time.
         Einstein published two papers on relativity: Special Relativity in 1905
         and General Relativity in 1915. These theories explained phenomena
@@ -56,7 +61,8 @@ async def main() -> None:
             },
         )
 
-        result = json.loads(compress_result.content[0].text)
+        content = compress_result.content[0]
+        result = json.loads(content.text if isinstance(content, TextContent) else "{}")
         print(f"Original tokens: {result.get('original_tokens', 'N/A')}")
         print(f"Compressed tokens: {result.get('compressed_tokens', 'N/A')}")
         print(f"Tokens saved: {result.get('tokens_saved', 'N/A')}")
@@ -76,7 +82,8 @@ async def main() -> None:
             },
         )
 
-        mot_data = json.loads(mot_result.content[0].text)
+        mot_content = mot_result.content[0]
+        mot_data = json.loads(mot_content.text if isinstance(mot_content, TextContent) else "{}")
         print(f"Answer: {mot_data.get('answer', 'N/A')[:200]}...")
         print(f"Confidence: {mot_data.get('confidence', 'N/A'):.1%}")
         print(f"Reasoning steps: {mot_data.get('num_reasoning_steps', 'N/A')}")
@@ -94,12 +101,14 @@ async def main() -> None:
             },
         )
 
-        verify_data = json.loads(verify_result.content[0].text)
+        verify_content = verify_result.content[0]
+        verify_text = verify_content.text if isinstance(verify_content, TextContent) else "{}"
+        verify_data = json.loads(verify_text)
         print(f"Verified: {verify_data.get('verified', 'N/A')}")
         print(f"Confidence: {verify_data.get('confidence', 'N/A'):.1%}")
-        print(
-            f"Claims verified: {verify_data.get('claims_verified', 'N/A')}/{verify_data.get('claims_total', 'N/A')}"
-        )
+        claims_verified = verify_data.get("claims_verified", "N/A")
+        claims_total = verify_data.get("claims_total", "N/A")
+        print(f"Claims verified: {claims_verified}/{claims_total}")
         print(f"Recommendation: {verify_data.get('recommendation', 'N/A')}")
 
         # Example 4: Get strategy recommendation
@@ -109,12 +118,16 @@ async def main() -> None:
         strategy_result = await client.call_tool(
             "recommend_reasoning_strategy",
             {
-                "problem": "Find if there is a path connecting node A to node D in a directed graph",
+                "problem": (
+                    "Find if there is a path connecting node A to node D in a directed graph"
+                ),
                 "token_budget": 3000,
             },
         )
 
-        strategy_data = json.loads(strategy_result.content[0].text)
+        strategy_content = strategy_result.content[0]
+        strategy_text = strategy_content.text if isinstance(strategy_content, TextContent) else "{}"
+        strategy_data = json.loads(strategy_text)
         print(f"Recommended: {strategy_data.get('recommended_strategy', 'N/A')}")
         print(f"Estimated steps: {strategy_data.get('estimated_depth_steps', 'N/A')}")
         print(f"Confidence: {strategy_data.get('strategy_confidence', 'N/A'):.1%}")
