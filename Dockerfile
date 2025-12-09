@@ -2,7 +2,7 @@
 # Multi-stage build for smaller final image
 
 # Stage 1: Build dependencies
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 
 WORKDIR /app
 
@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir build && \
     pip install --no-cache-dir -e ".[all]"
 
 # Stage 2: Runtime
-FROM python:3.11-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 WORKDIR /app
 
