@@ -325,6 +325,7 @@ class TestKnowledgeGraph:
         kg.add_entity("einstein", aliases=["A. Einstein"])
 
         entity = kg.get_entity("Einstein")
+        assert entity is not None
         assert "Albert" in entity.aliases
         assert "A. Einstein" in entity.aliases
 

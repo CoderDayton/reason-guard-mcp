@@ -38,8 +38,8 @@ class MockLLMClient:
         self,
         prompt: str,
         max_tokens: int = 2000,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        temperature: float | None = None,
+        top_p: float | None = None,
         system_prompt: str | None = None,
     ) -> str:
         """Simulate LLM generation with minimal latency."""
@@ -52,8 +52,8 @@ class MockLLMClient:
         self,
         prompt: str,
         max_tokens: int = 2000,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
+        temperature: float | None = None,
+        top_p: float | None = None,
         system_prompt: str | None = None,
     ) -> str:
         """Simulate async LLM generation."""

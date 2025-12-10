@@ -6,10 +6,15 @@ Run with: pytest tests/test_smoke.py -v
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 
 from src.utils.errors import CompressionException
 from src.utils.schema import CompressionResult, ReasoningResult, VerificationResult
+
+if TYPE_CHECKING:
+    from fastmcp.tools.tool import FunctionTool
 
 
 class TestSchemas:
@@ -185,8 +190,9 @@ class TestServerTools:
         from src.server import compress_prompt
 
         assert isinstance(compress_prompt, FunctionTool)
-        assert callable(compress_prompt.fn)
-        assert compress_prompt.name == "compress_prompt"
+        tool: FunctionTool = compress_prompt
+        assert callable(tool.fn)
+        assert tool.name == "compress_prompt"
 
     async def test_matrix_of_thought_success(self) -> None:
         """Test matrix_of_thought_reasoning tool."""
@@ -195,8 +201,9 @@ class TestServerTools:
         from src.server import matrix_of_thought_reasoning
 
         assert isinstance(matrix_of_thought_reasoning, FunctionTool)
-        assert callable(matrix_of_thought_reasoning.fn)
-        assert matrix_of_thought_reasoning.name == "matrix_of_thought_reasoning"
+        tool: FunctionTool = matrix_of_thought_reasoning
+        assert callable(tool.fn)
+        assert tool.name == "matrix_of_thought_reasoning"
 
     async def test_long_chain_success(self) -> None:
         """Test long_chain_of_thought tool."""
@@ -205,8 +212,9 @@ class TestServerTools:
         from src.server import long_chain_of_thought
 
         assert isinstance(long_chain_of_thought, FunctionTool)
-        assert callable(long_chain_of_thought.fn)
-        assert long_chain_of_thought.name == "long_chain_of_thought"
+        tool: FunctionTool = long_chain_of_thought
+        assert callable(tool.fn)
+        assert tool.name == "long_chain_of_thought"
 
     async def test_verify_fact_success(self) -> None:
         """Test verify_fact_consistency tool."""
@@ -215,8 +223,9 @@ class TestServerTools:
         from src.server import verify_fact_consistency
 
         assert isinstance(verify_fact_consistency, FunctionTool)
-        assert callable(verify_fact_consistency.fn)
-        assert verify_fact_consistency.name == "verify_fact_consistency"
+        tool: FunctionTool = verify_fact_consistency
+        assert callable(tool.fn)
+        assert tool.name == "verify_fact_consistency"
 
     async def test_recommend_strategy_success(self) -> None:
         """Test recommend_reasoning_strategy tool."""
@@ -225,5 +234,6 @@ class TestServerTools:
         from src.server import recommend_reasoning_strategy
 
         assert isinstance(recommend_reasoning_strategy, FunctionTool)
-        assert callable(recommend_reasoning_strategy.fn)
-        assert recommend_reasoning_strategy.name == "recommend_reasoning_strategy"
+        tool: FunctionTool = recommend_reasoning_strategy
+        assert callable(tool.fn)
+        assert tool.name == "recommend_reasoning_strategy"
