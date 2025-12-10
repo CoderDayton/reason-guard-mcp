@@ -176,12 +176,13 @@ Multi-dimensional reasoning combining breadth (strategies) and depth (refinement
 {
     "question": "Who invented the telephone and why?",
     "context": "Historical context about inventors...",
-    "matrix_rows": 3,  # 3 different strategies
-    "matrix_cols": 4   # 4 refinement iterations
+    "matrix_rows": 3,           # 3 different strategies
+    "matrix_cols": 4,           # 4 refinement iterations
+    "use_knowledge_graph": true # Extract entities/relations for multi-hop reasoning
 }
 ```
 
-**Returns:** `answer`, `confidence`, `reasoning_steps`, `matrix_shape`
+**Returns:** `answer`, `confidence`, `reasoning_steps`, `matrix_shape`, `knowledge_graph_stats`
 
 ### `long_chain_of_thought`
 
@@ -191,11 +192,13 @@ Sequential step-by-step reasoning with verification checkpoints.
 {
     "problem": "Make 24 using the numbers 3, 4, 5, 6",
     "num_steps": 15,
-    "verify_intermediate": true
+    "verify_intermediate": true,
+    "verification_frequency": 2,  # Verify every N steps (default: 3)
+    "star_iterations": 3          # STaR self-improvement iterations (0=disabled, 1-5 recommended)
 }
 ```
 
-**Returns:** `answer`, `confidence`, `reasoning_steps`, `verification_results`
+**Returns:** `answer`, `confidence`, `reasoning_steps`, `verification_results`, `star_iterations_used`, `star_best_score`
 
 ### `verify_fact_consistency`
 
