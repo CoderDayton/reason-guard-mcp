@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from src.models.llm_client import LLMClient
+from src.models.llm_client import LLMClientProtocol
 from src.utils.errors import MatrixMindException
 
 if TYPE_CHECKING:
@@ -549,7 +549,7 @@ class KnowledgeGraphExtractor:
 
     def __init__(
         self,
-        llm_client: LLMClient | None = None,
+        llm_client: LLMClientProtocol | None = None,
         use_llm: bool = True,
     ) -> None:
         """Initialize extractor.

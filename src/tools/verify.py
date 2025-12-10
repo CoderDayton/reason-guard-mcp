@@ -15,7 +15,7 @@ from src.utils.retry import retry_with_backoff
 from src.utils.schema import VerificationResult
 
 if TYPE_CHECKING:
-    from src.models.llm_client import LLMClient
+    from src.models.llm_client import LLMClientProtocol
 
 
 class FactVerificationTool:
@@ -30,7 +30,7 @@ class FactVerificationTool:
 
     """
 
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: LLMClientProtocol) -> None:
         """Initialize verification tool.
 
         Args:

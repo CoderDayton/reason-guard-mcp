@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from loguru import logger
 from openai import AsyncOpenAI, OpenAI
@@ -15,6 +15,89 @@ from src.utils.retry import retry_with_backoff
 
 if TYPE_CHECKING:
     pass
+
+
+@runtime_checkable
+class LLMClientProtocol(Protocol):
+    """Protocol defining the interface for LLM clients.
+
+    This protocol enables dependency injection and testing by allowing
+    mock implementations that satisfy the same interface as LLMClient.
+
+    Required methods:
+        generate: Synchronous text generation
+        generate_async: Asynchronous text generation
+        estimate_tokens: Token count estimation
+
+    Example:
+        class MockLLMClient:
+            def generate(self, prompt: str, ...) -> str: ...
+            async def generate_async(self, prompt: str, ...) -> str: ...
+            def estimate_tokens(self, text: str) -> int: ...
+
+        # MockLLMClient satisfies LLMClientProtocol
+        def process(client: LLMClientProtocol) -> None:
+            response = client.generate("Hello")
+
+    """
+
+    def generate(
+        self,
+        prompt: str,
+        max_tokens: int = 2000,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Generate text synchronously.
+
+        Args:
+            prompt: User prompt/question.
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature (0.0-2.0).
+            top_p: Top-p (nucleus) sampling parameter.
+            system_prompt: Optional system message.
+
+        Returns:
+            Generated text response.
+
+        """
+        ...
+
+    async def generate_async(
+        self,
+        prompt: str,
+        max_tokens: int = 2000,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Generate text asynchronously.
+
+        Args:
+            prompt: User prompt/question.
+            max_tokens: Maximum tokens in response.
+            temperature: Sampling temperature (0.0-2.0).
+            top_p: Top-p (nucleus) sampling parameter.
+            system_prompt: Optional system message.
+
+        Returns:
+            Generated text response.
+
+        """
+        ...
+
+    def estimate_tokens(self, text: str) -> int:
+        """Estimate token count for text.
+
+        Args:
+            text: Text to estimate tokens for.
+
+        Returns:
+            Estimated token count.
+
+        """
+        ...
 
 
 class LLMClient:

@@ -17,7 +17,7 @@ from .knowledge_graph import (
     Relation,
     RelationType,
 )
-from .llm_client import LLMClient
+from .llm_client import LLMClient, LLMClientProtocol
 from .model_config import (
     DEFAULT_CONFIG,
     DEFAULT_CONTEXT_LENGTH,
@@ -45,6 +45,7 @@ __all__ = [
     "KnowledgeGraphException",
     "KnowledgeGraphExtractor",
     "LLMClient",
+    "LLMClientProtocol",
     "ModelCapability",
     "ModelConfig",
     "PoolingStrategy",
