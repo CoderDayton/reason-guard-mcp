@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from fastmcp.tools.tool import FunctionTool
 
 
 class TestEnvHelpers:
@@ -238,7 +242,8 @@ class TestRecommendStrategy:
         """Test recommendation for serial problems."""
         from src.server import recommend_reasoning_strategy
 
-        result = await recommend_reasoning_strategy.fn(
+        tool = cast("FunctionTool", recommend_reasoning_strategy)
+        result = await tool.fn(
             problem="Find the path from A to B through the graph with constraints",
             token_budget=5000,
         )
@@ -254,7 +259,8 @@ class TestRecommendStrategy:
         """Test recommendation for parallel/exploratory problems."""
         from src.server import recommend_reasoning_strategy
 
-        result = await recommend_reasoning_strategy.fn(
+        tool = cast("FunctionTool", recommend_reasoning_strategy)
+        result = await tool.fn(
             problem="Generate multiple creative options and explore different alternatives",
             token_budget=5000,
         )
@@ -267,7 +273,8 @@ class TestRecommendStrategy:
         """Test recommendation for balanced problems."""
         from src.server import recommend_reasoning_strategy
 
-        result = await recommend_reasoning_strategy.fn(
+        tool = cast("FunctionTool", recommend_reasoning_strategy)
+        result = await tool.fn(
             problem="Analyze this data for insights",
             token_budget=4000,
         )
@@ -281,7 +288,8 @@ class TestRecommendStrategy:
         """Test recommendation includes indicator counts."""
         from src.server import recommend_reasoning_strategy
 
-        result = await recommend_reasoning_strategy.fn(
+        tool = cast("FunctionTool", recommend_reasoning_strategy)
+        result = await tool.fn(
             problem="Test problem",
             token_budget=3000,
         )
@@ -299,7 +307,8 @@ class TestRecommendStrategy:
         mock_ctx = MagicMock()
         mock_ctx.info = AsyncMock()
 
-        await recommend_reasoning_strategy.fn(
+        tool = cast("FunctionTool", recommend_reasoning_strategy)
+        await tool.fn(
             problem="Test",
             token_budget=3000,
             ctx=mock_ctx,
@@ -318,9 +327,10 @@ class TestRecommendStrategy:
             mock_strategy.PARALLEL.value = None
             mock_strategy.MATRIX.value = None
 
+            tool = cast("FunctionTool", recommend_reasoning_strategy)
             # Calling with problematic setup should still return a response
             # (errors are caught and returned as ToolExecutionError)
-            result = await recommend_reasoning_strategy.fn(
+            result = await tool.fn(
                 problem="test",
                 token_budget=1000,
             )
@@ -346,7 +356,8 @@ class TestCheckStatus:
 
             from src.server import check_status
 
-            result = await check_status.fn()
+            tool = cast("FunctionTool", check_status)
+            result = await tool.fn()
 
             response = json.loads(result)
             assert "model_status" in response
@@ -369,7 +380,8 @@ class TestCheckStatus:
 
             from src.server import check_status
 
-            await check_status.fn(ctx=mock_ctx)
+            tool = cast("FunctionTool", check_status)
+            await tool.fn(ctx=mock_ctx)
 
             mock_ctx.info.assert_called_once()
 
@@ -381,7 +393,8 @@ class TestCheckStatus:
 
             from src.server import check_status
 
-            result = await check_status.fn()
+            tool = cast("FunctionTool", check_status)
+            result = await tool.fn()
 
             response = json.loads(result)
             assert "error" in response
@@ -399,7 +412,8 @@ class TestCompressPromptErrors:
         with patch("src.server.get_compression_tool") as mock_get_tool:
             mock_get_tool.side_effect = ModelNotReadyException("Model loading")
 
-            result = await compress_prompt.fn(
+            tool = cast("FunctionTool", compress_prompt)
+            result = await tool.fn(
                 context="Test context",
                 question="Test question",
             )
@@ -419,7 +433,8 @@ class TestCompressPromptErrors:
             mock_tool.compress.side_effect = MatrixMindException("Compression error")
             mock_get_tool.return_value = mock_tool
 
-            result = await compress_prompt.fn(
+            tool = cast("FunctionTool", compress_prompt)
+            result = await tool.fn(
                 context="Test context",
                 question="Test question",
             )
@@ -437,7 +452,8 @@ class TestCompressPromptErrors:
             mock_tool.compress.side_effect = RuntimeError("Unexpected")
             mock_get_tool.return_value = mock_tool
 
-            result = await compress_prompt.fn(
+            tool = cast("FunctionTool", compress_prompt)
+            result = await tool.fn(
                 context="Test context",
                 question="Test question",
             )
@@ -461,7 +477,8 @@ class TestMotReasoningErrors:
             mock_tool.reason.side_effect = MatrixMindException("MoT error")
             mock_get_tool.return_value = mock_tool
 
-            result = await matrix_of_thought_reasoning.fn(
+            tool = cast("FunctionTool", matrix_of_thought_reasoning)
+            result = await tool.fn(
                 question="Test",
                 context="Context",
             )
@@ -479,7 +496,8 @@ class TestMotReasoningErrors:
             mock_tool.reason.side_effect = ValueError("Unexpected")
             mock_get_tool.return_value = mock_tool
 
-            result = await matrix_of_thought_reasoning.fn(
+            tool = cast("FunctionTool", matrix_of_thought_reasoning)
+            result = await tool.fn(
                 question="Test",
                 context="Context",
             )
@@ -499,10 +517,11 @@ class TestLongChainErrors:
 
         with patch("src.server.get_long_chain_tool") as mock_get_tool:
             mock_tool = MagicMock()
-            mock_tool.reason.side_effect = MatrixMindException("Chain error")
+            mock_tool.reason_async = AsyncMock(side_effect=MatrixMindException("Chain error"))
             mock_get_tool.return_value = mock_tool
 
-            result = await long_chain_of_thought.fn(
+            tool = cast("FunctionTool", long_chain_of_thought)
+            result = await tool.fn(
                 problem="Test problem",
             )
 
@@ -516,15 +535,48 @@ class TestLongChainErrors:
 
         with patch("src.server.get_long_chain_tool") as mock_get_tool:
             mock_tool = MagicMock()
-            mock_tool.reason.side_effect = TypeError("Unexpected")
+            mock_tool.reason_async = AsyncMock(side_effect=TypeError("Unexpected"))
             mock_get_tool.return_value = mock_tool
 
-            result = await long_chain_of_thought.fn(
+            tool = cast("FunctionTool", long_chain_of_thought)
+            result = await tool.fn(
                 problem="Test problem",
             )
 
             response = json.loads(result)
             assert "error" in response
+
+    @pytest.mark.asyncio
+    async def test_long_chain_verification_frequency_param(self) -> None:
+        """Test long_chain passes verification_frequency to tool."""
+        from src.server import long_chain_of_thought
+        from src.utils.schema import ReasoningResult
+
+        with patch("src.server.get_long_chain_tool") as mock_get_tool:
+            mock_tool = MagicMock()
+            mock_result = ReasoningResult(
+                answer="Test answer",
+                confidence=0.8,
+                reasoning_steps=["Step 1"],
+                verification_results={"total_verifications": 2, "passed": 2, "failed": 0},
+                tokens_used=100,
+                reasoning_trace={"total_steps": 6},
+            )
+            mock_tool.reason_async = AsyncMock(return_value=mock_result)
+            mock_get_tool.return_value = mock_tool
+
+            tool = cast("FunctionTool", long_chain_of_thought)
+            await tool.fn(
+                problem="Test problem",
+                num_steps=6,
+                verify_intermediate=True,
+                verification_frequency=2,  # Custom frequency
+            )
+
+            # Verify reason_async was called with verification_frequency=2
+            mock_tool.reason_async.assert_called_once()
+            call_kwargs = mock_tool.reason_async.call_args.kwargs
+            assert call_kwargs["verification_frequency"] == 2
 
 
 class TestVerifyErrors:
@@ -541,7 +593,8 @@ class TestVerifyErrors:
             mock_tool.verify.side_effect = MatrixMindException("Verify error")
             mock_get_tool.return_value = mock_tool
 
-            result = await verify_fact_consistency.fn(
+            tool = cast("FunctionTool", verify_fact_consistency)
+            result = await tool.fn(
                 answer="Test answer",
                 context="Context",
             )
@@ -559,7 +612,8 @@ class TestVerifyErrors:
             mock_tool.verify.side_effect = KeyError("Unexpected")
             mock_get_tool.return_value = mock_tool
 
-            result = await verify_fact_consistency.fn(
+            tool = cast("FunctionTool", verify_fact_consistency)
+            result = await tool.fn(
                 answer="Test answer",
                 context="Context",
             )

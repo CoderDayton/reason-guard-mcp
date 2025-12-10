@@ -315,6 +315,7 @@ async def matrix_of_thought_reasoning(
     matrix_rows: int = 3,
     matrix_cols: int = 4,
     communication_pattern: str = "vert&hor-01",
+    use_knowledge_graph: bool = False,
     ctx: Context | None = None,
 ) -> str:
     """Multi-dimensional reasoning combining breadth and depth.
@@ -333,10 +334,13 @@ async def matrix_of_thought_reasoning(
             - "vert&hor-01": Gradual increase in communication
             - "uniform": Equal communication everywhere
             - "none": Independent cells (like standard ToT)
+        use_knowledge_graph: Extract and use knowledge graph from context
+            for enhanced multi-hop reasoning (default false)
 
     Returns:
         JSON with answer, confidence (0-1), reasoning_steps,
-        matrix_shape, total_thoughts, num_refinements
+        matrix_shape, total_thoughts, num_refinements.
+        When use_knowledge_graph=true, also includes knowledge_graph_stats.
 
     Use when:
         - Multi-hop reasoning needed (3+ logical steps)
@@ -354,13 +358,17 @@ async def matrix_of_thought_reasoning(
             question="Who wrote the paper that introduced transformers?",
             context="<research paper summaries>",
             matrix_rows=3,
-            matrix_cols=4
+            matrix_cols=4,
+            use_knowledge_graph=True
         )
 
     """
     try:
         if ctx:
-            await ctx.info(f"Starting MoT reasoning ({matrix_rows}×{matrix_cols} matrix)...")
+            kg_info = " with KG" if use_knowledge_graph else ""
+            await ctx.info(
+                f"Starting MoT reasoning ({matrix_rows}×{matrix_cols} matrix{kg_info})..."
+            )
 
         tool = get_mot_tool()
 
@@ -371,6 +379,7 @@ async def matrix_of_thought_reasoning(
             matrix_rows=matrix_rows,
             matrix_cols=matrix_cols,
             communication_pattern=communication_pattern,
+            use_knowledge_graph=use_knowledge_graph,
         )
 
         if ctx:
@@ -398,6 +407,8 @@ async def long_chain_of_thought(
     problem: str,
     num_steps: int = 15,
     verify_intermediate: bool = True,
+    verification_frequency: int = 3,
+    star_iterations: int = 0,
     ctx: Context | None = None,
 ) -> str:
     """Sequential step-by-step reasoning with verification checkpoints.
@@ -408,11 +419,18 @@ async def long_chain_of_thought(
     Args:
         problem: Problem statement (required)
         num_steps: Number of reasoning steps 1-50 (default 15)
-        verify_intermediate: Check consistency every 3 steps (default true)
+        verify_intermediate: Check consistency periodically (default true)
+        verification_frequency: Verify every N steps 1-10 (default 3)
+        star_iterations: Number of STaR (Self-Taught Reasoner) iterations
+            0 = disabled (default), 1-5 recommended for complex problems.
+            Generates multiple chains with varying temperatures and selects best.
+            Higher values increase accuracy but also latency.
 
     Returns:
         JSON with answer, confidence (0.6-0.8), reasoning_steps,
-        verification_results, tokens_used
+        verification_results, tokens_used.
+        When star_iterations>0, also includes star_enabled, star_iterations_used,
+        star_best_score.
 
     Use when:
         - Problem has strong serial dependencies
@@ -428,35 +446,45 @@ async def long_chain_of_thought(
 
     Performance:
         - Exponential advantage over parallel for serial problems
-        - +47% improvement on constraint solving (66% vs 36%)
-        - Verification catches errors early
+        - Verification catches errors early in reasoning chains
+        - STaR iterations improve accuracy on complex multi-step problems
 
     Example:
         long_chain_of_thought(
             problem="Make 24 using the numbers 3, 4, 5, 6",
             num_steps=10,
-            verify_intermediate=True
+            verify_intermediate=True,
+            verification_frequency=2,
+            star_iterations=3
         )
 
     """
     try:
         if ctx:
-            await ctx.info(f"Starting long-chain reasoning ({num_steps} steps)...")
+            star_info = f" with {star_iterations} STaR iterations" if star_iterations > 0 else ""
+            await ctx.info(f"Starting long-chain reasoning ({num_steps} steps{star_info})...")
 
         tool = get_long_chain_tool()
 
-        # Use native async method for optimal performance
+        # Use native async method for all modes (STaR and non-STaR)
         result = await tool.reason_async(
             problem=problem,
             num_steps=num_steps,
             verify_intermediate=verify_intermediate,
+            verification_frequency=verification_frequency,
+            star_iterations=star_iterations,
         )
 
         if ctx:
             verif = result.verification_results or {}
+            star_msg = ""
+            if star_iterations > 0 and result.reasoning_trace:
+                star_msg = (
+                    f" (STaR iterations: {result.reasoning_trace.get('star_iterations_used', '?')})"
+                )
             await ctx.info(
                 f"Completed with {verif.get('passed', 0)}/{verif.get('total_verifications', 0)} "
-                f"verifications passed"
+                f"verifications passed{star_msg}"
             )
 
         return safe_json_serialize(result)
