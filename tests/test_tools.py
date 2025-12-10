@@ -280,6 +280,7 @@ class TestMatrixOfThoughtTool:
             communication_pattern="uniform",
         )
 
+        assert result.reasoning_trace is not None
         assert result.reasoning_trace["communication_pattern"] == "uniform"
 
     def test_reason_with_none_pattern(self) -> None:
@@ -296,6 +297,7 @@ class TestMatrixOfThoughtTool:
             communication_pattern="none",
         )
 
+        assert result.reasoning_trace is not None
         assert result.reasoning_trace["communication_pattern"] == "none"
 
     def test_reason_with_unknown_pattern(self) -> None:
@@ -367,6 +369,124 @@ class TestMatrixOfThoughtTool:
         # Should fallback to summary
         assert result is not None
 
+    def test_weight_matrix_vert_hor_01_formula(self) -> None:
+        """Test vert&hor-01 weight matrix follows paper 2509.03918v2 formula.
+
+        Formula: α[i,j] = 0.1*(m-i) + 0.1*j
+        - Earlier rows (strategies) get more communication weight
+        - Later columns (iterations) accumulate more communication
+        """
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
+
+        # Test 3x4 matrix (weights are 3x3)
+        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="vert&hor-01")
+
+        # Row 0: highest weights (first strategy has most established knowledge)
+        assert matrix[0, 0] == pytest.approx(0.3)  # 0.1*(3-0) + 0.1*0
+        assert matrix[0, 1] == pytest.approx(0.4)  # 0.1*(3-0) + 0.1*1
+        assert matrix[0, 2] == pytest.approx(0.5)  # 0.1*(3-0) + 0.1*2
+
+        # Row 1: medium weights
+        assert matrix[1, 0] == pytest.approx(0.2)  # 0.1*(3-1) + 0.1*0
+        assert matrix[1, 1] == pytest.approx(0.3)  # 0.1*(3-1) + 0.1*1
+        assert matrix[1, 2] == pytest.approx(0.4)  # 0.1*(3-1) + 0.1*2
+
+        # Row 2: lowest weights (last strategy)
+        assert matrix[2, 0] == pytest.approx(0.1)  # 0.1*(3-2) + 0.1*0
+        assert matrix[2, 1] == pytest.approx(0.2)  # 0.1*(3-2) + 0.1*1
+        assert matrix[2, 2] == pytest.approx(0.3)  # 0.1*(3-2) + 0.1*2
+
+    def test_weight_matrix_uniform_pattern(self) -> None:
+        """Test uniform pattern has equal weights."""
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
+        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="uniform")
+
+        assert (matrix == 0.5).all()
+
+    def test_weight_matrix_none_pattern(self) -> None:
+        """Test none pattern has zero weights (no communication)."""
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
+        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="none")
+
+        assert (matrix == 0.0).all()
+
+    def test_reason_with_knowledge_graph(self) -> None:
+        """Test MoT with knowledge graph extraction enabled."""
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        # Responses include KG extraction response + thought generations
+        kg_response = (
+            "ENTITY: Einstein | PERSON\n"
+            "ENTITY: Relativity | CONCEPT\n"
+            "RELATION: Einstein | authored | Relativity"
+        )
+        responses = [
+            # KG extraction response
+            kg_response,
+            # Thought nodes and synthesis
+            "Thought 1",
+            "Thought 2",
+            "Synthesis 1",
+            "Thought 3",
+            "Thought 4",
+            "Synthesis 2",
+            "Final answer: Einstein authored the theory of relativity",
+        ]
+        tool = MatrixOfThoughtTool(MockLLMClient(responses))  # type: ignore
+
+        result = tool.reason(
+            question="Who authored the theory of relativity?",
+            context="Albert Einstein was a physicist who developed the theory of relativity.",
+            matrix_rows=2,
+            matrix_cols=2,
+            use_knowledge_graph=True,
+        )
+
+        assert result.answer is not None
+        assert result.reasoning_trace is not None
+        assert result.reasoning_trace["knowledge_graph_enabled"] is True
+
+    def test_reason_knowledge_graph_disabled_by_default(self) -> None:
+        """Test that knowledge graph is disabled by default."""
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        tool = MatrixOfThoughtTool(MockLLMClient(["Response"] * 20))  # type: ignore
+
+        result = tool.reason(
+            question="Q",
+            context="C",
+            matrix_rows=2,
+            matrix_cols=2,
+        )
+
+        assert result.reasoning_trace is not None
+        assert result.reasoning_trace["knowledge_graph_enabled"] is False
+
+    def test_extract_knowledge_graph_helper(self) -> None:
+        """Test _extract_knowledge_graph helper method."""
+        from src.tools.mot_reasoning import MatrixOfThoughtTool
+
+        # Response for KG extraction
+        kg_response = (
+            "ENTITY: Alice | PERSON\nENTITY: Bob | PERSON\nRELATION: Alice | works_for | Bob"
+        )
+        tool = MatrixOfThoughtTool(MockLLMClient([kg_response]))  # type: ignore
+
+        kg_context, kg_stats = tool._extract_knowledge_graph(
+            context="Alice works for Bob at the company.", question="Who does Alice work for?"
+        )
+
+        assert "Knowledge Graph" in kg_context
+        assert "Alice" in kg_context
+        assert kg_stats is not None
+        assert kg_stats["entities"] >= 1
+
 
 # =============================================================================
 # LongChainOfThoughtTool Tests
@@ -422,6 +542,7 @@ class TestLongChainOfThoughtTool:
         )
 
         assert result.answer is not None
+        assert result.verification_results is not None
         assert result.verification_results["total_verifications"] == 2
         assert result.verification_results["passed"] == 2
 
@@ -437,6 +558,7 @@ class TestLongChainOfThoughtTool:
             verify_intermediate=False,
         )
 
+        assert result.verification_results is not None
         assert result.verification_results["total_verifications"] == 0
         assert result.confidence == 0.7  # Default without verification
 
@@ -464,6 +586,7 @@ class TestLongChainOfThoughtTool:
             verification_frequency=3,
         )
 
+        assert result.verification_results is not None
         assert result.verification_results["passed"] == 1
         assert result.verification_results["failed"] == 1
 
@@ -539,6 +662,133 @@ class TestLongChainOfThoughtTool:
         result = tool._build_recent_context([long_step], max_steps=5)
 
         assert "..." in result
+
+    def test_reason_with_star_iterations_disabled(self) -> None:
+        """Test that star_iterations=0 uses standard single-chain mode."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+
+        responses = ["Step 1", "Step 2", "Step 3", "Final answer: 42"]
+        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
+
+        result = tool.reason(
+            problem="Test problem",
+            num_steps=3,
+            verify_intermediate=False,
+            star_iterations=0,
+        )
+
+        assert result.answer is not None
+        assert result.reasoning_trace is not None
+        assert result.reasoning_trace.get("star_enabled") is None
+
+    def test_reason_with_star_iterations_enabled(self) -> None:
+        """Test that star_iterations > 0 runs multiple iterations."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+
+        # Each iteration: 3 steps + answer extraction + final answer verification
+        # We provide enough responses for 2 iterations
+        responses = [
+            # Iteration 1
+            "Step 1 iter1",
+            "Step 2 iter1",
+            "Step 3 iter1",
+            "Answer iter1",
+            "NO - not valid",  # Final answer verification fails
+            # Iteration 2
+            "Step 1 iter2",
+            "Step 2 iter2",
+            "Step 3 iter2",
+            "Answer iter2",
+            "YES - valid",  # Final answer verification passes
+        ]
+        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
+
+        result = tool.reason(
+            problem="Test problem",
+            num_steps=3,
+            verify_intermediate=False,
+            star_iterations=2,
+        )
+
+        assert result.answer is not None
+        assert result.reasoning_trace is not None
+        assert result.reasoning_trace.get("star_enabled") is True
+        assert result.reasoning_trace.get("star_iterations_requested") == 2
+
+    def test_star_invalid_iterations_raises(self) -> None:
+        """Test that invalid star_iterations raises exception."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+
+        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
+
+        with pytest.raises(ReasoningException, match="star_iterations must be 0-10"):
+            tool.reason(problem="P", num_steps=3, star_iterations=11)
+
+        with pytest.raises(ReasoningException, match="star_iterations must be 0-10"):
+            tool.reason(problem="P", num_steps=3, star_iterations=-1)
+
+    def test_star_early_exit_on_high_score(self) -> None:
+        """Test that STaR exits early when a high-scoring chain is found."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+
+        # Provide responses for first iteration only - it should pass verification
+        # and exit early without needing more iterations
+        responses = [
+            # Iteration 1: steps + intermediate verification + answer + final verify
+            "Step 1",
+            "Step 2",
+            "Step 3",
+            "YES - step valid",  # Intermediate verification
+            "Answer: 42",
+            "YES - answer valid",  # Final answer verification -> early exit
+        ]
+        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
+
+        result = tool.reason(
+            problem="Test",
+            num_steps=3,
+            verify_intermediate=True,
+            verification_frequency=3,
+            star_iterations=5,  # Request 5 but should exit after 1
+        )
+
+        assert result.reasoning_trace is not None
+        # Should exit early (iterations_used < iterations_requested)
+        assert result.reasoning_trace.get("star_iterations_used", 0) <= 2
+
+    def test_verify_final_answer_helper(self) -> None:
+        """Test _verify_final_answer helper method."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+        from src.utils.schema import ReasoningResult
+
+        tool = LongChainOfThoughtTool(MockLLMClient(["YES - correct"]))  # type: ignore
+
+        result = ReasoningResult(
+            answer="42",
+            confidence=0.8,
+            reasoning_steps=["Step 1", "Step 2", "Therefore 42"],
+            tokens_used=100,
+        )
+
+        is_valid = tool._verify_final_answer("What is 6*7?", result)
+        assert is_valid is True
+
+    def test_verify_final_answer_returns_false_on_no(self) -> None:
+        """Test _verify_final_answer returns False when LLM says NO."""
+        from src.tools.long_chain import LongChainOfThoughtTool
+        from src.utils.schema import ReasoningResult
+
+        tool = LongChainOfThoughtTool(MockLLMClient(["NO - incorrect"]))  # type: ignore
+
+        result = ReasoningResult(
+            answer="wrong answer",
+            confidence=0.5,
+            reasoning_steps=["Bad step"],
+            tokens_used=50,
+        )
+
+        is_valid = tool._verify_final_answer("What is 6*7?", result)
+        assert is_valid is False
 
 
 # =============================================================================

@@ -19,7 +19,8 @@ from src.utils.retry import retry_with_backoff
 from src.utils.schema import ReasoningResult
 
 if TYPE_CHECKING:
-    from src.models.llm_client import LLMClient
+    from src.models.knowledge_graph import KnowledgeGraph
+    from src.models.llm_client import LLMClientProtocol
 
 
 class MatrixOfThoughtTool:
@@ -35,6 +36,9 @@ class MatrixOfThoughtTool:
     - uniform: Equal communication across all cells
     - none: Independent cells (like standard ToT)
 
+    Optional Knowledge Graph integration extracts entities and relations
+    from context to enhance multi-hop reasoning.
+
     Attributes:
         llm: LLM client for generating thoughts.
 
@@ -43,7 +47,7 @@ class MatrixOfThoughtTool:
     # P2 Optimization: Class-level cache for common weight matrices
     _weight_cache: dict[tuple[int, int, str], np.ndarray] = {}
 
-    def __init__(self, llm_client: LLMClient) -> None:
+    def __init__(self, llm_client: LLMClientProtocol) -> None:
         """Initialize MoT tool.
 
         Args:
@@ -60,17 +64,19 @@ class MatrixOfThoughtTool:
         matrix_rows: int = 3,
         matrix_cols: int = 4,
         communication_pattern: str = "vert&hor-01",
+        use_knowledge_graph: bool = False,
     ) -> ReasoningResult:
         """Execute Matrix of Thought reasoning.
 
         Algorithm:
         1. Initialize m×n thought matrix
-        2. For each column (depth iteration):
+        2. Optionally extract knowledge graph from context
+        3. For each column (depth iteration):
            a. For each row (strategy):
               - Generate thought with communication from previous column
               - Weight previous thought by communication matrix α
            b. Synthesize column into summary node
-        3. Extract final answer from last summary node
+        4. Extract final answer from last summary node
 
         Args:
             question: The problem to solve.
@@ -79,6 +85,8 @@ class MatrixOfThoughtTool:
             matrix_cols: Number of refinement iterations (depth), 2-5.
             communication_pattern: Weight pattern for inter-cell communication.
                                   Options: "vert&hor-01", "uniform", "none".
+            use_knowledge_graph: If True, extract entities and relations from
+                                context to enhance multi-hop reasoning.
 
         Returns:
             ReasoningResult with answer, confidence, and reasoning trace.
@@ -93,7 +101,8 @@ class MatrixOfThoughtTool:
             ...     question="Who invented the telephone?",
             ...     context="Alexander Graham Bell was an inventor...",
             ...     matrix_rows=3,
-            ...     matrix_cols=4
+            ...     matrix_cols=4,
+            ...     use_knowledge_graph=True
             ... )
             >>> print(result.answer)
             >>> print(result.confidence)  # e.g., 0.85
@@ -113,6 +122,12 @@ class MatrixOfThoughtTool:
             raise ReasoningException(f"matrix_cols must be 2-5, got {matrix_cols}")
 
         try:
+            # Extract knowledge graph if enabled
+            kg_context = ""
+            kg_stats: dict[str, int] | None = None
+            if use_knowledge_graph:
+                kg_context, kg_stats = self._extract_knowledge_graph(context, question)
+
             # Generate communication weight matrix
             weight_matrix = self._generate_weight_matrix(
                 matrix_rows, matrix_cols, communication_pattern
@@ -144,6 +159,7 @@ class MatrixOfThoughtTool:
                         col=col,
                         total_rows=matrix_rows,
                         total_cols=matrix_cols,
+                        kg_context=kg_context,
                     )
 
                     if thought:
@@ -173,17 +189,23 @@ class MatrixOfThoughtTool:
             coverage = len(all_thoughts) / (matrix_rows * matrix_cols)
             confidence = min(0.5 + 0.4 * coverage, 0.95)
 
+            # Build reasoning trace with optional KG stats
+            trace: dict[str, object] = {
+                "matrix_shape": [matrix_rows, matrix_cols],
+                "total_thoughts": len(all_thoughts),
+                "summary_iterations": len(summary_nodes),
+                "communication_pattern": communication_pattern,
+                "knowledge_graph_enabled": use_knowledge_graph,
+            }
+            if kg_stats:
+                trace["knowledge_graph_stats"] = kg_stats
+
             return ReasoningResult(
                 answer=final_answer,
                 confidence=confidence,
                 reasoning_steps=reasoning_steps,
                 tokens_used=self.llm.estimate_tokens("\n".join(reasoning_steps)),
-                reasoning_trace={
-                    "matrix_shape": [matrix_rows, matrix_cols],
-                    "total_thoughts": len(all_thoughts),
-                    "summary_iterations": len(summary_nodes),
-                    "communication_pattern": communication_pattern,
-                },
+                reasoning_trace=trace,
             )
 
         except ReasoningException:
@@ -199,6 +221,7 @@ class MatrixOfThoughtTool:
         matrix_rows: int = 3,
         matrix_cols: int = 4,
         communication_pattern: str = "vert&hor-01",
+        use_knowledge_graph: bool = False,
     ) -> ReasoningResult:
         """Execute Matrix of Thought reasoning with parallelized row generation.
 
@@ -207,10 +230,11 @@ class MatrixOfThoughtTool:
 
         Algorithm:
         1. Initialize m×n thought matrix
-        2. For each column (depth iteration):
+        2. Optionally extract knowledge graph from context
+        3. For each column (depth iteration):
            a. PARALLEL: Generate all row thoughts concurrently
            b. Synthesize column into summary node
-        3. Extract final answer from last summary node
+        4. Extract final answer from last summary node
 
         Args:
             question: The problem to solve.
@@ -218,6 +242,8 @@ class MatrixOfThoughtTool:
             matrix_rows: Number of strategies (breadth), 2-5.
             matrix_cols: Number of refinement iterations (depth), 2-5.
             communication_pattern: Weight pattern for inter-cell communication.
+            use_knowledge_graph: If True, extract entities and relations from
+                                context to enhance multi-hop reasoning.
 
         Returns:
             ReasoningResult with answer, confidence, and reasoning trace.
@@ -240,6 +266,12 @@ class MatrixOfThoughtTool:
             raise ReasoningException(f"matrix_cols must be 2-5, got {matrix_cols}")
 
         try:
+            # Extract knowledge graph if enabled
+            kg_context = ""
+            kg_stats: dict[str, int] | None = None
+            if use_knowledge_graph:
+                kg_context, kg_stats = self._extract_knowledge_graph(context, question)
+
             # Generate communication weight matrix (cached)
             weight_matrix = self._generate_weight_matrix(
                 matrix_rows, matrix_cols, communication_pattern
@@ -270,6 +302,7 @@ class MatrixOfThoughtTool:
                             col=col,
                             total_rows=matrix_rows,
                             total_cols=matrix_cols,
+                            kg_context=kg_context,
                         )
                     )
 
@@ -310,18 +343,24 @@ class MatrixOfThoughtTool:
             coverage = len(all_thoughts) / (matrix_rows * matrix_cols)
             confidence = min(0.5 + 0.4 * coverage, 0.95)
 
+            # Build reasoning trace with optional KG stats
+            trace: dict[str, object] = {
+                "matrix_shape": [matrix_rows, matrix_cols],
+                "total_thoughts": len(all_thoughts),
+                "summary_iterations": len(summary_nodes),
+                "communication_pattern": communication_pattern,
+                "parallel_execution": True,
+                "knowledge_graph_enabled": use_knowledge_graph,
+            }
+            if kg_stats:
+                trace["knowledge_graph_stats"] = kg_stats
+
             return ReasoningResult(
                 answer=final_answer,
                 confidence=confidence,
                 reasoning_steps=reasoning_steps,
                 tokens_used=self.llm.estimate_tokens("\n".join(reasoning_steps)),
-                reasoning_trace={
-                    "matrix_shape": [matrix_rows, matrix_cols],
-                    "total_thoughts": len(all_thoughts),
-                    "summary_iterations": len(summary_nodes),
-                    "communication_pattern": communication_pattern,
-                    "parallel_execution": True,
-                },
+                reasoning_trace=trace,
             )
 
         except ReasoningException:
@@ -340,6 +379,7 @@ class MatrixOfThoughtTool:
         col: int,
         total_rows: int,
         total_cols: int,
+        kg_context: str = "",
     ) -> str | None:
         """Async version of thought node generation for parallel execution.
 
@@ -352,6 +392,7 @@ class MatrixOfThoughtTool:
             col: Current column index.
             total_rows: Total rows in matrix.
             total_cols: Total columns in matrix.
+            kg_context: Optional knowledge graph context string.
 
         Returns:
             Generated thought string, or None if generation failed.
@@ -380,7 +421,7 @@ class MatrixOfThoughtTool:
             prompt = f"""Question: {question}
 
 Context: {context[:800]}{"..." if len(context) > 800 else ""}
-
+{kg_context}
 Matrix Position: Strategy {row + 1}/{total_rows}, Iteration {col + 1}/{total_cols}
 Strategy Focus: {strategy}
 {comm_context}
@@ -475,6 +516,83 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
             # Fall back to first line of summary
             return final_summary.split("\n")[0] if final_summary else "Unable to extract answer"
 
+    def _extract_knowledge_graph(
+        self, context: str, question: str
+    ) -> tuple[str, dict[str, int] | None]:
+        """Extract knowledge graph from context and format for prompts.
+
+        Args:
+            context: The context text to extract from.
+            question: The question to focus extraction on.
+
+        Returns:
+            Tuple of (kg_context_string, kg_stats_dict or None).
+
+        """
+        try:
+            from src.models.knowledge_graph import KnowledgeGraphExtractor
+
+            extractor = KnowledgeGraphExtractor(self.llm, use_llm=True)
+            kg = extractor.extract_for_question(context, question)
+
+            if not kg.relations:
+                logger.debug("No relations extracted from knowledge graph")
+                return "", None
+
+            # Format relations for prompt injection
+            def _format_predicate(pred: object) -> str:
+                """Format predicate as string."""
+                if isinstance(pred, str):
+                    return pred
+                return pred.value if hasattr(pred, "value") else str(pred)
+
+            relations_text = "\n".join(
+                f"- {r.subject.name} → {_format_predicate(r.predicate)} → {r.object_entity.name}"
+                for r in list(kg.relations)[:10]  # Limit to top 10 relations
+            )
+            kg_context = f"\nKnowledge Graph (extracted entities/relations):\n{relations_text}\n"
+
+            # Build stats
+            stats = kg.stats()
+            kg_stats = {
+                "entities": stats.num_entities,
+                "relations": stats.num_relations,
+            }
+
+            logger.debug(
+                f"Extracted KG with {stats.num_entities} entities, {stats.num_relations} relations"
+            )
+            return kg_context, kg_stats
+
+        except Exception as e:
+            logger.warning(f"Knowledge graph extraction failed: {e}")
+            return "", None
+
+    def _format_kg_context(self, kg: KnowledgeGraph) -> str:
+        """Format knowledge graph as context string for prompts.
+
+        Args:
+            kg: The knowledge graph to format.
+
+        Returns:
+            Formatted string of relations for prompt injection.
+
+        """
+        if not kg.relations:
+            return ""
+
+        def _format_predicate(pred: object) -> str:
+            """Format predicate as string."""
+            if isinstance(pred, str):
+                return pred
+            return pred.value if hasattr(pred, "value") else str(pred)
+
+        relations_text = "\n".join(
+            f"- {r.subject.name} → {_format_predicate(r.predicate)} → {r.object_entity.name}"
+            for r in list(kg.relations)[:10]
+        )
+        return f"\nKnowledge Graph:\n{relations_text}\n"
+
     def _generate_thought_node(
         self,
         question: str,
@@ -485,6 +603,7 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
         col: int,
         total_rows: int,
         total_cols: int,
+        kg_context: str = "",
     ) -> str | None:
         """Generate a single thought node in the matrix.
 
@@ -497,6 +616,7 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
             col: Current column index.
             total_rows: Total rows in matrix.
             total_cols: Total columns in matrix.
+            kg_context: Optional knowledge graph context string.
 
         Returns:
             Generated thought string, or None if generation failed.
@@ -525,7 +645,7 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
             prompt = f"""Question: {question}
 
 Context: {context[:800]}{"..." if len(context) > 800 else ""}
-
+{kg_context}
 Matrix Position: Strategy {row + 1}/{total_rows}, Iteration {col + 1}/{total_cols}
 Strategy Focus: {strategy}
 {comm_context}
@@ -641,10 +761,12 @@ Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (
         matrix = np.zeros((rows, cols - 1))
 
         if pattern == "vert&hor-01":
-            # Gradual increase: α increases with position
+            # Paper 2509.03918v2 formula: α = 0.1*(m-i) + 0.1*j
+            # - (m-i): Earlier rows (strategies) get more communication weight
+            # - j: Later columns (iterations) accumulate more communication
             for i in range(rows):
                 for j in range(cols - 1):
-                    matrix[i, j] = min(0.1 * (i + j + 1), 1.0)
+                    matrix[i, j] = min(0.1 * (rows - i) + 0.1 * j, 1.0)
 
         elif pattern == "uniform":
             # Equal communication everywhere
