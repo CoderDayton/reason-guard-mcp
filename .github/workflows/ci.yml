@@ -115,6 +115,30 @@ jobs:
           path: dist/
           retention-days: 7
 
+  changelog:
+    name: Changelog Validation
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check CHANGELOG.md has unreleased changes
+        run: |
+          if ! grep -q "## \[Unreleased\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md must have an [Unreleased] section"
+            exit 1
+          fi
+
+          # Extract content between [Unreleased] and next ## or ---
+          UNRELEASED=$(sed -n '/## \[Unreleased\]/,/^## \[/p' CHANGELOG.md | sed '1d;$d' | grep -v '^$' | grep -v '^---' || true)
+
+          if [ -z "$UNRELEASED" ]; then
+            echo "::warning::CHANGELOG.md [Unreleased] section is empty. Consider documenting your changes."
+          else
+            echo "✓ CHANGELOG.md has unreleased changes:"
+            echo "$UNRELEASED"
+          fi
+
   docker:
     name: Docker Build & Sign
     runs-on: ubuntu-latest

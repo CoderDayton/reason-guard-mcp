@@ -146,18 +146,35 @@ ifndef V
 	$(error VERSION is not set. Usage: make release V=X.Y.Z)
 endif
 	@echo "Creating release v$(V)..."
-	@# Update version
+	@# Validate version format (semver)
+	@echo "$(V)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$$' || (echo "Error: Invalid semver format. Use X.Y.Z or X.Y.Z-suffix"; exit 1)
+	@# Update version in pyproject.toml
 	@sed -i 's/^version = ".*"/version = "$(V)"/' pyproject.toml
-	@# Commit version bump
-	git add pyproject.toml
-	git commit -m "chore: bump version to $(V)"
-	@# Create and push tag
+	@# Move [Unreleased] to new version in CHANGELOG.md
+	@sed -i 's/## \[Unreleased\]/## [Unreleased]\n\n## [$(V)] - $(shell date +%Y-%m-%d)/' CHANGELOG.md
+	@# Commit version bump and changelog
+	git add pyproject.toml CHANGELOG.md
+	git commit -m "chore: release v$(V)"
+	@# Create annotated tag
 	git tag -a "v$(V)" -m "Release v$(V)"
+	@# Push commit and tag
+	git push origin main
+	git push origin "v$(V)"
 	@echo ""
-	@echo "Release v$(V) created locally."
+	@echo "✓ Release v$(V) published!"
+	@echo "  → GitHub Actions will now build and publish to PyPI"
+	@echo "  → View progress: https://github.com/$$(git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/.git$$//')/actions"
+
+# Dry-run release (validates without pushing)
+# Usage: make release-dry V=0.2.0
+release-dry: check test
+ifndef V
+	$(error VERSION is not set. Usage: make release-dry V=X.Y.Z)
+endif
+	@echo "Dry-run release v$(V)..."
+	@echo "$(V)" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$$' || (echo "Error: Invalid semver format"; exit 1)
+	@echo "✓ Version format valid"
+	@echo "✓ Lint passed"
+	@echo "✓ Tests passed"
 	@echo ""
-	@echo "To publish, run:"
-	@echo "  git push origin main"
-	@echo "  git push origin v$(V)"
-	@echo ""
-	@echo "This will trigger the GitHub Actions release workflow."
+	@echo "Ready to release. Run: make release V=$(V)"
