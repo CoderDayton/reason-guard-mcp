@@ -151,7 +151,7 @@ jobs:
           verbose: true
           print-hash: true
 
-  # Create GitHub Release
+  # Create GitHub Release with dated changelog
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
@@ -162,6 +162,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Full history for changelog generation
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v6
@@ -169,27 +172,80 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Generate changelog
+      - name: Generate categorized changelog
         id: changelog
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
-
-          # Generate changelog from recent commits
-          cat << 'EOF' > RELEASE_NOTES.md
-          ## What's Changed
-
-          EOF
+          RELEASE_DATE=$(date +%Y-%m-%d)
 
           # Get commits since last tag (or all if first release)
           LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
           if [ -n "$LAST_TAG" ]; then
-            git log ${LAST_TAG}..HEAD --pretty=format:"- %s" >> RELEASE_NOTES.md
+            COMMIT_RANGE="${LAST_TAG}..HEAD"
           else
-            git log --pretty=format:"- %s" -20 >> RELEASE_NOTES.md
+            COMMIT_RANGE="HEAD~50..HEAD"
           fi
 
-          cat << 'EOF' >> RELEASE_NOTES.md
+          # Categorize commits by conventional commit type
+          FEATURES=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^feat" 2>/dev/null || true)
+          FIXES=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^fix" 2>/dev/null || true)
+          DOCS=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^docs" 2>/dev/null || true)
+          TESTS=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^test" 2>/dev/null || true)
+          REFACTOR=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^refactor" 2>/dev/null || true)
+          PERF=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^perf" 2>/dev/null || true)
+          CHORE=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^chore" 2>/dev/null || true)
 
+          # Build release notes
+          cat << EOF > RELEASE_NOTES.md
+          ## What's Changed in v${VERSION}
+
+          EOF
+
+          # Add sections only if they have content
+          if [ -n "$FEATURES" ]; then
+            echo "### ✨ Features" >> RELEASE_NOTES.md
+            echo "$FEATURES" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$FIXES" ]; then
+            echo "### 🐛 Bug Fixes" >> RELEASE_NOTES.md
+            echo "$FIXES" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$PERF" ]; then
+            echo "### ⚡ Performance" >> RELEASE_NOTES.md
+            echo "$PERF" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$DOCS" ]; then
+            echo "### 📚 Documentation" >> RELEASE_NOTES.md
+            echo "$DOCS" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$REFACTOR" ]; then
+            echo "### ♻️ Refactoring" >> RELEASE_NOTES.md
+            echo "$REFACTOR" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$TESTS" ]; then
+            echo "### 🧪 Tests" >> RELEASE_NOTES.md
+            echo "$TESTS" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          if [ -n "$CHORE" ]; then
+            echo "### 🔧 Maintenance" >> RELEASE_NOTES.md
+            echo "$CHORE" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
+          # Add installation section
+          cat << 'EOF' >> RELEASE_NOTES.md
           ## Installation
 
           ```bash
@@ -206,6 +262,83 @@ jobs:
           docker pull ghcr.io/coderdayton/matrixmind-mcp:latest
           ```
           EOF
+
+          # Export for changelog update
+          echo "release_date=${RELEASE_DATE}" >> $GITHUB_OUTPUT
+
+      - name: Update CHANGELOG.md
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          RELEASE_DATE="${{ steps.changelog.outputs.release_date }}"
+
+          # Get commits since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            COMMIT_RANGE="${LAST_TAG}..HEAD"
+          else
+            COMMIT_RANGE="HEAD~50..HEAD"
+          fi
+
+          # Build changelog entry
+          CHANGELOG_ENTRY="## [${VERSION}] - ${RELEASE_DATE}"$'\n\n'
+
+          # Categorize commits
+          FEATURES=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^feat" 2>/dev/null || true)
+          FIXES=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^fix" 2>/dev/null || true)
+          DOCS=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^docs" 2>/dev/null || true)
+          TESTS=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^test" 2>/dev/null || true)
+          REFACTOR=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^refactor" 2>/dev/null || true)
+          PERF=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^perf" 2>/dev/null || true)
+          CHORE=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^chore" 2>/dev/null || true)
+
+          if [ -n "$FEATURES" ]; then
+            CHANGELOG_ENTRY+="### Added"$'\n'"${FEATURES}"$'\n\n'
+          fi
+          if [ -n "$FIXES" ]; then
+            CHANGELOG_ENTRY+="### Fixed"$'\n'"${FIXES}"$'\n\n'
+          fi
+          if [ -n "$PERF" ]; then
+            CHANGELOG_ENTRY+="### Performance"$'\n'"${PERF}"$'\n\n'
+          fi
+          if [ -n "$DOCS" ]; then
+            CHANGELOG_ENTRY+="### Documentation"$'\n'"${DOCS}"$'\n\n'
+          fi
+          if [ -n "$REFACTOR" ]; then
+            CHANGELOG_ENTRY+="### Changed"$'\n'"${REFACTOR}"$'\n\n'
+          fi
+          if [ -n "$TESTS" ]; then
+            CHANGELOG_ENTRY+="### Tests"$'\n'"${TESTS}"$'\n\n'
+          fi
+          if [ -n "$CHORE" ]; then
+            CHANGELOG_ENTRY+="### Maintenance"$'\n'"${CHORE}"$'\n\n'
+          fi
+
+          CHANGELOG_ENTRY+="---"$'\n'
+
+          # Insert after the marker line in CHANGELOG.md
+          if [ -f "CHANGELOG.md" ]; then
+            # Find the marker and insert after it
+            sed -i "/<!-- Releases will be auto-appended below this line -->/a\\
+          \\
+          ${CHANGELOG_ENTRY}" CHANGELOG.md
+          else
+            echo "CHANGELOG.md not found, skipping update"
+          fi
+
+      - name: Commit changelog update
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Only commit if there are changes
+          if git diff --quiet CHANGELOG.md; then
+            echo "No changelog changes to commit"
+          else
+            git add CHANGELOG.md
+            git commit -m "chore(changelog): update for v${VERSION} [skip ci]"
+            git push origin HEAD:main
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
