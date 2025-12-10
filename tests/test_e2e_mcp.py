@@ -7,37 +7,16 @@ This verifies that tools are properly exposed and callable via MCP.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-from src.utils.schema import CompressionResult, ReasoningResult, VerificationResult
-
-if TYPE_CHECKING:
-    pass
 
 
 class TestMCPProtocol:
     """Test MCP protocol compliance through actual server communication."""
 
-    @pytest.fixture
-    def mock_llm_response(self) -> str:
-        """Standard mock LLM response."""
-        return "This is a mock LLM response for testing."
-
-    @pytest.fixture
-    def mock_llm_client(self, mock_llm_response: str) -> MagicMock:
-        """Create mock LLM client that returns predictable responses."""
-        mock = MagicMock()
-        mock.generate.return_value = mock_llm_response
-        mock.generate_async = AsyncMock(return_value=mock_llm_response)
-        mock.estimate_tokens.return_value = 100
-        return mock
-
     @pytest.mark.asyncio
     async def test_server_lists_all_tools(self) -> None:
-        """Test that server exposes all 5 expected tools via MCP protocol."""
+        """Test that server exposes all expected tools via MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
@@ -47,15 +26,33 @@ class TestMCPProtocol:
 
             tool_names = {tool.name for tool in tools}
             expected_tools = {
+                # Compression
                 "compress_prompt",
-                "matrix_of_thought_reasoning",
-                "long_chain_of_thought",
-                "verify_fact_consistency",
+                # Long Chain (multi-call)
+                "chain_start",
+                "chain_add_step",
+                "chain_finalize",
+                "chain_get",
+                # Matrix of Thought (multi-call)
+                "matrix_start",
+                "matrix_set_cell",
+                "matrix_synthesize",
+                "matrix_finalize",
+                "matrix_get",
+                # Verification (multi-call)
+                "verify_start",
+                "verify_add_claim",
+                "verify_claim",
+                "verify_finalize",
+                "verify_get",
+                # Utilities
                 "recommend_reasoning_strategy",
                 "check_status",
             }
 
-            assert tool_names == expected_tools, f"Missing tools: {expected_tools - tool_names}"
+            missing = expected_tools - tool_names
+            extra = tool_names - expected_tools
+            assert tool_names == expected_tools, f"Missing: {missing}, Extra: {extra}"
 
     @pytest.mark.asyncio
     async def test_tool_schemas_are_valid(self) -> None:
@@ -81,7 +78,7 @@ class TestMCPProtocol:
     async def test_recommend_strategy_tool_callable(self) -> None:
         """Test recommend_reasoning_strategy tool via MCP protocol.
 
-        This tool doesn't require LLM calls, so it's a good E2E test target.
+        This tool doesn't require session state, so it's a good E2E test target.
         """
         from fastmcp import Client
 
@@ -110,155 +107,152 @@ class TestMCPProtocol:
             ]
 
     @pytest.mark.asyncio
-    async def test_compress_prompt_with_mock_llm(self) -> None:
-        """Test compress_prompt tool via MCP protocol with mocked tool."""
+    async def test_chain_workflow_via_mcp(self) -> None:
+        """Test complete chain workflow through MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
-        # Patch the get_compression_tool to use our mock
-        with patch("src.server.get_compression_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            # Return a proper dataclass instance that serializes correctly
-            mock_tool.compress.return_value = CompressionResult(
-                compressed_context="Compressed context here.",
-                compression_ratio=0.3,
-                original_tokens=1000,
-                compressed_tokens=300,
-                sentences_kept=5,
-                sentences_removed=15,
-                relevance_scores=[("test sentence", 0.9)],
+        async with Client(mcp) as client:
+            # Step 1: Start chain (parameter is 'expected_steps', not 'planned_steps')
+            result = await client.call_tool(
+                "chain_start",
+                {"problem": "What is 2 + 2?", "expected_steps": 3},
             )
-            mock_get_tool.return_value = mock_tool
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "started"
+            session_id = response["session_id"]
 
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "compress_prompt",
-                    {
-                        "context": "This is a long context. " * 100,
-                        "question": "What is this about?",
-                        "compression_ratio": 0.3,
-                    },
-                )
+            # Step 2: Add steps (parameter is 'thought', not 'step_content')
+            result = await client.call_tool(
+                "chain_add_step",
+                {"session_id": session_id, "thought": "First, identify the operands: 2 and 2"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "current_step" in response or "instruction" in response  # Verify valid response
 
-                assert not result.is_error, f"Tool returned error: {result.data}"
-                response = json.loads(result.data)
+            result = await client.call_tool(
+                "chain_add_step",
+                {"session_id": session_id, "thought": "Apply addition: 2 + 2 = 4"},
+            )
+            assert not result.is_error
 
-                assert "compressed_context" in response
-                assert "compression_ratio" in response
+            # Step 3: Finalize (parameter is 'answer', not 'final_answer')
+            result = await client.call_tool(
+                "chain_finalize",
+                {"session_id": session_id, "answer": "The answer is 4"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "completed"
+            assert "chain" in response  # Chain contains the reasoning steps
 
     @pytest.mark.asyncio
-    async def test_matrix_of_thought_with_mock_llm(self) -> None:
-        """Test matrix_of_thought_reasoning tool via MCP protocol."""
+    async def test_matrix_workflow_via_mcp(self) -> None:
+        """Test complete matrix workflow through MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
-        with patch("src.server.get_mot_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            # Mock the async method used by the server
-            mock_tool.reason_async = AsyncMock(
-                return_value=ReasoningResult(
-                    answer="The answer is 42.",
-                    confidence=0.85,
-                    reasoning_steps=["Step 1", "Step 2"],
-                    reasoning_trace={"matrix": [[1, 2], [3, 4]]},
-                    tokens_used=500,
-                )
+        async with Client(mcp) as client:
+            # Step 1: Start matrix
+            result = await client.call_tool(
+                "matrix_start",
+                {"question": "What is AI?", "rows": 2, "cols": 2},
             )
-            mock_get_tool.return_value = mock_tool
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "started"
+            session_id = response["session_id"]
 
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "matrix_of_thought_reasoning",
-                    {
-                        "question": "What is the meaning of life?",
-                        "context": "Philosophy text here.",
-                        "matrix_rows": 2,
-                        "matrix_cols": 2,
-                    },
-                )
+            # Step 2: Set cells (parameter is 'thought', not 'content')
+            for row in range(2):
+                for col in range(2):
+                    result = await client.call_tool(
+                        "matrix_set_cell",
+                        {
+                            "session_id": session_id,
+                            "row": row,
+                            "col": col,
+                            "thought": f"Thought at ({row}, {col})",
+                        },
+                    )
+                    assert not result.is_error
 
-                assert not result.is_error, f"Tool returned error: {result.data}"
-                response = json.loads(result.data)
+            # Step 3: Synthesize (requires col parameter)
+            result = await client.call_tool(
+                "matrix_synthesize",
+                {"session_id": session_id, "col": 0, "synthesis": "Column 0 synthesis"},
+            )
+            assert not result.is_error
 
-                assert "answer" in response
-                assert "confidence" in response
+            result = await client.call_tool(
+                "matrix_synthesize",
+                {"session_id": session_id, "col": 1, "synthesis": "Column 1 synthesis"},
+            )
+            assert not result.is_error
+
+            # Step 4: Finalize (parameter is 'answer', not 'final_answer')
+            result = await client.call_tool(
+                "matrix_finalize",
+                {"session_id": session_id, "answer": "AI is the simulation of human intelligence"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_long_chain_with_mock_llm(self) -> None:
-        """Test long_chain_of_thought tool via MCP protocol."""
+    async def test_verify_workflow_via_mcp(self) -> None:
+        """Test complete verification workflow through MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
-        with patch("src.server.get_long_chain_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            # Mock the async method used by the server
-            mock_tool.reason_async = AsyncMock(
-                return_value=ReasoningResult(
-                    answer="Step-by-step answer.",
-                    confidence=0.78,
-                    reasoning_steps=["Step 1", "Step 2", "Step 3"],
-                    verification_results={"passed": True},
-                    tokens_used=800,
-                )
+        async with Client(mcp) as client:
+            # Step 1: Start verification
+            result = await client.call_tool(
+                "verify_start",
+                {
+                    "answer": "Einstein was a physicist",
+                    "context": "Albert Einstein was a theoretical physicist.",
+                },
             )
-            mock_get_tool.return_value = mock_tool
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "started"
+            session_id = response["session_id"]
 
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "long_chain_of_thought",
-                    {
-                        "problem": "Solve this complex problem.",
-                        "num_steps": 5,
-                        "verify_intermediate": False,
-                    },
-                )
-
-                assert not result.is_error, f"Tool returned error: {result.data}"
-                response = json.loads(result.data)
-
-                assert "answer" in response
-                assert "reasoning_steps" in response
-
-    @pytest.mark.asyncio
-    async def test_verify_fact_with_mock_llm(self) -> None:
-        """Test verify_fact_consistency tool via MCP protocol."""
-        from fastmcp import Client
-
-        from src.server import mcp
-
-        with patch("src.server.get_verify_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            # Mock the async method used by the server
-            mock_tool.verify_async = AsyncMock(
-                return_value=VerificationResult(
-                    verified=True,
-                    confidence=0.95,
-                    claims_verified=3,
-                    claims_total=3,
-                    reason="All claims verified.",
-                    claim_details=[{"claim": "Test", "status": "supported"}],
-                )
+            # Step 2: Add claim
+            result = await client.call_tool(
+                "verify_add_claim",
+                {"session_id": session_id, "claim": "Einstein was a physicist"},
             )
-            mock_get_tool.return_value = mock_tool
+            assert not result.is_error
+            response = json.loads(result.data)
+            claim_id = response["claim_id"]
 
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "verify_fact_consistency",
-                    {
-                        "answer": "Einstein was a physicist.",
-                        "context": "Albert Einstein was a theoretical physicist.",
-                        "max_claims": 5,
-                    },
-                )
+            # Step 3: Verify claim
+            result = await client.call_tool(
+                "verify_claim",
+                {
+                    "session_id": session_id,
+                    "claim_id": claim_id,
+                    "status": "supported",
+                    "evidence": "Context confirms this",
+                },
+            )
+            assert not result.is_error
 
-                assert not result.is_error, f"Tool returned error: {result.data}"
-                response = json.loads(result.data)
-
-                assert "verified" in response
-                assert "confidence" in response
+            # Step 4: Finalize verification session
+            result = await client.call_tool(
+                "verify_finalize",
+                {"session_id": session_id},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["verified"] is True
 
     @pytest.mark.asyncio
     async def test_tool_error_handling(self) -> None:
@@ -268,35 +262,58 @@ class TestMCPProtocol:
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # Call with invalid parameters (empty problem)
+            # Call with invalid session_id (use 'thought' param)
             result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {"problem": "", "token_budget": 100},
+                "chain_add_step",
+                {"session_id": "invalid-session-id", "thought": "Test step"},
             )
 
-            # Should return error in response or handle gracefully
+            # Should return error
             response = json.loads(result.data)
-
-            # Either error key or the tool handles empty gracefully
-            assert "error" in response or "recommended_strategy" in response
+            assert "error" in response
 
     @pytest.mark.asyncio
-    async def test_tool_parameter_validation(self) -> None:
-        """Test that invalid parameter types are rejected."""
+    async def test_check_status_tool(self) -> None:
+        """Test check_status tool via MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # Test with out-of-range token_budget
+            # check_status returns general server status with active_sessions
             result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {"problem": "Test problem", "token_budget": 100},  # Below minimum
+                "check_status",
+                {},
             )
-
-            # Should either error or clamp to valid range
+            assert not result.is_error
             response = json.loads(result.data)
-            assert "error" in response or "recommended_strategy" in response
+            assert "active_sessions" in response
+            assert "server_info" in response
+
+    @pytest.mark.asyncio
+    async def test_chain_get_session_status(self) -> None:
+        """Test chain_get tool to check session status via MCP protocol."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Start a chain session
+            result = await client.call_tool(
+                "chain_start",
+                {"problem": "Test problem"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Check session status via chain_get
+            result = await client.call_tool(
+                "chain_get",
+                {"session_id": session_id},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "active"
 
 
 class TestMCPServerInitialization:
@@ -309,8 +326,7 @@ class TestMCPServerInitialization:
 
         # FastMCP stores instructions in the server
         assert mcp.instructions is not None
-        assert "compress" in mcp.instructions.lower()
-        assert "reason" in mcp.instructions.lower()
+        assert "chain" in mcp.instructions.lower() or "matrix" in mcp.instructions.lower()
 
     @pytest.mark.asyncio
     async def test_server_name_configured(self) -> None:

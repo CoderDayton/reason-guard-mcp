@@ -23,7 +23,6 @@ dependencies = [
     "transformers>=4.36.0",
     "sentence-transformers>=2.2.2",
     "faiss-cpu>=1.7.4",
-    "openai>=1.3.0",
     "pydantic>=2.5.0",
     "python-dotenv>=1.0.0",
     "loguru>=0.7.2",

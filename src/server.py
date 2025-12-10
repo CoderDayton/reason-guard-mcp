@@ -1,10 +1,15 @@
 """MatrixMind MCP Server.
 
-FastMCP 2.0 implementation providing 4 reasoning tools:
-1. compress_prompt - Semantic context compression
-2. matrix_of_thought_reasoning - Multi-perspective reasoning
-3. long_chain_of_thought - Deep sequential reasoning
-4. verify_fact_consistency - Answer verification
+FastMCP 2.0 implementation providing reasoning state management tools.
+The calling LLM does all reasoning; these tools track and organize the process.
+
+Tools:
+1. compress_prompt - Semantic context compression (uses local embeddings)
+2. chain_* - Long chain-of-thought state management
+3. matrix_* - Matrix of thought state management
+4. verify_* - Fact verification state management
+5. recommend_reasoning_strategy - Strategy recommendation (heuristics)
+6. check_status - Server status
 
 Run with: uvx matrixmind-mcp
 Or: python -m src.server
@@ -23,12 +28,11 @@ from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
 from loguru import logger
 
-from src.models.llm_client import LLMClient
 from src.models.model_manager import ModelManager
 from src.tools.compress import ContextAwareCompressionTool
-from src.tools.long_chain import LongChainOfThoughtTool
-from src.tools.mot_reasoning import MatrixOfThoughtTool
-from src.tools.verify import FactVerificationTool
+from src.tools.long_chain import get_chain_manager
+from src.tools.mot_reasoning import get_matrix_manager
+from src.tools.verify import get_verification_manager
 from src.utils.errors import MatrixMindException, ModelNotReadyException, ToolExecutionError
 from src.utils.schema import ReasoningStrategy, safe_json_serialize
 
@@ -53,28 +57,9 @@ def _get_env_int(key: str, default: int) -> int:
     return default
 
 
-def _get_env_float(key: str, default: float) -> float:
-    """Get environment variable as float."""
-    value = os.getenv(key)
-    if value:
-        try:
-            return float(value)
-        except ValueError:
-            logger.warning(f"Invalid float for {key}: {value}, using default {default}")
-    return default
-
-
 # =============================================================================
 # Configuration from Environment Variables
 # =============================================================================
-
-# LLM Configuration
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_BASE_URL = _get_env("OPENAI_BASE_URL") or None  # None = use default OpenAI
-OPENAI_MODEL = _get_env("OPENAI_MODEL", "gpt-4.1")
-LLM_TIMEOUT = _get_env_int("LLM_TIMEOUT", 60)
-LLM_MAX_RETRIES = _get_env_int("LLM_MAX_RETRIES", 3)
-LLM_TEMPERATURE = _get_env_float("LLM_TEMPERATURE", 0.7)
 
 # Model Configuration
 EMBEDDING_MODEL = _get_env("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-xs")
@@ -91,30 +76,18 @@ SERVER_PORT = _get_env_int("SERVER_PORT", 8000)
 
 
 def _get_embedding_model_name() -> str:
-    """Get full embedding model name, adding prefix only for short names.
-
-    If the model name already contains a '/' (e.g., 'Snowflake/snowflake-arctic-embed-xs'),
-    it's assumed to be a full HuggingFace model path. Otherwise, 'sentence-transformers/'
-    prefix is added for backward compatibility with short names like 'all-mpnet-base-v2'.
-    """
+    """Get full embedding model name."""
     model_name = EMBEDDING_MODEL
-    # Only add prefix if no org/namespace is specified
     if "/" not in model_name:
         model_name = f"sentence-transformers/{model_name}"
     return model_name
 
 
 def _init_model_manager() -> None:
-    """Initialize the model manager with embedding model.
-
-    Preloads the embedding model at startup (blocking) so tools are immediately
-    ready when the server starts. This ensures the first tool call doesn't have
-    to wait for model download.
-    """
+    """Initialize the model manager with embedding model."""
     model_manager = ModelManager.get_instance()
     model_name = _get_embedding_model_name()
     logger.info(f"Preloading embedding model: {model_name}")
-    # Blocking: wait for model to be ready before server starts
     model_manager.initialize(model_name, blocking=True)
     logger.info("Embedding model ready")
 
@@ -122,7 +95,6 @@ def _init_model_manager() -> None:
 # =============================================================================
 # Thread Pool for CPU-bound Operations
 # =============================================================================
-# Prevents blocking the event loop during compression/encoding operations
 _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="matrixmind-worker")
 
 
@@ -132,81 +104,57 @@ _executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="matrixmind-wor
 
 mcp = FastMCP(
     name=SERVER_NAME,
-    instructions="""MatrixMind reasoning server with 6 tools:
+    instructions="""MatrixMind reasoning state manager with tools for structured thinking.
 
-1. compress_prompt: Reduce token count for long documents (use first for large inputs)
-2. matrix_of_thought_reasoning: Multi-perspective reasoning for complex problems
-3. long_chain_of_thought: Deep sequential reasoning for serial problems
-4. verify_fact_consistency: Verify answer accuracy against context
-5. recommend_reasoning_strategy: Get optimal reasoning approach for a problem
-6. check_status: Get server/model status for debugging
+ARCHITECTURE: You (the calling LLM) do ALL reasoning. These tools TRACK and ORGANIZE your thoughts.
 
-Typical workflow: compress → reason (MoT or long_chain) → verify
+TOOLS:
+
+1. compress_prompt - Reduce context size using semantic compression
+
+2. Chain-of-Thought (sequential reasoning):
+   - chain_start(problem, expected_steps) → Start a reasoning chain
+   - chain_add_step(session_id, thought) → Add your reasoning step
+   - chain_finalize(session_id, answer) → Complete with final answer
+   - chain_get(session_id) → Get current chain state
+
+3. Matrix-of-Thought (multi-perspective reasoning):
+   - matrix_start(question, context, rows, cols) → Start matrix reasoning
+   - matrix_set_cell(session_id, row, col, thought) → Fill a matrix cell
+   - matrix_synthesize(session_id, col, synthesis) → Synthesize a column
+   - matrix_finalize(session_id, answer) → Complete with final answer
+
+4. Fact Verification:
+   - verify_start(answer, context) → Start verification session
+   - verify_add_claim(session_id, claim) → Add a claim to verify
+   - verify_claim(session_id, claim_id, status, evidence) → Verify a claim
+   - verify_finalize(session_id) → Get verification result
+
+5. recommend_reasoning_strategy - Get optimal approach for a problem
+6. check_status - Server/model status
+
+WORKFLOW EXAMPLE (Chain):
+1. Call chain_start(problem="Solve X", expected_steps=5)
+2. Think about step 1, call chain_add_step(session_id, thought="Step 1: ...")
+3. Continue for each step
+4. Call chain_finalize(session_id, answer="The answer is...")
 """,
 )
 
 # =============================================================================
-# Lazy-loaded Tool Instances
+# Tool Instances
 # =============================================================================
 
-_llm_client: LLMClient | None = None
 _compression_tool: ContextAwareCompressionTool | None = None
-_mot_tool: MatrixOfThoughtTool | None = None
-_long_chain_tool: LongChainOfThoughtTool | None = None
-_verify_tool: FactVerificationTool | None = None
-
-
-def get_llm_client() -> LLMClient:
-    """Get or create LLM client instance."""
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = LLMClient(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL,
-            model=OPENAI_MODEL,
-            timeout=LLM_TIMEOUT,
-            max_retries=LLM_MAX_RETRIES,
-            default_temperature=LLM_TEMPERATURE,
-        )
-    return _llm_client
 
 
 def get_compression_tool() -> ContextAwareCompressionTool:
-    """Get or create compression tool instance.
-
-    Note: The compression tool uses the ModelManager which handles
-    model loading state. If called before model is ready, it will
-    raise ModelNotReadyException with a helpful message.
-    """
+    """Get or create compression tool instance."""
     global _compression_tool
     if _compression_tool is None:
         model_name = _get_embedding_model_name()
         _compression_tool = ContextAwareCompressionTool(model_name=model_name)
     return _compression_tool
-
-
-def get_mot_tool() -> MatrixOfThoughtTool:
-    """Get or create MoT tool instance."""
-    global _mot_tool
-    if _mot_tool is None:
-        _mot_tool = MatrixOfThoughtTool(get_llm_client())
-    return _mot_tool
-
-
-def get_long_chain_tool() -> LongChainOfThoughtTool:
-    """Get or create long chain tool instance."""
-    global _long_chain_tool
-    if _long_chain_tool is None:
-        _long_chain_tool = LongChainOfThoughtTool(get_llm_client())
-    return _long_chain_tool
-
-
-def get_verify_tool() -> FactVerificationTool:
-    """Get or create verification tool instance."""
-    global _verify_tool
-    if _verify_tool is None:
-        _verify_tool = FactVerificationTool(get_llm_client())
-    return _verify_tool
 
 
 # ============================================================================
@@ -228,30 +176,13 @@ async def compress_prompt(
     Uses sentence embeddings to score and select most relevant content.
 
     Args:
-        context: Long text to compress (required, can be 5K-50K+ tokens)
+        context: Long text to compress (required)
         question: Query to determine relevance (required)
-        compression_ratio: Target ratio 0.1-1.0 (default 0.3 = 3× compression)
+        compression_ratio: Target ratio 0.1-1.0 (default 0.3)
         preserve_order: Keep original sentence order (default true)
 
     Returns:
-        JSON with compressed_context, compression_ratio, tokens_saved,
-        sentences_kept, sentences_removed, top_relevance_scores
-
-    Use when:
-        - Input documents are very long (>3000 tokens)
-        - Need faster reasoning with reduced context
-        - Want to preserve semantic meaning while reducing cost
-
-    Performance:
-        - 10.93× faster than token-level methods
-        - Preserves quality (-0.3 F1 vs -2.8 for baselines)
-
-    Example:
-        compress_prompt(
-            context="<20 page document>",
-            question="What was the main finding?",
-            compression_ratio=0.3
-        )
+        JSON with compressed_context, compression_ratio, tokens_saved
 
     """
     try:
@@ -260,7 +191,6 @@ async def compress_prompt(
 
         tool = get_compression_tool()
 
-        # Run CPU-bound compression in thread pool to avoid blocking event loop
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             _executor,
@@ -282,16 +212,8 @@ async def compress_prompt(
         return safe_json_serialize(result)
 
     except ModelNotReadyException as e:
-        # Specific error for model not ready - give user actionable feedback
-        error = ToolExecutionError(
-            "compress_prompt",
-            str(e),
-            {
-                "retry_after_seconds": 30,
-                "hint": "The embedding model is still loading. Please retry shortly.",
-            },
-        )
-        logger.warning(f"Model not ready for compression: {e}")
+        error = ToolExecutionError("compress_prompt", str(e), {"retry_after_seconds": 30})
+        logger.warning(f"Model not ready: {e}")
         return json.dumps(error.to_dict())
     except MatrixMindException as e:
         error = ToolExecutionError("compress_prompt", str(e))
@@ -299,277 +221,561 @@ async def compress_prompt(
         return json.dumps(error.to_dict())
     except Exception as e:
         error = ToolExecutionError("compress_prompt", str(e), {"type": type(e).__name__})
-        logger.error(f"Unexpected error in compress_prompt: {e}")
+        logger.error(f"Unexpected error: {e}")
         return json.dumps(error.to_dict())
 
 
 # ============================================================================
-# TOOL 2: MATRIX OF THOUGHT REASONING
+# TOOL 2: LONG CHAIN OF THOUGHT (State Manager)
 # ============================================================================
 
 
 @mcp.tool
-async def matrix_of_thought_reasoning(
-    question: str,
-    context: str,
-    matrix_rows: int = 3,
-    matrix_cols: int = 4,
-    communication_pattern: str = "vert&hor-01",
-    use_knowledge_graph: bool = False,
+async def chain_start(
+    problem: str,
+    expected_steps: int = 10,
     ctx: Context | None = None,
 ) -> str:
-    """Multi-dimensional reasoning combining breadth and depth.
+    """Start a new chain-of-thought reasoning session.
 
-    Organizes reasoning in an m×n matrix:
-    - Rows = different reasoning strategies (breadth)
-    - Columns = iterative refinement steps (depth)
-    - Inter-cell communication enables knowledge sharing
+    YOU do the reasoning. This tool tracks your progress.
 
     Args:
-        question: Problem to solve (required)
-        context: Background information (required)
-        matrix_rows: Number of strategies 2-5 (default 3)
-        matrix_cols: Number of refinements 2-5 (default 4)
-        communication_pattern: Weight pattern (default "vert&hor-01")
-            - "vert&hor-01": Gradual increase in communication
-            - "uniform": Equal communication everywhere
-            - "none": Independent cells (like standard ToT)
-        use_knowledge_graph: Extract and use knowledge graph from context
-            for enhanced multi-hop reasoning (default false)
+        problem: The problem to reason about (required)
+        expected_steps: How many reasoning steps you plan (default 10)
 
     Returns:
-        JSON with answer, confidence (0-1), reasoning_steps,
-        matrix_shape, total_thoughts, num_refinements.
-        When use_knowledge_graph=true, also includes knowledge_graph_stats.
-
-    Use when:
-        - Multi-hop reasoning needed (3+ logical steps)
-        - Multiple perspectives could improve answer
-        - Problem has complex constraints
-        - Need to explore diverse strategies
-
-    Performance:
-        - 7× faster than RATT baseline
-        - +4.2% F1 improvement on HotpotQA
-        - Generalizes CoT (1×n) and ToT (α=0) as special cases
+        JSON with session_id, status, instruction for next step
 
     Example:
-        matrix_of_thought_reasoning(
-            question="Who wrote the paper that introduced transformers?",
-            context="<research paper summaries>",
-            matrix_rows=3,
-            matrix_cols=4,
-            use_knowledge_graph=True
+        chain_start(problem="What is 15 * 17?", expected_steps=5)
+        → Returns session_id, then YOU reason and call chain_add_step
+
+    """
+    try:
+        manager = get_chain_manager()
+        result = manager.start_chain(problem=problem, expected_steps=expected_steps)
+
+        if ctx:
+            await ctx.info(f"Started chain session {result['session_id']}")
+
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        error = ToolExecutionError("chain_start", str(e))
+        logger.error(f"Chain start failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def chain_add_step(
+    session_id: str,
+    thought: str,
+    step_type: str = "continuation",
+    branch_from: int | None = None,
+    revises: int | None = None,
+    confidence: float | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Add a reasoning step to an active chain.
+
+    Call this after YOU have reasoned about the next step.
+
+    Args:
+        session_id: Session from chain_start (required)
+        thought: Your reasoning for this step (required)
+        step_type: Type of step - continuation, revision, branch, synthesis
+        branch_from: If branching, which step number to branch from
+        revises: If revising, which step number this revises
+        confidence: Your confidence in this step (0-1)
+
+    Returns:
+        JSON with step_added, progress, needs_more_steps, instruction
+
+    Example:
+        chain_add_step(
+            session_id="abc123",
+            thought="Step 1: First, I'll multiply 15 * 10 = 150"
         )
 
     """
     try:
-        if ctx:
-            kg_info = " with KG" if use_knowledge_graph else ""
+        manager = get_chain_manager()
+        result = manager.add_step(
+            session_id=session_id,
+            thought=thought,
+            step_type=step_type,
+            branch_from=branch_from,
+            revises=revises,
+            confidence=confidence,
+        )
+
+        if ctx and "step_added" in result:
             await ctx.info(
-                f"Starting MoT reasoning ({matrix_rows}×{matrix_cols} matrix{kg_info})..."
+                f"Added step {result['step_added']}, progress: {result.get('progress', 0):.0%}"
             )
 
-        tool = get_mot_tool()
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("chain_add_step", str(e))
+        logger.error(f"Chain add step failed: {e}")
+        return json.dumps(error.to_dict())
 
-        # Use native async method for optimal performance
-        result = await tool.reason_async(
+
+@mcp.tool
+async def chain_finalize(
+    session_id: str,
+    answer: str,
+    confidence: float | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Finalize a reasoning chain with your answer.
+
+    Call this when you've completed your reasoning.
+
+    Args:
+        session_id: Session from chain_start (required)
+        answer: Your final answer (required)
+        confidence: Your confidence in the answer (0-1)
+
+    Returns:
+        JSON with status, final_answer, summary of chain
+
+    """
+    try:
+        manager = get_chain_manager()
+        result = manager.finalize(session_id=session_id, answer=answer, confidence=confidence)
+
+        if ctx:
+            await ctx.info(f"Finalized chain with {result.get('total_steps', 0)} steps")
+
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("chain_finalize", str(e))
+        logger.error(f"Chain finalize failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def chain_get(session_id: str, ctx: Context | None = None) -> str:
+    """Get the current state of a reasoning chain.
+
+    Args:
+        session_id: Session to retrieve (required)
+
+    Returns:
+        JSON with full chain state including all steps
+
+    """
+    try:
+        manager = get_chain_manager()
+        result = manager.get_chain(session_id=session_id)
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("chain_get", str(e))
+        logger.error(f"Chain get failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+# ============================================================================
+# TOOL 3: MATRIX OF THOUGHT (State Manager)
+# ============================================================================
+
+
+@mcp.tool
+async def matrix_start(
+    question: str,
+    context: str = "",
+    rows: int = 3,
+    cols: int = 4,
+    strategies: list[str] | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Start a matrix-of-thought reasoning session.
+
+    Matrix structure:
+    - Rows = different reasoning strategies (direct, logical, analogical)
+    - Columns = iterative refinement steps
+    - YOU fill each cell, then synthesize each column
+
+    Args:
+        question: The question to reason about (required)
+        context: Background context (optional)
+        rows: Number of strategies 2-5 (default 3)
+        cols: Number of iterations 2-6 (default 4)
+        strategies: Custom strategy names (optional)
+
+    Returns:
+        JSON with session_id, matrix_dimensions, strategies, next_cell
+
+    Example:
+        matrix_start(
+            question="What caused the French Revolution?",
+            context="<historical text>",
+            rows=3,
+            cols=4
+        )
+
+    """
+    try:
+        manager = get_matrix_manager()
+        result = manager.start_matrix(
             question=question,
             context=context,
-            matrix_rows=matrix_rows,
-            matrix_cols=matrix_cols,
-            communication_pattern=communication_pattern,
-            use_knowledge_graph=use_knowledge_graph,
+            rows=rows,
+            cols=cols,
+            strategies=strategies,
         )
 
         if ctx:
-            await ctx.info(f"Generated answer with {result.confidence:.1%} confidence")
+            await ctx.info(f"Started {rows}x{cols} matrix session {result['session_id']}")
 
-        return safe_json_serialize(result)
-
-    except MatrixMindException as e:
-        error = ToolExecutionError("matrix_of_thought_reasoning", str(e))
-        logger.error(f"MoT reasoning failed: {e}")
-        return json.dumps(error.to_dict())
+        return json.dumps(result, indent=2)
     except Exception as e:
-        error = ToolExecutionError("matrix_of_thought_reasoning", str(e))
-        logger.error(f"Unexpected error in MoT: {e}")
+        error = ToolExecutionError("matrix_start", str(e))
+        logger.error(f"Matrix start failed: {e}")
         return json.dumps(error.to_dict())
-
-
-# ============================================================================
-# TOOL 3: LONG CHAIN OF THOUGHT
-# ============================================================================
 
 
 @mcp.tool
-async def long_chain_of_thought(
-    problem: str,
-    num_steps: int = 15,
-    verify_intermediate: bool = True,
-    verification_frequency: int = 3,
-    star_iterations: int = 0,
+async def matrix_set_cell(
+    session_id: str,
+    row: int,
+    col: int,
+    thought: str,
+    confidence: float | None = None,
     ctx: Context | None = None,
 ) -> str:
-    """Sequential step-by-step reasoning with verification checkpoints.
-
-    Implements deep reasoning where each step builds directly on previous.
-    Includes optional intermediate verification to catch errors early.
+    """Fill a cell in the reasoning matrix.
 
     Args:
-        problem: Problem statement (required)
-        num_steps: Number of reasoning steps 1-50 (default 15)
-        verify_intermediate: Check consistency periodically (default true)
-        verification_frequency: Verify every N steps 1-10 (default 3)
-        star_iterations: Number of STaR (Self-Taught Reasoner) iterations
-            0 = disabled (default), 1-5 recommended for complex problems.
-            Generates multiple chains with varying temperatures and selects best.
-            Higher values increase accuracy but also latency.
+        session_id: Session from matrix_start (required)
+        row: Row index 0-based (required)
+        col: Column index 0-based (required)
+        thought: Your reasoning for this cell (required)
+        confidence: Confidence in this reasoning (0-1)
 
     Returns:
-        JSON with answer, confidence (0.6-0.8), reasoning_steps,
-        verification_results, tokens_used.
-        When star_iterations>0, also includes star_enabled, star_iterations_used,
-        star_best_score.
-
-    Use when:
-        - Problem has strong serial dependencies
-        - Each step fundamentally builds on previous
-        - High accuracy more important than speed
-        - Problem requires deep logical chain
-
-    When to use over matrix_of_thought:
-        - Graph connectivity problems (exponential advantage)
-        - Constraint satisfaction (permutations, ordering)
-        - Arithmetic with dependencies (iterated operations)
-        - Pure serial problems (no parallel decomposition)
-
-    Performance:
-        - Exponential advantage over parallel for serial problems
-        - Verification catches errors early in reasoning chains
-        - STaR iterations improve accuracy on complex multi-step problems
+        JSON with cell_set, progress, next_cell or pending_synthesis
 
     Example:
-        long_chain_of_thought(
-            problem="Make 24 using the numbers 3, 4, 5, 6",
-            num_steps=10,
-            verify_intermediate=True,
-            verification_frequency=2,
-            star_iterations=3
+        matrix_set_cell(
+            session_id="abc123",
+            row=0, col=0,
+            thought="Using direct factual analysis: The text states..."
         )
 
     """
     try:
-        if ctx:
-            star_info = f" with {star_iterations} STaR iterations" if star_iterations > 0 else ""
-            await ctx.info(f"Starting long-chain reasoning ({num_steps} steps{star_info})...")
-
-        tool = get_long_chain_tool()
-
-        # Use native async method for all modes (STaR and non-STaR)
-        result = await tool.reason_async(
-            problem=problem,
-            num_steps=num_steps,
-            verify_intermediate=verify_intermediate,
-            verification_frequency=verification_frequency,
-            star_iterations=star_iterations,
+        manager = get_matrix_manager()
+        result = manager.set_cell(
+            session_id=session_id,
+            row=row,
+            col=col,
+            thought=thought,
+            confidence=confidence,
         )
 
-        if ctx:
-            verif = result.verification_results or {}
-            star_msg = ""
-            if star_iterations > 0 and result.reasoning_trace:
-                star_msg = (
-                    f" (STaR iterations: {result.reasoning_trace.get('star_iterations_used', '?')})"
-                )
-            await ctx.info(
-                f"Completed with {verif.get('passed', 0)}/{verif.get('total_verifications', 0)} "
-                f"verifications passed{star_msg}"
-            )
+        if ctx and "cell_set" in result:
+            await ctx.info(f"Set cell ({row},{col}), progress: {result.get('progress', 0):.0%}")
 
-        return safe_json_serialize(result)
-
-    except MatrixMindException as e:
-        error = ToolExecutionError("long_chain_of_thought", str(e))
-        logger.error(f"Long chain reasoning failed: {e}")
-        return json.dumps(error.to_dict())
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     except Exception as e:
-        error = ToolExecutionError("long_chain_of_thought", str(e))
-        logger.error(f"Unexpected error in long_chain: {e}")
+        error = ToolExecutionError("matrix_set_cell", str(e))
+        logger.error(f"Matrix set cell failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def matrix_synthesize(
+    session_id: str,
+    col: int,
+    synthesis: str,
+    ctx: Context | None = None,
+) -> str:
+    """Synthesize a column's perspectives into a unified insight.
+
+    Call this after completing all rows in a column.
+
+    Args:
+        session_id: Session from matrix_start (required)
+        col: Column to synthesize (required)
+        synthesis: Your combined insight from all rows (required)
+
+    Returns:
+        JSON with column_synthesized, next_cell or completion instruction
+
+    """
+    try:
+        manager = get_matrix_manager()
+        result = manager.synthesize_column(session_id=session_id, col=col, synthesis=synthesis)
+
+        if ctx:
+            await ctx.info(f"Synthesized column {col}")
+
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("matrix_synthesize", str(e))
+        logger.error(f"Matrix synthesize failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def matrix_finalize(
+    session_id: str,
+    answer: str,
+    confidence: float | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Finalize matrix reasoning with your answer.
+
+    Args:
+        session_id: Session from matrix_start (required)
+        answer: Your final answer (required)
+        confidence: Confidence in the answer (0-1)
+
+    Returns:
+        JSON with status, final_answer, matrix summary
+
+    """
+    try:
+        manager = get_matrix_manager()
+        result = manager.finalize(session_id=session_id, answer=answer, confidence=confidence)
+
+        if ctx:
+            await ctx.info("Finalized matrix with answer")
+
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("matrix_finalize", str(e))
+        logger.error(f"Matrix finalize failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def matrix_get(session_id: str, ctx: Context | None = None) -> str:
+    """Get the current state of a matrix reasoning session.
+
+    Args:
+        session_id: Session to retrieve (required)
+
+    Returns:
+        JSON with full matrix state
+
+    """
+    try:
+        manager = get_matrix_manager()
+        result = manager.get_matrix(session_id=session_id)
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("matrix_get", str(e))
+        logger.error(f"Matrix get failed: {e}")
         return json.dumps(error.to_dict())
 
 
 # ============================================================================
-# TOOL 4: VERIFY FACT CONSISTENCY
+# TOOL 4: FACT VERIFICATION (State Manager)
 # ============================================================================
 
 
 @mcp.tool
-async def verify_fact_consistency(
+async def verify_start(
     answer: str,
     context: str,
-    max_claims: int = 10,
     ctx: Context | None = None,
 ) -> str:
-    """Verify answer claims against knowledge base/context.
+    """Start a fact verification session.
 
-    Extracts factual claims from answer and checks each against context.
-    Helps prevent hallucinations and ensures answer accuracy.
+    YOU extract claims from the answer, then verify each against context.
 
     Args:
-        answer: Answer text to verify (required)
-        context: Factual context for verification (required)
-        max_claims: Maximum claims to check 1-20 (default 10)
+        answer: The answer to verify (required)
+        context: The factual context to verify against (required)
 
     Returns:
-        JSON with verified (bool), confidence (0-1), claims_verified,
-        claims_total, reason, recommendation
-
-    Use when:
-        - Need to ensure answer factuality
-        - QA with external knowledge base
-        - Preventing hallucinations
-        - Quality assurance on generated answers
-
-    Confidence levels:
-        - 0.9-1.0: All claims supported → highly reliable
-        - 0.7-0.9: Most claims supported → verified=true
-        - 0.5-0.7: Mixed support → use caution
-        - <0.5: Few claims supported → verified=false
+        JSON with session_id, suggested_claims, instruction
 
     Example:
-        verify_fact_consistency(
-            answer="Einstein published relativity in 1905 and 1915.",
-            context="Albert Einstein published special relativity in 1905...",
-            max_claims=5
+        verify_start(
+            answer="Einstein published relativity in 1905.",
+            context="Albert Einstein published special relativity in 1905..."
         )
 
     """
     try:
+        manager = get_verification_manager()
+        result = manager.start_verification(answer=answer, context=context)
+
         if ctx:
-            await ctx.info(f"Verifying answer ({len(answer.split())} words)...")
+            await ctx.info(f"Started verification session {result['session_id']}")
 
-        tool = get_verify_tool()
+        return json.dumps(result, indent=2)
+    except Exception as e:
+        error = ToolExecutionError("verify_start", str(e))
+        logger.error(f"Verify start failed: {e}")
+        return json.dumps(error.to_dict())
 
-        # Use native async method for optimal performance
-        result = await tool.verify_async(
-            answer=answer,
-            context=context,
-            max_claims=max_claims,
+
+@mcp.tool
+async def verify_add_claim(
+    session_id: str,
+    claim: str,
+    ctx: Context | None = None,
+) -> str:
+    """Add a factual claim to verify.
+
+    Extract claims from the answer and add each one.
+
+    Args:
+        session_id: Session from verify_start (required)
+        claim: A factual assertion to verify (required)
+
+    Returns:
+        JSON with claim_id, instruction for verification
+
+    Example:
+        verify_add_claim(
+            session_id="abc123",
+            claim="Einstein published special relativity in 1905"
+        )
+
+    """
+    try:
+        manager = get_verification_manager()
+        result = manager.add_claim(session_id=session_id, content=claim)
+
+        if ctx and "claim_id" in result:
+            await ctx.info(f"Added claim {result['claim_id']}")
+
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("verify_add_claim", str(e))
+        logger.error(f"Verify add claim failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def verify_claim(
+    session_id: str,
+    claim_id: int,
+    status: str,
+    evidence: str | None = None,
+    confidence: float | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Verify a claim against the context.
+
+    Check the context and determine if the claim is supported.
+
+    Args:
+        session_id: Session from verify_start (required)
+        claim_id: ID of the claim to verify (required)
+        status: Verification result - "supported", "contradicted", or "unclear"
+        evidence: Quote from context supporting your verdict
+        confidence: Confidence in verification (0-1)
+
+    Returns:
+        JSON with claim status update, summary, next_claim
+
+    Example:
+        verify_claim(
+            session_id="abc123",
+            claim_id=0,
+            status="supported",
+            evidence="Einstein published his theory of special relativity in 1905"
+        )
+
+    """
+    try:
+        manager = get_verification_manager()
+        result = manager.verify_claim(
+            session_id=session_id,
+            claim_id=claim_id,
+            status=status,
+            evidence=evidence,
+            confidence=confidence,
         )
 
         if ctx:
-            await ctx.info(f"Verification: {result.reason}")
+            await ctx.info(f"Verified claim {claim_id} as {status}")
 
-        return safe_json_serialize(result)
-
-    except MatrixMindException as e:
-        error = ToolExecutionError("verify_fact_consistency", str(e))
-        logger.error(f"Verification failed: {e}")
-        return json.dumps(error.to_dict())
+        return json.dumps(result, indent=2)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
     except Exception as e:
-        error = ToolExecutionError("verify_fact_consistency", str(e))
-        logger.error(f"Unexpected error in verification: {e}")
+        error = ToolExecutionError("verify_claim", str(e))
+        logger.error(f"Verify claim failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def verify_finalize(session_id: str, ctx: Context | None = None) -> str:
+    """Finalize verification and get result.
+
+    Call after verifying all claims.
+
+    Args:
+        session_id: Session from verify_start (required)
+
+    Returns:
+        JSON with verified (bool), confidence, summary, recommendation
+
+    """
+    try:
+        manager = get_verification_manager()
+        result = manager.finalize(session_id=session_id)
+
+        if ctx:
+            verified = result.get("verified", False)
+            conf = result.get("confidence", 0)
+            await ctx.info(
+                f"Verification complete: {'✓' if verified else '✗'} ({conf:.0%} confidence)"
+            )
+
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("verify_finalize", str(e))
+        logger.error(f"Verify finalize failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def verify_get(session_id: str, ctx: Context | None = None) -> str:
+    """Get the current state of a verification session.
+
+    Args:
+        session_id: Session to retrieve (required)
+
+    Returns:
+        JSON with full verification state
+
+    """
+    try:
+        manager = get_verification_manager()
+        result = manager.get_status(session_id=session_id)
+        return json.dumps(result, indent=2, default=str)
+    except ValueError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        error = ToolExecutionError("verify_get", str(e))
+        logger.error(f"Verify get failed: {e}")
         return json.dumps(error.to_dict())
 
 
@@ -586,39 +792,24 @@ async def recommend_reasoning_strategy(
 ) -> str:
     """Get recommendation for optimal reasoning strategy.
 
-    Analyzes problem structure to recommend the best reasoning approach
-    based on serial vs parallel nature and resource constraints.
+    Analyzes problem structure to recommend the best approach.
 
     Args:
         problem: Problem description (required)
         token_budget: Available tokens 500-20000 (default 4000)
 
     Returns:
-        JSON with recommended_strategy, estimated_depth_steps,
-        estimated_tokens_needed, expressiveness_guarantee,
-        strategy_confidence, explanation
+        JSON with recommended_strategy, explanation
 
     Strategies:
-        - long_chain: For serial problems with strong dependencies
-        - matrix: For multi-hop reasoning needing multiple perspectives
-        - parallel_voting: For simple problems or exploration
-
-    Decision logic (from research papers):
-        - High serial dependency indicators → long_chain
-        - Multi-path benefits → matrix
-        - Complex exploration with budget → parallel_voting
-
-    Example:
-        recommend_reasoning_strategy(
-            problem="Find if there's a path from A to D in graph",
-            token_budget=5000
-        )
+        - chain: For serial problems (use chain_* tools)
+        - matrix: For multi-perspective problems (use matrix_* tools)
+        - parallel_voting: For simple exploration
 
     """
     try:
         problem_lower = problem.lower()
 
-        # Heuristic indicators for serial vs parallel
         serial_indicators = [
             "order",
             "sequence",
@@ -645,39 +836,42 @@ async def recommend_reasoning_strategy(
         serial_count = sum(1 for ind in serial_indicators if ind in problem_lower)
         parallel_count = sum(1 for ind in parallel_indicators if ind in problem_lower)
 
-        # Determine strategy
-        if serial_count > parallel_count + 1:
+        budget_constrained = token_budget < 1000
+
+        if budget_constrained:
+            strategy = ReasoningStrategy.LONG_CHAIN
+            depth = min(token_budget // 250, 5)
+            explanation = f"Low token budget ({token_budget}) - use simple chain"
+        elif serial_count > parallel_count + 1:
             strategy = ReasoningStrategy.LONG_CHAIN
             depth = min(token_budget // 250, 20)
-            explanation = f"Detected {serial_count} serial indicators (path, sequence, etc.)"
+            explanation = "Serial problem detected - use chain_* tools"
         elif parallel_count > serial_count:
             strategy = ReasoningStrategy.PARALLEL
             depth = min(token_budget // 300, 10)
-            explanation = f"Detected {parallel_count} parallel indicators (multiple, explore, etc.)"
+            explanation = "Parallel exploration beneficial - consider multiple approaches"
         else:
             strategy = ReasoningStrategy.MATRIX
             depth = 4
-            explanation = "Balanced problem - matrix combines breadth and depth"
+            explanation = "Multi-perspective problem - use matrix_* tools"
 
-        # Calculate confidence
         indicator_diff = abs(serial_count - parallel_count)
         confidence = min(0.5 + 0.1 * indicator_diff, 0.9)
 
         result: dict[str, Any] = {
             "recommended_strategy": strategy.value,
             "estimated_depth_steps": depth,
-            "estimated_tokens_needed": depth * 250,
-            "expressiveness_guarantee": True,
             "strategy_confidence": round(confidence, 3),
             "explanation": explanation,
-            "indicators": {
-                "serial_count": serial_count,
-                "parallel_count": parallel_count,
-            },
+            "tool_suggestion": (
+                "chain_start, chain_add_step, chain_finalize"
+                if strategy == ReasoningStrategy.LONG_CHAIN
+                else "matrix_start, matrix_set_cell, matrix_synthesize, matrix_finalize"
+            ),
         }
 
         if ctx:
-            await ctx.info(f"Recommended: {strategy.value} (confidence: {confidence:.0%})")
+            await ctx.info(f"Recommended: {strategy.value}")
 
         return json.dumps(result, indent=2)
 
@@ -694,39 +888,20 @@ async def recommend_reasoning_strategy(
 
 @mcp.tool
 async def check_status(ctx: Context | None = None) -> str:
-    """Get server and model status for debugging.
-
-    Returns comprehensive status information including model state,
-    device info, memory usage, and disk space. Useful for debugging
-    deployment issues and monitoring.
-
-    Args:
-        None required
+    """Get server and model status.
 
     Returns:
-        JSON with model_status (state, device, memory, disk),
-        server_info (name, transport), and llm_config
-
-    Status fields:
-        - state: not_started, downloading, loading, ready, failed
-        - device: cpu or cuda
-        - gpu_memory_*: GPU memory stats (if using CUDA)
-        - disk_free_mb: Available disk space
-        - model_size_mb: Estimated model size
-
-    Use when:
-        - Debugging why tools aren't working
-        - Checking if model finished loading
-        - Monitoring resource usage
-        - Verifying configuration
-
-    Example:
-        check_status()
+        JSON with model_status, server_info
 
     """
     try:
         model_manager = ModelManager.get_instance()
         model_status = model_manager.get_status()
+
+        # Get session counts
+        chain_mgr = get_chain_manager()
+        matrix_mgr = get_matrix_manager()
+        verify_mgr = get_verification_manager()
 
         result: dict[str, Any] = {
             "model_status": model_status,
@@ -734,22 +909,19 @@ async def check_status(ctx: Context | None = None) -> str:
                 "name": SERVER_NAME,
                 "transport": SERVER_TRANSPORT,
             },
-            "llm_config": {
-                "model": OPENAI_MODEL,
-                "base_url": OPENAI_BASE_URL or "https://api.openai.com",
-                "api_key_set": bool(OPENAI_API_KEY),
-                "timeout": LLM_TIMEOUT,
-                "max_retries": LLM_MAX_RETRIES,
-            },
             "embedding_config": {
                 "model": _get_embedding_model_name(),
+            },
+            "active_sessions": {
+                "chain": len(chain_mgr._sessions),
+                "matrix": len(matrix_mgr._sessions),
+                "verify": len(verify_mgr._sessions),
             },
         }
 
         if ctx:
             state = model_status.get("state", "unknown")
-            device = model_status.get("device", "unknown")
-            await ctx.info(f"Model state: {state}, Device: {device}")
+            await ctx.info(f"Model state: {state}")
 
         return json.dumps(result, indent=2)
 
@@ -768,23 +940,15 @@ def main() -> None:
     """Run the MatrixMind MCP server."""
     logger.info(f"Starting {SERVER_NAME} (transport: {SERVER_TRANSPORT})")
 
-    # Initialize embedding model in background (non-blocking)
+    # Initialize embedding model
     _init_model_manager()
 
     if SERVER_TRANSPORT == "stdio":
         mcp.run(transport="stdio")
     elif SERVER_TRANSPORT == "http":
-        mcp.run(
-            transport="streamable-http",
-            host=SERVER_HOST,
-            port=SERVER_PORT,
-        )
+        mcp.run(transport="streamable-http", host=SERVER_HOST, port=SERVER_PORT)
     elif SERVER_TRANSPORT == "sse":
-        mcp.run(
-            transport="sse",
-            host=SERVER_HOST,
-            port=SERVER_PORT,
-        )
+        mcp.run(transport="sse", host=SERVER_HOST, port=SERVER_PORT)
     else:
         logger.warning(f"Unknown transport '{SERVER_TRANSPORT}', falling back to stdio")
         mcp.run(transport="stdio")

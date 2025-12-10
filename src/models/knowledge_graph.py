@@ -14,15 +14,11 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from loguru import logger
 
-from src.models.llm_client import LLMClientProtocol
 from src.utils.errors import MatrixMindException
-
-if TYPE_CHECKING:
-    pass
 
 
 class KnowledgeGraphException(MatrixMindException):
@@ -523,13 +519,13 @@ class KnowledgeGraph:
 
 
 class KnowledgeGraphExtractor:
-    """Extracts knowledge graph from text using LLM.
+    """Extracts knowledge graph from text using rule-based patterns.
 
-    Uses an LLM to identify entities, relations, and facts from
-    unstructured text, building a structured knowledge graph.
+    Uses regex patterns and heuristics to identify entities, relations,
+    and facts from unstructured text, building a structured knowledge graph.
 
     Example:
-        >>> extractor = KnowledgeGraphExtractor(llm_client)
+        >>> extractor = KnowledgeGraphExtractor()
         >>> kg = extractor.extract(
         ...     "Einstein published his theory of relativity in 1905."
         ... )
@@ -537,7 +533,7 @@ class KnowledgeGraphExtractor:
 
     """
 
-    # Patterns for simple entity extraction (fallback)
+    # Patterns for entity extraction
     DATE_PATTERN = re.compile(
         r"\b((?:19|20)\d{2}|January|February|March|April|May|June|July|August|September|October|November|December)\b",
         re.IGNORECASE,
@@ -547,20 +543,9 @@ class KnowledgeGraphExtractor:
         re.IGNORECASE,
     )
 
-    def __init__(
-        self,
-        llm_client: LLMClientProtocol | None = None,
-        use_llm: bool = True,
-    ) -> None:
-        """Initialize extractor.
-
-        Args:
-            llm_client: LLM client for extraction. If None, uses rule-based only.
-            use_llm: Whether to use LLM for extraction.
-
-        """
-        self.llm = llm_client
-        self.use_llm = use_llm and llm_client is not None
+    def __init__(self) -> None:
+        """Initialize extractor."""
+        pass
 
     def extract(
         self,
@@ -586,11 +571,7 @@ class KnowledgeGraphExtractor:
         kg = existing_graph or KnowledgeGraph()
 
         try:
-            if self.use_llm:
-                self._extract_with_llm(text, kg)
-            else:
-                self._extract_with_rules(text, kg)
-
+            self._extract_with_rules(text, kg)
         except KnowledgeGraphException:
             raise
         except Exception as e:
@@ -599,71 +580,8 @@ class KnowledgeGraphExtractor:
 
         return kg
 
-    def _extract_with_llm(self, text: str, kg: KnowledgeGraph) -> None:
-        """Extract using LLM."""
-        if not self.llm:
-            return
-
-        prompt = f"""Extract entities and relations from the following text.
-
-Text:
-{text[:2000]}
-
-Output format (one per line):
-ENTITY: <name> | <type: PERSON/ORG/LOC/DATE/EVENT/CONCEPT/OTHER>
-RELATION: <subject> | <predicate> | <object>
-
-Example:
-ENTITY: Albert Einstein | PERSON
-ENTITY: Theory of Relativity | CONCEPT
-RELATION: Albert Einstein | authored | Theory of Relativity
-
-Extract all meaningful entities and relations:"""
-
-        try:
-            response = self.llm.generate(
-                prompt=prompt,
-                max_tokens=1000,
-                temperature=0.3,
-            )
-
-            # Parse response
-            for line in response.strip().split("\n"):
-                line = line.strip()
-                if line.startswith("ENTITY:"):
-                    parts = line[7:].split("|")
-                    if len(parts) >= 2:
-                        name = parts[0].strip()
-                        type_str = parts[1].strip().upper()
-                        try:
-                            entity_type = EntityType(type_str)
-                        except ValueError:
-                            entity_type = EntityType.OTHER
-                        kg.add_entity(name, entity_type)
-
-                elif line.startswith("RELATION:"):
-                    parts = line[9:].split("|")
-                    if len(parts) >= 3:
-                        subject = parts[0].strip()
-                        predicate = parts[1].strip()
-                        obj = parts[2].strip()
-
-                        # Try to match known relation type
-                        try:
-                            rel_type: RelationType | str = RelationType(
-                                predicate.lower().replace(" ", "_")
-                            )
-                        except ValueError:
-                            rel_type = predicate  # Use as string
-
-                        kg.add_relation(subject, rel_type, obj, evidence=text[:200])
-
-        except Exception as e:
-            logger.warning(f"LLM extraction failed, falling back to rules: {e}")
-            self._extract_with_rules(text, kg)
-
     def _extract_with_rules(self, text: str, kg: KnowledgeGraph) -> None:
-        """Extract using simple rule-based patterns."""
+        """Extract using rule-based patterns."""
         # Extract dates
         for match in self.DATE_PATTERN.finditer(text):
             kg.add_entity(match.group(), EntityType.DATE)
@@ -685,6 +603,44 @@ Extract all meaningful entities and relations:"""
             else:
                 kg.add_entity(name, EntityType.OTHER)
 
+        # Extract simple relations using pattern matching
+        self._extract_relations_with_rules(text, kg)
+
+    def _extract_relations_with_rules(self, text: str, kg: KnowledgeGraph) -> None:
+        """Extract relations using pattern matching."""
+        # Common relation patterns
+        patterns = [
+            # "X is a Y" / "X is the Y"
+            (r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+is\s+(?:a|the)\s+([A-Za-z]+)", RelationType.IS_A),
+            # "X founded Y" / "X created Y"
+            (
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:founded|created|established)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+                RelationType.FOUNDED,
+            ),
+            # "X located in Y" / "X is in Y"
+            (
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:is\s+)?(?:located\s+)?in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+                RelationType.LOCATED_IN,
+            ),
+            # "X works for Y" / "X employed by Y"
+            (
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:works\s+for|employed\s+by)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)",
+                RelationType.WORKS_FOR,
+            ),
+            # "X born in Y"
+            (
+                r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s+(?:was\s+)?born\s+in\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+|\d{4})*)",
+                RelationType.BORN_IN,
+            ),
+        ]
+
+        for pattern, rel_type in patterns:
+            for match in re.finditer(pattern, text):
+                subject = match.group(1).strip()
+                obj = match.group(2).strip()
+                if subject and obj:
+                    kg.add_relation(subject, rel_type, obj, evidence=match.group(0))
+
     def extract_for_question(
         self,
         text: str,
@@ -702,59 +658,18 @@ Extract all meaningful entities and relations:"""
         """
         kg = KnowledgeGraph()
 
-        if not self.llm:
-            return self.extract(text, kg)
+        # Extract normally first
+        self.extract(text, kg)
 
-        prompt = f"""Given the question, extract relevant entities and relations from the text.
+        # Extract entities mentioned in the question for relevance
+        question_entities: set[str] = set()
+        cap_pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
+        for match in cap_pattern.finditer(question):
+            question_entities.add(match.group().lower())
 
-Question: {question}
-
-Text:
-{text[:2000]}
-
-Output format (one per line):
-ENTITY: <name> | <type: PERSON/ORG/LOC/DATE/EVENT/CONCEPT/OTHER>
-RELATION: <subject> | <predicate> | <object>
-
-Focus on entities and relations that help answer the question:"""
-
-        try:
-            response = self.llm.generate(
-                prompt=prompt,
-                max_tokens=800,
-                temperature=0.3,
-            )
-
-            # Parse response (same as _extract_with_llm)
-            for line in response.strip().split("\n"):
-                line = line.strip()
-                if line.startswith("ENTITY:"):
-                    parts = line[7:].split("|")
-                    if len(parts) >= 2:
-                        name = parts[0].strip()
-                        type_str = parts[1].strip().upper()
-                        try:
-                            entity_type = EntityType(type_str)
-                        except ValueError:
-                            entity_type = EntityType.OTHER
-                        kg.add_entity(name, entity_type)
-
-                elif line.startswith("RELATION:"):
-                    parts = line[9:].split("|")
-                    if len(parts) >= 3:
-                        subject = parts[0].strip()
-                        predicate = parts[1].strip()
-                        obj = parts[2].strip()
-                        try:
-                            rel_type_q: RelationType | str = RelationType(
-                                predicate.lower().replace(" ", "_")
-                            )
-                        except ValueError:
-                            rel_type_q = predicate
-                        kg.add_relation(subject, rel_type_q, obj, evidence=text[:200])
-
-        except Exception as e:
-            logger.warning(f"Question-focused extraction failed: {e}")
-            return self.extract(text, kg)
+        # Mark question-relevant entities with higher mention count
+        for entity in kg.entities:
+            if entity.name.lower() in question_entities:
+                entity.mention_count += 5  # Boost relevance
 
         return kg

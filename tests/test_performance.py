@@ -27,51 +27,6 @@ import pytest
 pytest.importorskip("fastmcp")
 
 
-class MockLLMClient:
-    """Mock LLM client for performance testing without API calls."""
-
-    def __init__(self) -> None:
-        self.call_count = 0
-        self.total_latency = 0.0
-
-    def generate(
-        self,
-        prompt: str,
-        max_tokens: int = 2000,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Simulate LLM generation with minimal latency."""
-        self.call_count += 1
-        # Simulate small processing delay
-        time.sleep(0.01)
-        return f"Mock response for: {prompt[:50]}..."
-
-    async def generate_async(
-        self,
-        prompt: str,
-        max_tokens: int = 2000,
-        temperature: float | None = None,
-        top_p: float | None = None,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Simulate async LLM generation."""
-        self.call_count += 1
-        await asyncio.sleep(0.01)
-        return f"Mock async response for: {prompt[:50]}..."
-
-    def estimate_tokens(self, text: str) -> int:
-        """Estimate tokens in text."""
-        return len(text) // 4
-
-
-@pytest.fixture
-def mock_llm_client() -> MockLLMClient:
-    """Create a mock LLM client for testing."""
-    return MockLLMClient()
-
-
 @pytest.fixture
 def sample_contexts() -> list[str]:
     """Generate sample contexts of varying sizes."""
@@ -155,100 +110,117 @@ class TestCompressionPerformance:
         assert avg_time < 5.0  # Should complete within 5 seconds each
 
 
-class TestReasoningPerformance:
-    """Performance tests for reasoning tools."""
+class TestStateManagerPerformance:
+    """Performance tests for state manager tools (new architecture)."""
 
-    def test_mot_matrix_size_impact(self, mock_llm_client: MockLLMClient) -> None:
-        """Test how matrix size affects MoT performance."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
+    def test_chain_manager_session_overhead(self) -> None:
+        """Test session creation and management overhead for chain manager."""
+        from src.tools.long_chain import LongChainManager
 
-        tool = MatrixOfThoughtTool(mock_llm_client)
+        manager = LongChainManager()
 
-        context = "Test context for reasoning."
-        question = "What is the answer?"
+        num_sessions = 100
+        timings: list[float] = []
 
-        results: list[dict[str, Any]] = []
-
-        for rows in [2, 3, 4]:
-            for cols in [2, 3, 4]:
-                mock_llm_client.call_count = 0
-                start = time.perf_counter()
-
-                result = tool.reason(
-                    question=question,
-                    context=context,
-                    matrix_rows=rows,
-                    matrix_cols=cols,
-                )
-
-                elapsed = time.perf_counter() - start
-
-                results.append(
-                    {
-                        "rows": rows,
-                        "cols": cols,
-                        "time": elapsed,
-                        "llm_calls": mock_llm_client.call_count,
-                        "confidence": result.confidence,
-                    }
-                )
-
-        # Print results table
-        print(
-            "\n{:<6} {:<6} {:<10} {:<12} {:<10}".format(
-                "Rows", "Cols", "Time (s)", "LLM Calls", "Confidence"
-            )
-        )
-        print("-" * 50)
-        for r in results:
-            print(
-                "{:<6} {:<6} {:<10.3f} {:<12} {:<10.2f}".format(
-                    r["rows"], r["cols"], r["time"], r["llm_calls"], r["confidence"]
-                )
-            )
-
-    def test_long_chain_step_impact(self, mock_llm_client: MockLLMClient) -> None:
-        """Test how step count affects long chain performance."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(mock_llm_client)
-
-        problem = "Solve this step by step."
-
-        results: list[dict[str, Any]] = []
-
-        for num_steps in [5, 10, 15, 20]:
-            mock_llm_client.call_count = 0
+        for i in range(num_sessions):
             start = time.perf_counter()
+            result = manager.start_chain(f"Problem {i}")
+            session_id = result["session_id"]
+            manager.add_step(session_id, f"Step 1 for problem {i}")
+            manager.add_step(session_id, f"Step 2 for problem {i}")
+            manager.finalize(session_id, f"Answer {i}")
+            timings.append(time.perf_counter() - start)
 
-            result = tool.reason(
-                problem=problem,
-                num_steps=num_steps,
-                verify_intermediate=True,
-            )
+        avg_time = statistics.mean(timings)
+        print(f"\nChain sessions created: {num_sessions}")
+        print(f"Average session time: {avg_time * 1000:.2f}ms")
+        print(f"P95 latency: {sorted(timings)[int(0.95 * len(timings))] * 1000:.2f}ms")
 
+        # Session overhead should be minimal (< 10ms per session)
+        assert avg_time < 0.01
+
+    def test_matrix_manager_cell_population(self) -> None:
+        """Test matrix cell population performance."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
+
+        manager = MatrixOfThoughtManager()
+
+        matrix_sizes = [(2, 2), (3, 3), (4, 4), (5, 5)]
+        results: list[dict[str, Any]] = []
+
+        for rows, cols in matrix_sizes:
+            start = time.perf_counter()
+            result = manager.start_matrix(f"Question for {rows}x{cols}", "", rows, cols)
+            session_id = result["session_id"]
+
+            for row in range(rows):
+                for col in range(cols):
+                    manager.set_cell(session_id, row, col, f"Thought at ({row}, {col})")
+
+            manager.synthesize_column(session_id, 0, "Synthesis of all thoughts")
+            manager.finalize(session_id, "Final answer")
             elapsed = time.perf_counter() - start
 
             results.append(
                 {
-                    "steps": num_steps,
-                    "time": elapsed,
-                    "llm_calls": mock_llm_client.call_count,
-                    "actual_steps": len(result.reasoning_steps),
+                    "size": f"{rows}x{cols}",
+                    "cells": rows * cols,
+                    "time_ms": elapsed * 1000,
                 }
             )
 
         # Print results
-        print(
-            "\n{:<8} {:<10} {:<12} {:<12}".format("Steps", "Time (s)", "LLM Calls", "Actual Steps")
-        )
+        print("\n{:<8} {:<8} {:<15}".format("Size", "Cells", "Time (ms)"))
+        print("-" * 35)
+        for r in results:
+            print("{:<8} {:<8} {:<15.2f}".format(r["size"], r["cells"], r["time_ms"]))
+
+    def test_verification_manager_claim_processing(self) -> None:
+        """Test verification manager claim processing performance."""
+        from src.tools.verify import VerificationManager
+
+        manager = VerificationManager()
+
+        claim_counts = [5, 10, 15, 20]
+        results: list[dict[str, Any]] = []
+
+        for num_claims in claim_counts:
+            start = time.perf_counter()
+            result = manager.start_verification(
+                "Test answer with multiple claims",
+                "Context for verification",
+            )
+            session_id = result["session_id"]
+
+            claim_ids = []
+            for i in range(num_claims):
+                claim_result = manager.add_claim(session_id, f"Claim number {i}")
+                claim_ids.append(claim_result["claim_id"])
+
+            for claim_id in claim_ids:
+                manager.verify_claim(
+                    session_id,
+                    claim_id,
+                    "supported",
+                    "Evidence supports this claim",
+                )
+
+            manager.finalize(session_id)
+            elapsed = time.perf_counter() - start
+
+            results.append(
+                {
+                    "claims": num_claims,
+                    "time_ms": elapsed * 1000,
+                    "per_claim_ms": (elapsed * 1000) / num_claims,
+                }
+            )
+
+        # Print results
+        print("\n{:<10} {:<15} {:<15}".format("Claims", "Total (ms)", "Per Claim (ms)"))
         print("-" * 45)
         for r in results:
-            print(
-                "{:<8} {:<10.3f} {:<12} {:<12}".format(
-                    r["steps"], r["time"], r["llm_calls"], r["actual_steps"]
-                )
-            )
+            print("{:<10} {:<15.2f} {:<15.2f}".format(r["claims"], r["time_ms"], r["per_claim_ms"]))
 
 
 class TestConcurrencyPerformance:
@@ -287,35 +259,71 @@ class TestConcurrencyPerformance:
         print(f"Speedup vs sequential: {sum(times) / total_time:.2f}x")
 
     @pytest.mark.asyncio
-    async def test_concurrent_reasoning(self, mock_llm_client: MockLLMClient) -> None:
-        """Test concurrent reasoning requests."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
+    async def test_concurrent_state_manager_sessions(self) -> None:
+        """Test concurrent state manager session handling."""
+        from src.tools.long_chain import LongChainManager
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
 
-        tool = MatrixOfThoughtTool(mock_llm_client)
+        chain_manager = LongChainManager()
+        matrix_manager = MatrixOfThoughtManager()
 
-        async def reason_task(idx: int) -> tuple[int, float]:
+        async def chain_task(idx: int) -> tuple[str, float]:
             start = time.perf_counter()
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
                 None,
-                lambda: tool.reason(
-                    question=f"Question {idx}?",
-                    context=f"Context {idx}.",
-                    matrix_rows=2,
-                    matrix_cols=2,
-                ),
+                lambda: self._run_chain_session(chain_manager, idx),
             )
-            return idx, time.perf_counter() - start
+            return "chain", time.perf_counter() - start
 
-        num_concurrent = 3
+        async def matrix_task(idx: int) -> tuple[str, float]:
+            start = time.perf_counter()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self._run_matrix_session(matrix_manager, idx),
+            )
+            return "matrix", time.perf_counter() - start
+
+        # Run mixed concurrent sessions
+        tasks = [
+            chain_task(0),
+            matrix_task(0),
+            chain_task(1),
+            matrix_task(1),
+            chain_task(2),
+            matrix_task(2),
+        ]
+
         start_total = time.perf_counter()
-        results = await asyncio.gather(*[reason_task(i) for i in range(num_concurrent)])
+        results = await asyncio.gather(*tasks)
         total_time = time.perf_counter() - start_total
 
-        times = [r[1] for r in results]
-        print(f"\nConcurrent reasoning requests: {num_concurrent}")
+        chain_times = [r[1] for r in results if r[0] == "chain"]
+        matrix_times = [r[1] for r in results if r[0] == "matrix"]
+
+        print(f"\nConcurrent mixed sessions: {len(tasks)}")
         print(f"Total time: {total_time:.3f}s")
-        print(f"Average per request: {statistics.mean(times):.3f}s")
+        print(f"Avg chain session: {statistics.mean(chain_times) * 1000:.2f}ms")
+        print(f"Avg matrix session: {statistics.mean(matrix_times) * 1000:.2f}ms")
+
+    def _run_chain_session(self, manager: Any, idx: int) -> None:
+        """Helper to run a chain session."""
+        result = manager.start_chain(f"Problem {idx}")
+        session_id = result["session_id"]
+        for step in range(5):
+            manager.add_step(session_id, f"Step {step} for problem {idx}")
+        manager.finalize(session_id, f"Answer {idx}")
+
+    def _run_matrix_session(self, manager: Any, idx: int) -> None:
+        """Helper to run a matrix session."""
+        result = manager.start_matrix(f"Question {idx}", "", 3, 3)
+        session_id = result["session_id"]
+        for row in range(3):
+            for col in range(3):
+                manager.set_cell(session_id, row, col, f"Cell ({row},{col})")
+        manager.synthesize_column(session_id, 0, f"Synthesis {idx}")
+        manager.finalize(session_id, f"Answer {idx}")
 
 
 class TestMemoryPerformance:
@@ -364,6 +372,33 @@ class TestMemoryPerformance:
         # Cache should not exceed max size
         assert stats["size"] <= stats["max_size"]
 
+    def test_state_manager_session_cleanup(self) -> None:
+        """Test that state managers properly clean up completed sessions."""
+        import tracemalloc
+
+        from src.tools.long_chain import LongChainManager
+
+        tracemalloc.start()
+
+        manager = LongChainManager()
+
+        # Create and complete many sessions
+        for i in range(100):
+            result = manager.start_chain(f"Problem {i}")
+            session_id = result["session_id"]
+            manager.add_step(session_id, "Step 1")
+            manager.finalize(session_id, "Answer")
+
+        current, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        print("\nAfter 100 sessions:")
+        print(f"  Current memory: {current / 1024:.2f} KB")
+        print(f"  Peak memory: {peak / 1024:.2f} KB")
+
+        # Memory should be bounded
+        assert current < 10 * 1024 * 1024  # < 10MB
+
 
 class TestStressTests:
     """Stress tests for system limits."""
@@ -391,29 +426,39 @@ class TestStressTests:
         assert result.compression_ratio < 0.3
 
     @pytest.mark.stress
-    def test_rapid_sequential_requests(self, mock_llm_client: MockLLMClient) -> None:
-        """Test rapid sequential request handling."""
-        from src.tools.verify import FactVerificationTool
+    def test_rapid_sequential_state_sessions(self) -> None:
+        """Test rapid sequential state manager session handling."""
+        from src.tools.verify import VerificationManager
 
-        tool = FactVerificationTool(mock_llm_client)
+        manager = VerificationManager()
 
-        num_requests = 50
+        num_sessions = 50
         timings: list[float] = []
 
         start_total = time.perf_counter()
-        for i in range(num_requests):
+        for i in range(num_sessions):
             start = time.perf_counter()
-            tool.verify(
-                answer=f"Answer {i} is correct.",
-                context=f"Context {i} contains the answer.",
-                max_claims=3,
+
+            result = manager.start_verification(
+                f"Answer {i} is correct.",
+                f"Context {i} contains the answer.",
             )
+            session_id = result["session_id"]
+
+            # Add and verify 3 claims per session
+            for j in range(3):
+                claim_result = manager.add_claim(session_id, f"Claim {j} of session {i}")
+                claim_id = claim_result["claim_id"]
+                manager.verify_claim(session_id, claim_id, "supported", "Evidence")
+
+            manager.finalize(session_id)
             timings.append(time.perf_counter() - start)
+
         total_time = time.perf_counter() - start_total
 
-        print(f"\nRapid sequential requests: {num_requests}")
+        print(f"\nRapid sequential sessions: {num_sessions}")
         print(f"Total time: {total_time:.3f}s")
-        print(f"Requests/second: {num_requests / total_time:.1f}")
+        print(f"Sessions/second: {num_sessions / total_time:.1f}")
         print(f"Average latency: {statistics.mean(timings) * 1000:.1f}ms")
         print(f"P95 latency: {sorted(timings)[int(0.95 * len(timings))] * 1000:.1f}ms")
 

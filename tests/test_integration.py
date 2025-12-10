@@ -1,175 +1,302 @@
-"""Integration tests for MatrixMind MCP Server.
+"""Integration tests for MatrixMind MCP.
 
-Tests full pipeline: compress → reason → verify
-Requires OPENAI_API_KEY to be set.
-
-Run with: pytest -m integration -v
-Or exclude: pytest -m "not integration"
+Tests the full workflow of tools working together.
 """
 
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock
-
 import pytest
 
-# Skip all tests if no API key (for CI without secrets)
-# Also mark as integration tests for explicit selection
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        not os.getenv("OPENAI_API_KEY"),
-        reason="OPENAI_API_KEY not set - skipping integration tests",
-    ),
-]
+
+class TestLongChainWorkflow:
+    """Integration tests for long chain reasoning workflow."""
+
+    def test_complete_chain_workflow(self) -> None:
+        """Test complete chain reasoning from start to finish."""
+        from src.tools.long_chain import LongChainManager
+
+        manager = LongChainManager()
+
+        # Start a reasoning chain
+        start = manager.start_chain(
+            problem="What is the sum of the first 5 prime numbers?",
+            expected_steps=5,
+        )
+        session_id = start["session_id"]
+        assert start["status"] == "started"
+
+        # Step 1: Identify what we need
+        step1 = manager.add_step(
+            session_id,
+            thought="I need to find the first 5 prime numbers: 2, 3, 5, 7, 11",
+        )
+        assert step1["step_added"] == 1
+
+        # Step 2: Set up calculation
+        step2 = manager.add_step(
+            session_id,
+            thought="Now I need to add them: 2 + 3 + 5 + 7 + 11",
+        )
+        assert step2["step_added"] == 2
+
+        # Step 3: Calculate
+        step3 = manager.add_step(
+            session_id,
+            thought="2 + 3 = 5, 5 + 5 = 10, 10 + 7 = 17, 17 + 11 = 28",
+        )
+        assert step3["step_added"] == 3
+
+        # Finalize
+        result = manager.finalize(session_id, answer="28", confidence=0.95)
+        assert result["status"] == "completed"
+        assert result["final_answer"] == "28"
+
+    def test_chain_early_termination(self) -> None:
+        """Test abandoning a chain before completion."""
+        from src.tools.long_chain import LongChainManager
+
+        manager = LongChainManager()
+
+        start = manager.start_chain(problem="Test problem", expected_steps=10)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="First thought")
+        manager.add_step(session_id, thought="Second thought")
+
+        # Abandon
+        result = manager.abandon(session_id)
+        assert result["status"] == "abandoned"
+
+        # Session still exists but is abandoned
+        state = manager.get_chain(session_id)
+        assert state["status"] == "abandoned"
 
 
-@pytest.fixture
-def mock_llm_client() -> MagicMock:
-    """Create a mock LLM client for testing without API calls."""
-    client = MagicMock()
-    client.generate.return_value = "Mocked LLM response"
-    client.estimate_tokens.return_value = 100
-    return client
+class TestMatrixOfThoughtWorkflow:
+    """Integration tests for matrix of thought workflow."""
+
+    def test_complete_matrix_workflow(self) -> None:
+        """Test complete matrix reasoning from start to finish."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
+
+        manager = MatrixOfThoughtManager()
+
+        # Start a matrix session
+        start = manager.start_matrix(
+            question="Should we migrate to microservices?",
+            rows=3,  # 3 perspectives
+            cols=2,  # 2 criteria
+            strategies=["technical", "business", "operational"],
+        )
+        session_id = start["session_id"]
+        assert start["status"] == "started"
+        assert start["matrix_dimensions"]["rows"] == 3
+        assert start["matrix_dimensions"]["cols"] == 2
+
+        # Fill the matrix (perspectives x criteria)
+        # Row 0: Technical perspective
+        manager.set_cell(session_id, 0, 0, thought="Technical pros: Better scalability")
+        manager.set_cell(session_id, 0, 1, thought="Technical cons: Complexity")
+
+        # Row 1: Business perspective
+        manager.set_cell(session_id, 1, 0, thought="Business pros: Faster delivery")
+        manager.set_cell(session_id, 1, 1, thought="Business cons: Higher cost")
+
+        # Row 2: Operational perspective
+        manager.set_cell(session_id, 2, 0, thought="Ops pros: Better fault isolation")
+        manager.set_cell(session_id, 2, 1, thought="Ops cons: More infrastructure")
+
+        # Finalize
+        result = manager.finalize(
+            session_id,
+            answer="Yes, migrate for scalability benefits",
+            confidence=0.75,
+        )
+        assert result["status"] == "completed"
+
+    def test_matrix_partial_fill_finalize(self) -> None:
+        """Test finalizing matrix with partial fill."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
+
+        manager = MatrixOfThoughtManager()
+
+        start = manager.start_matrix(question="Test?", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Only fill some cells
+        manager.set_cell(session_id, 0, 0, thought="Only one cell")
+
+        # Should still be able to finalize
+        result = manager.finalize(session_id, answer="Partial answer", confidence=0.5)
+        assert result["status"] == "completed"
 
 
-class TestFullPipeline:
-    """Test complete reasoning pipeline."""
+class TestVerificationWorkflow:
+    """Integration tests for verification workflow."""
 
-    @pytest.mark.asyncio
-    async def test_compress_then_reason(self, mock_llm_client: MagicMock) -> None:
-        """Test compression followed by reasoning."""
-        # This test would use actual tools with mocked LLM
-        # For unit testing, we verify the flow
+    def test_complete_verification_workflow(self) -> None:
+        """Test complete verification from start to finish."""
+        from src.tools.verify import VerificationManager
 
-        # 1. Compress long context
-        long_context = "This is a test sentence. " * 100
-        _question = "What is the test about?"  # noqa: F841
+        manager = VerificationManager()
 
-        # Mock compression result
-        compressed = "This is a test sentence. " * 10
-        assert len(compressed) < len(long_context)
+        # Context to verify against
+        context = """
+        The Eiffel Tower is a wrought-iron lattice tower on the Champ de Mars in Paris.
+        It was constructed from 1887 to 1889 and is 330 metres tall.
+        It was named after the engineer Gustave Eiffel.
+        """
 
-        # 2. Reason on compressed context
-        # Would call matrix_of_thought_reasoning or long_chain_of_thought
-        answer = "The test is about sentences."
-        confidence = 0.85
+        # Answer to verify
+        answer = "The Eiffel Tower is 330 meters tall and was built by Gustave Eiffel."
 
-        assert answer
-        assert 0 <= confidence <= 1
+        # Start verification
+        start = manager.start_verification(answer=answer, context=context)
+        session_id = start["session_id"]
+        assert start["status"] == "started"
 
-    @pytest.mark.asyncio
-    async def test_reason_then_verify(self, mock_llm_client: MagicMock) -> None:
-        """Test reasoning followed by verification."""
-        # 1. Get reasoning result (values shown for documentation)
-        _answer = "Einstein published relativity in 1905."  # noqa: F841
-        _context = "Albert Einstein published special relativity in 1905."  # noqa: F841
+        # Add claims from the answer
+        manager.add_claim(session_id, content="The Eiffel Tower is 330 meters tall")
+        manager.add_claim(session_id, content="It was built by Gustave Eiffel")
 
-        # 2. Verify answer
-        # Mock verification
-        verified = True
-        confidence = 0.9
+        # Verify each claim
+        manager.verify_claim(
+            session_id,
+            claim_id=0,
+            status="supported",
+            evidence="Context states: 'is 330 metres tall'",
+            confidence=0.95,
+        )
+        manager.verify_claim(
+            session_id,
+            claim_id=1,
+            status="supported",
+            evidence="Context states: 'named after the engineer Gustave Eiffel'",
+            confidence=0.85,
+        )
 
-        assert verified
-        assert confidence > 0.7
+        # Finalize
+        result = manager.finalize(session_id)
+        assert result["status"] == "completed"
+        assert result["summary"]["total_claims"] == 2
+        assert result["summary"]["supported"] == 2
+        assert result["verified"] is True
 
-    @pytest.mark.asyncio
-    async def test_full_pipeline_compress_reason_verify(self, mock_llm_client: MagicMock) -> None:
-        """Test complete pipeline: compress → reason → verify."""
-        # Step 1: Compress
-        original_context = "Long document about physics. " * 50
-        compressed_context = "Long document about physics. " * 5
+    def test_verification_with_contradictions(self) -> None:
+        """Test verification that finds contradictions."""
+        from src.tools.verify import VerificationManager
 
-        # Step 2: Reason
-        _question = "What is the document about?"  # noqa: F841
-        answer = "The document is about physics."
+        manager = VerificationManager()
 
-        # Step 3: Verify
-        verified = True
-        claims_verified = 1
-        claims_total = 1
+        context = "The Great Wall of China is approximately 21,196 km long."
+        answer = "The Great Wall is 5,000 km long."
 
-        # Assertions
-        assert len(compressed_context) < len(original_context)
-        assert answer
-        assert verified
-        assert claims_verified == claims_total
+        start = manager.start_verification(answer=answer, context=context)
+        session_id = start["session_id"]
 
+        # Add claim
+        manager.add_claim(session_id, content="The Great Wall is 5,000 km long")
 
-class TestStrategySelection:
-    """Test reasoning strategy selection."""
+        # Verify - contradicts context
+        manager.verify_claim(
+            session_id,
+            claim_id=0,
+            status="contradicted",
+            evidence="Context says 21,196 km, not 5,000 km",
+            confidence=0.99,
+        )
 
-    def test_serial_problem_selects_long_chain(self) -> None:
-        """Test that serial problems recommend long_chain."""
-        problem = "Find the path from node A to node D in this graph"
-
-        # Serial indicators
-        serial_words = ["path", "sequence", "order", "then", "step"]
-        serial_count = sum(1 for w in serial_words if w in problem.lower())
-
-        assert serial_count >= 1
-        # Would recommend long_chain
-
-    def test_parallel_problem_selects_matrix(self) -> None:
-        """Test that parallel problems recommend matrix."""
-        problem = "Generate multiple creative solutions to this problem"
-
-        # Parallel indicators
-        parallel_words = ["multiple", "creative", "alternative", "different"]
-        parallel_count = sum(1 for w in parallel_words if w in problem.lower())
-
-        assert parallel_count >= 1
-        # Would recommend matrix or parallel
+        result = manager.finalize(session_id)
+        assert result["summary"]["contradicted"] == 1
+        assert result["verified"] is False
 
 
-class TestEdgeCases:
-    """Test edge cases and error handling."""
+class TestCrossToolWorkflow:
+    """Tests for workflows using multiple tool types."""
 
-    def test_empty_input_handling(self) -> None:
-        """Test that empty inputs are handled gracefully."""
-        from src.utils.errors import CompressionException
+    def test_chain_then_verify(self) -> None:
+        """Test using chain reasoning followed by verification."""
+        from src.tools.long_chain import LongChainManager
+        from src.tools.verify import VerificationManager
 
-        # Empty context should raise
-        with pytest.raises(CompressionException):
-            raise CompressionException("Context cannot be empty")
+        chain_manager = LongChainManager()
+        verify_manager = VerificationManager()
 
-    def test_very_long_input(self) -> None:
-        """Test handling of very long inputs."""
-        # Create 50K character input
-        long_input = "Test sentence. " * 5000
-        assert len(long_input) > 50000
+        # First, use chain reasoning to arrive at an answer
+        chain_start = chain_manager.start_chain(
+            problem="What year did the French Revolution begin?",
+            expected_steps=3,
+        )
+        chain_id = chain_start["session_id"]
 
-        # System should handle via truncation or chunking
-        max_input = 50000
-        truncated = long_input[:max_input]
-        assert len(truncated) == max_input
+        chain_manager.add_step(
+            chain_id, thought="The French Revolution is a major historical event"
+        )
+        chain_manager.add_step(
+            chain_id, thought="It started with the Storming of the Bastille in 1789"
+        )
 
-    def test_unicode_handling(self) -> None:
-        """Test Unicode text handling."""
-        unicode_text = "日本語テスト。中文测试。Emoji: 🎉🚀"
+        chain_result = chain_manager.finalize(chain_id, answer="1789", confidence=0.9)
+        assert chain_result["final_answer"] == "1789"
 
-        # Should handle without error
-        assert len(unicode_text) > 0
-        assert "🎉" in unicode_text
+        # Now verify the answer
+        context = (
+            "The French Revolution began in 1789 with the Storming of the Bastille on July 14."
+        )
+        verify_start = verify_manager.start_verification(
+            answer=chain_result["final_answer"],
+            context=context,
+        )
+        verify_id = verify_start["session_id"]
+
+        verify_manager.add_claim(verify_id, content="The French Revolution began in 1789")
+        verify_manager.verify_claim(
+            verify_id,
+            claim_id=0,
+            status="supported",
+            evidence="Context confirms 1789",
+            confidence=0.99,
+        )
+
+        verify_result = verify_manager.finalize(verify_id)
+        assert verify_result["verified"] is True
 
 
-class TestConcurrency:
-    """Test concurrent request handling."""
+class TestSessionIsolation:
+    """Tests for session isolation between managers."""
 
-    @pytest.mark.asyncio
-    async def test_multiple_concurrent_requests(self) -> None:
-        """Test handling multiple concurrent requests."""
-        import asyncio
+    def test_sessions_are_isolated(self) -> None:
+        """Test that sessions don't leak between manager instances."""
+        from src.tools.long_chain import LongChainManager
 
-        async def mock_request(request_id: int) -> dict:
-            """Simulate a tool request."""
-            await asyncio.sleep(0.01)  # Simulate processing
-            return {"id": request_id, "status": "success"}
+        manager1 = LongChainManager()
+        manager2 = LongChainManager()
 
-        # Run 10 concurrent requests
-        tasks = [mock_request(i) for i in range(10)]
-        results = await asyncio.gather(*tasks)
+        # Create session in manager1
+        start1 = manager1.start_chain(problem="Problem 1", expected_steps=5)
+        session_id = start1["session_id"]
 
-        assert len(results) == 10
-        assert all(r["status"] == "success" for r in results)
+        # Session should exist in manager1
+        state1 = manager1.get_chain(session_id)
+        assert state1["problem"] == "Problem 1"
+
+        # But not in manager2 (fresh instance)
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager2.get_chain(session_id)
+
+    def test_multiple_sessions_same_manager(self) -> None:
+        """Test multiple sessions in the same manager are independent."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
+
+        manager = MatrixOfThoughtManager()
+
+        # Create two sessions
+        start1 = manager.start_matrix(question="Question 1?", rows=2, cols=2)
+        start2 = manager.start_matrix(question="Question 2?", rows=3, cols=3)
+
+        # Modify first session
+        manager.set_cell(start1["session_id"], 0, 0, thought="Session 1 content")
+
+        # Second session should be unaffected
+        state2 = manager.get_matrix(start2["session_id"])
+        assert state2["cells_filled"] == 0

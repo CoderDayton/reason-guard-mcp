@@ -6,37 +6,57 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![FastMCP 2.0](https://img.shields.io/badge/FastMCP-2.0-green.svg)](https://gofastmcp.com)
 
-**Advanced Chain-of-Thought reasoning tools for LLMs.** Matrix-of-Thought, long-chain reasoning, semantic compression, and fact verification—all via MCP.
+**Advanced reasoning state management for LLMs.** Like `sequential-thinking` but with Matrix-of-Thought, long-chain reasoning, semantic compression, and fact verification—all via MCP.
 
-## Why MatrixMind?
+## Architecture
 
-| Tool                           | What it does                                  | Benchmark                                |
-| ------------------------------ | --------------------------------------------- | ---------------------------------------- |
-| `compress_prompt`              | Semantic compression for long documents       | **10.9× faster** than token-level        |
-| `matrix_of_thought_reasoning`  | Multi-perspective reasoning (breadth × depth) | **+4.2% F1**, 7× faster than RATT        |
-| `long_chain_of_thought`        | Step-by-step reasoning with verification      | Exponential advantage on serial problems |
-| `verify_fact_consistency`      | Claim-level fact checking                     | Prevents hallucinations                  |
-| `recommend_reasoning_strategy` | Auto-select optimal approach                  | Saves token budget                       |
+MatrixMind tools are **state managers**, not LLM wrappers. The calling LLM does all reasoning; tools track and organize the process:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Your LLM (Claude, GPT, etc.)             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    Reasoning Process                     │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                              │                                  │
+│                              ▼                                  │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              MatrixMind MCP (State Managers)             │   │
+│  │  • chain_start → chain_add_step → chain_finalize        │   │
+│  │  • matrix_start → matrix_set_cell → matrix_finalize     │   │
+│  │  • verify_start → verify_add_claim → verify_finalize    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+## Tools
+
+| Tool Family | Purpose | API |
+|-------------|---------|-----|
+| **Chain Reasoning** | Step-by-step reasoning with branching/revision | `chain_start` → `chain_add_step` → `chain_finalize` |
+| **Matrix of Thought** | Multi-perspective reasoning grid | `matrix_start` → `matrix_set_cell` → `matrix_synthesize` → `matrix_finalize` |
+| **Verification** | Claim-level fact checking | `verify_start` → `verify_add_claim` → `verify_claim` → `verify_finalize` |
+| **Compression** | Semantic context compression | `compress_prompt` (stateless) |
+| **Strategy** | Auto-select optimal approach | `recommend_reasoning_strategy` (stateless) |
 
 ## IDE Integration
 
 <details open>
 <summary><strong>VS Code</strong></summary>
-Add to your workspace or user settings (`.vscode/settings.json`):
+
+Add to `.vscode/settings.json`:
 
 ```json
 {
   "servers": {
     "matrixmind": {
       "command": "uvx",
-      "args": ["matrixmind-mcp"],
-      "env": {
-        "OPENAI_API_KEY": "sk-your-key"
-      }
+      "args": ["matrixmind-mcp"]
     }
   }
 }
 ```
+</details>
 
 <details>
 <summary><strong>Claude Desktop</strong></summary>
@@ -48,217 +68,248 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux/Mac) or `%APPDATA%\C
   "mcpServers": {
     "matrixmind": {
       "command": "uvx",
-      "args": ["matrixmind-mcp"],
-      "env": {
-        "OPENAI_API_KEY": "sk-your-key"
-      }
+      "args": ["matrixmind-mcp"]
     }
   }
 }
 ```
-
 </details>
 
 <details>
 <summary><strong>Cursor</strong></summary>
 
-Add to `.cursor/mcp.json` in your project or `~/.cursor/mcp.json` globally:
+Add to `.cursor/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "matrixmind": {
       "command": "uvx",
-      "args": ["matrixmind-mcp"],
-      "env": {
-        "OPENAI_API_KEY": "sk-your-key"
-      }
+      "args": ["matrixmind-mcp"]
     }
   }
 }
 ```
-
 </details>
 
 <details>
-<summary><strong>Continue</strong></summary>
-
-Add to your Continue config (`~/.continue/config.json`):
-
-```json
-{
-  "experimental": {
-    "modelContextProtocolServers": [
-      {
-        "transport": {
-          "type": "stdio",
-          "command": "uvx",
-          "args": ["matrixmind-mcp"]
-        }
-      }
-    ]
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Other MCP Clients (HTTP mode)</strong></summary>
+<summary><strong>HTTP Mode</strong></summary>
 
 ```bash
-export OPENAI_API_KEY=sk-your-key
 export SERVER_TRANSPORT=http
 export SERVER_PORT=8000
 uvx matrixmind-mcp
 # Connect to http://localhost:8000
 ```
+</details>
+
+## Usage Examples
+
+### Long Chain Reasoning
+
+For step-by-step problems requiring sequential logic:
+
+```python
+# 1. Start a chain
+chain_start(problem="Make 24 using 3, 4, 5, 6", expected_steps=10)
+# Returns: { "session_id": "abc123", "status": "started", ... }
+
+# 2. Add reasoning steps (LLM provides the reasoning)
+chain_add_step(session_id="abc123", thought="I can try (6-3) × (5+4) = 3 × 9 = 27. Too high.")
+chain_add_step(session_id="abc123", thought="Let me try 6 × (5 - 3 + 4) = 6 × 6 = 36. Too high.")
+chain_add_step(session_id="abc123", thought="Try (6 - 4) × (5 + 3) = 2 × 8 = 16. Too low.")
+chain_add_step(session_id="abc123", thought="Try (5 - 3) × 6 + 4 = 2 × 6 + 4 = 16. Still wrong.")
+chain_add_step(session_id="abc123", thought="Try (3 + 5) × (6 - 4) = 8 × 2 = 16. Not 24.")
+chain_add_step(session_id="abc123", thought="Try 6 / (1 - 3/4)... wait, I don't have 1.")
+chain_add_step(session_id="abc123", thought="(6 × 4) × (5 - 3) / 4 = 24 × 2 / 4 = 12. Hmm.")
+chain_add_step(session_id="abc123", thought="(5 × 3 - 6) × 4 = (15 - 6) × 4 = 9 × 4 = 36.")
+chain_add_step(session_id="abc123", thought="(6 - 5 + 3) × 4 = 4 × 4 = 16.")
+chain_add_step(session_id="abc123", thought="6 × 4 = 24, and 5 - 3 = 2. So 6 × 4 × (5-3)/2 = 24!")
+
+# 3. Finalize with answer
+chain_finalize(session_id="abc123", answer="6 × 4 × (5-3) / 2 = 24", confidence=0.95)
+```
+
+### Matrix of Thought
+
+For problems benefiting from multiple perspectives:
+
+```python
+# 1. Start matrix (3 perspectives × 2 criteria)
+matrix_start(
+    question="Should we migrate to microservices?",
+    rows=3, cols=2,
+    strategies=["technical", "business", "operational"]
+)
+
+# 2. Fill cells with analysis
+matrix_set_cell(session_id="xyz", row=0, col=0, thought="Technical pros: scalability, independent deployments")
+matrix_set_cell(session_id="xyz", row=0, col=1, thought="Technical cons: distributed complexity, debugging")
+matrix_set_cell(session_id="xyz", row=1, col=0, thought="Business pros: faster feature delivery")
+matrix_set_cell(session_id="xyz", row=1, col=1, thought="Business cons: higher initial cost")
+# ... fill remaining cells
+
+# 3. Synthesize columns
+matrix_synthesize(session_id="xyz", col=0, synthesis="Pros outweigh cons for our scale")
+
+# 4. Finalize
+matrix_finalize(session_id="xyz", answer="Yes, migrate with phased approach", confidence=0.8)
+```
+
+### Fact Verification
+
+For checking claims against context:
+
+```python
+# 1. Start verification
+verify_start(
+    answer="Einstein published special relativity in 1905.",
+    context="Albert Einstein published his theory of special relativity in 1905..."
+)
+
+# 2. Add claims to verify
+verify_add_claim(session_id="v123", content="Einstein published special relativity in 1905")
+
+# 3. Verify each claim
+verify_claim(session_id="v123", claim_id=0, status="supported",
+             evidence="Context confirms 1905 publication", confidence=0.98)
+
+# 4. Get verification result
+verify_finalize(session_id="v123")
+# Returns: { "verified": true, "summary": { "supported": 1, "contradicted": 0 } }
+```
+
+## Tool Reference
+
+<details>
+<summary><strong>Chain Tools</strong></summary>
+
+### `chain_start`
+Initialize a reasoning chain.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `problem` | string | Problem statement |
+| `expected_steps` | int | Expected number of steps |
+| `metadata` | object | Optional metadata |
+
+### `chain_add_step`
+Add a reasoning step.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Session from chain_start |
+| `thought` | string | Reasoning content |
+| `branch_from` | int | Optional: branch from step N |
+| `revises` | int | Optional: revise step N |
+
+### `chain_get`
+Get current chain state.
+
+### `chain_finalize`
+Complete the chain with final answer.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Session ID |
+| `answer` | string | Final answer |
+| `confidence` | float | 0.0-1.0 confidence |
 
 </details>
 
-## Using Different LLM Providers
+<details>
+<summary><strong>Matrix Tools</strong></summary>
 
-Works with any OpenAI-compatible API:
+### `matrix_start`
+Initialize a reasoning matrix.
 
-```bash
-# OpenAI (default)
-export OPENAI_API_KEY=sk-your-key
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `question` | string | Question to analyze |
+| `rows` | int | Number of perspectives |
+| `cols` | int | Number of criteria |
+| `strategies` | list | Optional: named strategies |
 
-# Ollama (local)
-export OPENAI_BASE_URL=http://localhost:11434/v1
-export OPENAI_MODEL=llama3.3
+### `matrix_set_cell`
+Fill a matrix cell.
 
-# Azure OpenAI
-export OPENAI_BASE_URL=https://your-resource.openai.azure.com/openai/deployments/your-deployment
-export OPENAI_API_KEY=your-azure-key
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Session ID |
+| `row` | int | Row index |
+| `col` | int | Column index |
+| `thought` | string | Analysis content |
 
-# OpenRouter
-export OPENAI_BASE_URL=https://openrouter.ai/api/v1
-export OPENAI_API_KEY=your-openrouter-key
-export OPENAI_MODEL=anthropic/claude-sonnet-4
-```
+### `matrix_synthesize`
+Synthesize a column.
 
-## Workflow
+### `matrix_finalize`
+Complete with final answer.
 
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│ compress_prompt │ ──► │ matrix_of_thought │ ──► │ verify_fact_    │
-│ (if >3K tokens) │     │ OR long_chain    │     │ consistency     │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-```
-
-1. **Compress** long documents first (if >3000 tokens)
-2. **Reason** using MoT (multi-hop) or long_chain (serial problems)
-3. **Verify** the answer against context
+</details>
 
 <details>
-<summary><strong>Full Tool Reference</strong></summary>
+<summary><strong>Verify Tools</strong></summary>
+
+### `verify_start`
+Initialize verification session.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `answer` | string | Answer to verify |
+| `context` | string | Context to verify against |
+
+### `verify_add_claim`
+Add a claim to verify.
+
+### `verify_claim`
+Verify a specific claim.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | string | Session ID |
+| `claim_id` | int | Claim index |
+| `status` | string | "supported" or "contradicted" |
+| `evidence` | string | Evidence for verdict |
+| `confidence` | float | 0.0-1.0 confidence |
+
+### `verify_finalize`
+Get verification summary.
+
+</details>
+
+<details>
+<summary><strong>Stateless Tools</strong></summary>
 
 ### `compress_prompt`
+Compress context using semantic filtering.
 
-Compress long context using semantic sentence-level filtering.
-
-```python
-{
-    "context": "Long document text...",
-    "question": "What is the main topic?",
-    "compression_ratio": 0.3  # Keep 30% = 3× compression
-}
-```
-
-**Returns:** `compressed_context`, `tokens_saved`, `compression_ratio`
-
-### `matrix_of_thought_reasoning`
-
-Multi-dimensional reasoning combining breadth (strategies) and depth (refinement).
-
-```python
-{
-    "question": "Who invented the telephone and why?",
-    "context": "Historical context about inventors...",
-    "matrix_rows": 3,           # 3 different strategies
-    "matrix_cols": 4,           # 4 refinement iterations
-    "use_knowledge_graph": true # Extract entities/relations for multi-hop reasoning
-}
-```
-
-**Returns:** `answer`, `confidence`, `reasoning_steps`, `matrix_shape`, `knowledge_graph_stats`
-
-### `long_chain_of_thought`
-
-Sequential step-by-step reasoning with verification checkpoints.
-
-```python
-{
-    "problem": "Make 24 using the numbers 3, 4, 5, 6",
-    "num_steps": 15,
-    "verify_intermediate": true,
-    "verification_frequency": 2,  # Verify every N steps (default: 3)
-    "star_iterations": 3          # STaR self-improvement iterations (0=disabled, 1-5 recommended)
-}
-```
-
-**Returns:** `answer`, `confidence`, `reasoning_steps`, `verification_results`, `star_iterations_used`, `star_best_score`
-
-### `verify_fact_consistency`
-
-Verify answer claims against knowledge base/context.
-
-```python
-{
-    "answer": "Einstein published relativity in 1905 and 1915.",
-    "context": "Historical physics context...",
-    "max_claims": 10
-}
-```
-
-**Returns:** `verified`, `confidence`, `claims_verified`, `claims_total`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `context` | string | Text to compress |
+| `question` | string | Question for relevance |
+| `compression_ratio` | float | Target ratio (0.3 = 3× compression) |
 
 ### `recommend_reasoning_strategy`
+Get recommendation for optimal approach.
 
-Get recommendation for optimal reasoning approach.
-
-```python
-{
-    "problem": "Find the path from A to D in this graph",
-    "token_budget": 4000
-}
-```
-
-**Returns:** `recommended_strategy`, `estimated_depth_steps`, `explanation`
-
-### `check_status`
-
-Get server health and configuration status.
-
-```python
-{}  # No parameters required
-```
-
-**Returns:** `model_loaded`, `gpu_memory`, `disk_space`, `llm_config`
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `problem` | string | Problem description |
+| `token_budget` | int | Available token budget |
 
 </details>
 
 ## Configuration
 
-<details>
-<summary><strong>Environment Variables</strong></summary>
-
-| Variable              | Description               | Default                               |
-| --------------------- | ------------------------- | ------------------------------------- |
-| `OPENAI_API_KEY`      | OpenAI API key            | **Required**                          |
-| `OPENAI_BASE_URL`     | Custom API endpoint       | OpenAI default                        |
-| `OPENAI_MODEL`        | Model to use              | `gpt-4.1`                             |
-| `EMBEDDING_MODEL`     | Sentence embedding model  | `Snowflake/snowflake-arctic-embed-xs` |
-| `EMBEDDING_CACHE_DIR` | Model cache directory     | `~/.cache/matrixmind-mcp/models/`     |
-| `LLM_TIMEOUT`         | Request timeout (seconds) | `60`                                  |
-| `LLM_MAX_RETRIES`     | Max retry attempts        | `3`                                   |
-| `SERVER_TRANSPORT`    | `stdio`, `http`, or `sse` | `stdio`                               |
-| `SERVER_HOST`         | Host for http/sse         | `localhost`                           |
-| `SERVER_PORT`         | Port for http/sse         | `8000`                                |
-| `LOG_LEVEL`           | Logging level             | `INFO`                                |
-
-</details>
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `EMBEDDING_MODEL` | Sentence embedding model | `Snowflake/snowflake-arctic-embed-xs` |
+| `EMBEDDING_CACHE_DIR` | Model cache directory | `~/.cache/matrixmind-mcp/models/` |
+| `SERVER_TRANSPORT` | `stdio`, `http`, or `sse` | `stdio` |
+| `SERVER_HOST` | Host for http/sse | `localhost` |
+| `SERVER_PORT` | Port for http/sse | `8000` |
+| `LOG_LEVEL` | Logging level | `INFO` |
 
 ## Development
 
@@ -271,10 +322,8 @@ uv sync --dev
 # Run tests
 make test          # All tests
 make test-smoke    # Quick validation
-make test-e2e      # End-to-end MCP tests
 
 # Run locally
-cp .env.example .env  # Add your API key
 python -m src.server
 ```
 
@@ -283,62 +332,11 @@ python -m src.server
 
 ```bash
 docker build -t matrixmind-mcp .
-docker run -e OPENAI_API_KEY=$OPENAI_API_KEY -p 8000:8000 matrixmind-mcp
+docker run -p 8000:8000 matrixmind-mcp
 
 # Or with docker-compose
 docker compose up -d
 ```
-
-</details>
-
-<details>
-<summary><strong>FastMCP Cloud</strong></summary>
-
-```bash
-fastmcp deploy src/server.py --name matrixmind-mcp --public
-```
-
-</details>
-
-## Performance
-
-| Metric              | Target           | Actual      |
-| ------------------- | ---------------- | ----------- |
-| Compression speed   | <0.5s/10K tokens | **0.28s**   |
-| MoT reasoning (3×4) | <5 min           | **3.2 min** |
-| Long chain per step | <30s             | **15-20s**  |
-| Verification        | <2s/10 claims    | **1.8s**    |
-| Quality (F1)        | +4% vs baseline  | **+4.2%**   |
-| Token reduction     | 30%              | **24-48%**  |
-
-<details>
-<summary><strong>Troubleshooting</strong></summary>
-
-### "OpenAI API key not found"
-
-```bash
-export OPENAI_API_KEY=sk-your-key-here
-```
-
-### "CUDA out of memory"
-
-```bash
-# Use a smaller embedding model (~80MB)
-export EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-```
-
-### "Tool takes too long"
-
-```bash
-export LLM_TIMEOUT=300  # 5 minutes
-```
-
-### "Import errors"
-
-```bash
-uv sync --dev --force-reinstall
-```
-
 </details>
 
 ## Research

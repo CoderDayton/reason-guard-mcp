@@ -1,1222 +1,524 @@
-"""Long Chain-of-Thought reasoning tool.
+"""Long Chain-of-Thought state manager.
 
-Implements deep sequential reasoning with optional intermediate verification
-and STaR (Self-Taught Reasoner) iterations for improved accuracy.
+Implements a state management tool for tracking sequential reasoning chains.
+The calling LLM does all reasoning; this tool tracks steps, validates structure,
+supports branching/revision, and provides heuristic consistency checks.
 
-Based on paper 2505.21825 - achieves exponential advantage over parallel
-methods for serial problems requiring deep sequential dependencies.
+Based on: "The Surprising Effectiveness of Sequential Thinking" (arXiv:2505.21825)
+
+Architecture:
+    - Tool receives reasoning steps FROM the calling LLM
+    - Tracks chain state, branches, revisions
+    - Provides heuristic verification (no internal LLM)
+    - Returns state for next iteration
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import TYPE_CHECKING, Any
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
 from loguru import logger
 
-from src.utils.errors import ReasoningException
-from src.utils.retry import retry_with_backoff
-from src.utils.schema import ReasoningResult
 
-if TYPE_CHECKING:
-    from src.models.llm_client import LLMClientProtocol
+class ChainStatus(Enum):
+    """Status of a reasoning chain."""
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
 
 
-class LongChainOfThoughtTool:
-    """Long-chain sequential reasoning with verification checkpoints.
+class StepType(Enum):
+    """Type of reasoning step."""
 
-    Implements deep reasoning where each step builds fundamentally
-    on previous steps. Includes optional intermediate verification
-    to catch errors early.
+    INITIAL = "initial"
+    CONTINUATION = "continuation"
+    REVISION = "revision"
+    BRANCH = "branch"
+    SYNTHESIS = "synthesis"
+    FINAL = "final"
 
-    Supports STaR (Self-Taught Reasoner) iterations which generate
-    multiple reasoning chains with varying temperatures and select
-    the best one based on verification scores.
 
-    Best for:
-    - Graph connectivity problems
-    - Constraint satisfaction
-    - Arithmetic with dependencies
-    - Proof verification
+@dataclass
+class ReasoningStep:
+    """A single step in the reasoning chain."""
 
-    Attributes:
-        llm: LLM client for generating reasoning steps.
+    step_number: int
+    content: str
+    step_type: StepType = StepType.CONTINUATION
+    timestamp: datetime = field(default_factory=datetime.now)
+    branch_id: str | None = None
+    revises_step: int | None = None
+    confidence: float | None = None
+    tags: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "step_number": self.step_number,
+            "content": self.content,
+            "step_type": self.step_type.value,
+            "timestamp": self.timestamp.isoformat(),
+            "branch_id": self.branch_id,
+            "revises_step": self.revises_step,
+            "confidence": self.confidence,
+            "tags": self.tags,
+        }
+
+
+@dataclass
+class ChainState:
+    """State of a reasoning chain session."""
+
+    session_id: str
+    problem: str
+    steps: list[ReasoningStep] = field(default_factory=list)
+    branches: dict[str, list[ReasoningStep]] = field(default_factory=dict)
+    status: ChainStatus = ChainStatus.ACTIVE
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    expected_steps: int = 10
+    final_answer: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "session_id": self.session_id,
+            "problem": self.problem,
+            "steps": [s.to_dict() for s in self.steps],
+            "branches": {bid: [s.to_dict() for s in steps] for bid, steps in self.branches.items()},
+            "status": self.status.value,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "expected_steps": self.expected_steps,
+            "final_answer": self.final_answer,
+            "current_step": len(self.steps),
+            "progress": len(self.steps) / max(self.expected_steps, 1),
+        }
+
+
+class LongChainManager:
+    """Manages long chain-of-thought reasoning sessions.
+
+    This is a STATE MANAGER, not a reasoner. The calling LLM provides
+    reasoning content; this tool tracks and organizes the chain.
+
+    Example usage flow:
+        1. Agent calls: start_chain(problem="...")
+        2. Agent reasons, then calls: add_step(thought="Step 1: ...")
+        3. Agent continues: add_step(thought="Step 2: ...")
+        4. Agent can branch: add_step(thought="Alternative...", branch_from=2)
+        5. Agent can revise: add_step(thought="Actually...", revises=3)
+        6. Agent finalizes: finalize(answer="The answer is...")
 
     """
 
-    def __init__(self, llm_client: LLMClientProtocol) -> None:
-        """Initialize long chain tool.
+    def __init__(self) -> None:
+        """Initialize the chain manager."""
+        self._sessions: dict[str, ChainState] = {}
 
-        Args:
-            llm_client: LLM client for text generation.
-
-        """
-        self.llm = llm_client
-
-    @retry_with_backoff(max_attempts=2, base_delay=1.0)
-    def reason(
+    def start_chain(
         self,
         problem: str,
-        num_steps: int = 15,
-        verify_intermediate: bool = True,
-        verification_frequency: int = 3,
-        star_iterations: int = 0,
-    ) -> ReasoningResult:
-        """Execute long-chain sequential reasoning.
-
-        Algorithm:
-        1. Initialize reasoning chain with problem
-        2. For each step:
-           a. Generate next reasoning step based on previous
-           b. Optionally verify step consistency
-           c. If verification fails, flag but continue
-        3. Extract final answer from chain
-
-        If star_iterations > 0 (STaR mode):
-        1. Generate multiple reasoning chains with varying temperatures
-        2. Score each chain based on verification ratio + final answer validity
-        3. Return the best-scoring chain
-        4. Early exit if a fully verified chain is found
+        expected_steps: int = 10,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a new reasoning chain.
 
         Args:
-            problem: Problem statement to solve.
-            num_steps: Number of reasoning steps (1-50).
-            verify_intermediate: Whether to verify steps periodically.
-            verification_frequency: Verify every N steps.
-            star_iterations: Number of STaR iterations (0=disabled, 1-5 recommended).
-                            Higher values increase accuracy but also latency.
+            problem: The problem to reason about.
+            expected_steps: Expected number of reasoning steps.
+            metadata: Optional metadata (context, constraints, etc.)
 
         Returns:
-            ReasoningResult with answer, steps, and verification info.
-
-        Raises:
-            ReasoningException: If reasoning fails due to invalid parameters
-                               or LLM errors.
-
-        Example:
-            >>> tool = LongChainOfThoughtTool(llm_client)
-            >>> result = tool.reason(
-            ...     problem="Make 24 from 3, 4, 5, 6",
-            ...     num_steps=10,
-            ...     verify_intermediate=True,
-            ...     star_iterations=3  # Run up to 3 iterations
-            ... )
-            >>> print(result.answer)
-            >>> print(result.reasoning_trace["star_iterations_used"])
+            Session info with ID and initial state.
 
         """
-        # Validate inputs
-        if not problem or not problem.strip():
-            raise ReasoningException("Problem cannot be empty")
-
-        if not 1 <= num_steps <= 50:
-            raise ReasoningException(f"num_steps must be 1-50, got {num_steps}")
-
-        if not 0 <= star_iterations <= 10:
-            raise ReasoningException(f"star_iterations must be 0-10, got {star_iterations}")
-
-        try:
-            # STaR mode: run multiple iterations and select best
-            if star_iterations > 0:
-                return self._run_star_iterations(
-                    problem=problem,
-                    num_steps=num_steps,
-                    verify_intermediate=verify_intermediate,
-                    verification_frequency=verification_frequency,
-                    star_iterations=star_iterations,
-                )
-
-            # Standard single-chain mode
-            return self._run_single_chain(
-                problem=problem,
-                num_steps=num_steps,
-                verify_intermediate=verify_intermediate,
-                verification_frequency=verification_frequency,
-                temperature=0.5,
-            )
-
-        except ReasoningException:
-            raise
-        except Exception as e:
-            logger.error(f"Long chain reasoning failed: {e}")
-            raise ReasoningException(f"Long chain reasoning failed: {e!s}") from e
-
-    def _run_single_chain(
-        self,
-        problem: str,
-        num_steps: int,
-        verify_intermediate: bool,
-        verification_frequency: int,
-        temperature: float = 0.5,
-    ) -> ReasoningResult:
-        """Run a single reasoning chain.
-
-        Args:
-            problem: Problem statement.
-            num_steps: Number of reasoning steps.
-            verify_intermediate: Whether to verify steps.
-            verification_frequency: Verify every N steps.
-            temperature: LLM temperature for generation.
-
-        Returns:
-            ReasoningResult from this chain.
-
-        """
-        reasoning_chain: list[str] = []
-        verifications: list[dict[str, Any]] = []
-        verification_passed = 0
-        verification_total = 0
-
-        # Generate reasoning steps
-        for step_num in range(1, num_steps + 1):
-            recent_context = self._build_recent_context(reasoning_chain, max_steps=5)
-
-            next_step = self._generate_step(
-                problem=problem,
-                step_num=step_num,
-                total_steps=num_steps,
-                recent_context=recent_context,
-                temperature=temperature,
-            )
-
-            if not next_step:
-                logger.warning(f"Step {step_num} generation failed, stopping chain")
-                break
-
-            reasoning_chain.append(next_step)
-
-            # Periodic verification
-            if verify_intermediate and step_num % verification_frequency == 0:
-                verification = self._verify_step(
-                    problem=problem,
-                    chain=reasoning_chain,
-                    step_num=step_num,
-                )
-                verifications.append(verification)
-                verification_total += 1
-
-                if verification.get("is_valid", False):
-                    verification_passed += 1
-                else:
-                    reason = verification.get("reason", "unknown")
-                    logger.debug(f"Step {step_num} verification failed: {reason}")
-
-        # Extract final answer
-        final_answer = self._extract_answer(problem, reasoning_chain)
-
-        # Calculate confidence
-        if verification_total > 0:
-            verification_ratio = verification_passed / verification_total
-            confidence = 0.5 + 0.4 * verification_ratio
-        else:
-            confidence = 0.7
-
-        return ReasoningResult(
-            answer=final_answer,
-            confidence=confidence,
-            reasoning_steps=reasoning_chain,
-            verification_results={
-                "total_verifications": verification_total,
-                "passed": verification_passed,
-                "failed": verification_total - verification_passed,
-                "details": verifications[-3:] if verifications else [],
-            },
-            tokens_used=self.llm.estimate_tokens("\n".join(reasoning_chain)),
-            reasoning_trace={
-                "total_steps": len(reasoning_chain),
-                "requested_steps": num_steps,
-                "verify_enabled": verify_intermediate,
-                "temperature": temperature,
-            },
-        )
-
-    def _run_star_iterations(
-        self,
-        problem: str,
-        num_steps: int,
-        verify_intermediate: bool,
-        verification_frequency: int,
-        star_iterations: int,
-    ) -> ReasoningResult:
-        """Run STaR iterations to find best reasoning chain.
-
-        Generates multiple reasoning chains with varying temperatures,
-        scores each based on verification results and final answer validity,
-        and returns the best one.
-
-        Args:
-            problem: Problem statement.
-            num_steps: Number of reasoning steps.
-            verify_intermediate: Whether to verify steps.
-            verification_frequency: Verify every N steps.
-            star_iterations: Number of iterations to run.
-
-        Returns:
-            Best ReasoningResult from all iterations.
-
-        """
-        best_result: ReasoningResult | None = None
-        best_score = -1.0
-        iterations_used = 0
-
-        for iteration in range(star_iterations):
-            iterations_used = iteration + 1
-
-            # Vary temperature to explore different reasoning paths
-            # Range: 0.4 to 0.8 across iterations
-            temp = 0.4 + (iteration * 0.4 / max(star_iterations - 1, 1))
-
-            logger.debug(f"STaR iteration {iterations_used}/{star_iterations}, temp={temp:.2f}")
-
-            result = self._run_single_chain(
-                problem=problem,
-                num_steps=num_steps,
-                verify_intermediate=verify_intermediate,
-                verification_frequency=verification_frequency,
-                temperature=temp,
-            )
-
-            # Score the chain
-            score = self._score_chain(problem, result, verify_intermediate)
-
-            logger.debug(f"STaR iteration {iterations_used} score: {score:.3f}")
-
-            if score > best_score:
-                best_score = score
-                best_result = result
-
-            # Early exit if we got a high-confidence result
-            if score >= 1.4:  # Verification passed + answer valid
-                logger.debug(f"STaR early exit at iteration {iterations_used} (score={score:.3f})")
-                break
-
-        if best_result is None:
-            raise ReasoningException("STaR iterations produced no valid result")
-
-        # Add STaR metadata to reasoning trace
-        trace = dict(best_result.reasoning_trace) if best_result.reasoning_trace else {}
-        trace["star_enabled"] = True
-        trace["star_iterations_requested"] = star_iterations
-        trace["star_iterations_used"] = iterations_used
-        trace["star_best_score"] = round(best_score, 3)
-
-        return ReasoningResult(
-            answer=best_result.answer,
-            confidence=best_result.confidence,
-            reasoning_steps=best_result.reasoning_steps,
-            verification_results=best_result.verification_results,
-            tokens_used=best_result.tokens_used,
-            reasoning_trace=trace,
-        )
-
-    def _score_chain(
-        self,
-        problem: str,
-        result: ReasoningResult,
-        verify_intermediate: bool,
-    ) -> float:
-        """Score a reasoning chain for STaR selection.
-
-        Score components:
-        - Verification ratio (0-1): How many intermediate steps passed
-        - Answer validity (0-0.5): Self-verification of final answer
-
-        Args:
-            problem: Original problem.
-            result: ReasoningResult to score.
-            verify_intermediate: Whether verification was enabled.
-
-        Returns:
-            Score between 0 and ~1.5.
-
-        """
-        score = 0.0
-
-        # Component 1: Verification ratio
-        if verify_intermediate and result.verification_results:
-            vr = result.verification_results
-            total = vr.get("total_verifications", 0)
-            if total > 0:
-                passed = vr.get("passed", 0)
-                score += passed / total
-
-        # Component 2: Final answer self-verification
-        answer_valid = self._verify_final_answer(problem, result)
-        if answer_valid:
-            score += 0.5
-
-        return score
-
-    def _verify_final_answer(self, problem: str, result: ReasoningResult) -> bool:
-        """Self-verify that the final answer is correct and consistent.
-
-        Args:
-            problem: Original problem.
-            result: ReasoningResult containing answer and reasoning.
-
-        Returns:
-            True if answer appears valid, False otherwise.
-
-        """
-        if not result.answer or result.answer == "Unable to generate answer":
-            return False
-
-        try:
-            # Build reasoning summary from last steps
-            last_steps = result.reasoning_steps[-3:] if result.reasoning_steps else []
-            reasoning_summary = " → ".join(s[:80] + "..." if len(s) > 80 else s for s in last_steps)
-
-            prompt = f"""Problem: {problem}
-
-Proposed answer: {result.answer}
-
-Reasoning path: {reasoning_summary}
-
-Is this answer CORRECT and CONSISTENT with the reasoning shown?
-Answer YES if the answer logically follows from the reasoning.
-Answer NO if there are errors or inconsistencies.
-
-Your verdict (YES/NO):"""
-
-            response = self.llm.generate(prompt, max_tokens=50, temperature=0.2)
-            is_valid = response.strip().upper().startswith("YES")
-
-            logger.debug(f"Final answer verification: {is_valid}")
-            return is_valid
-
-        except Exception as e:
-            logger.warning(f"Final answer verification failed: {e}")
-            return False  # Fail closed for scoring
-
-    async def reason_async(
-        self,
-        problem: str,
-        num_steps: int = 15,
-        verify_intermediate: bool = True,
-        verification_frequency: int = 3,
-        star_iterations: int = 0,
-    ) -> ReasoningResult:
-        """Execute long-chain sequential reasoning with async verification.
-
-        P2 Optimization: Verification is performed as fire-and-forget tasks,
-        allowing step generation to continue without waiting for verification
-        results. Verifications are collected at the end.
-
-        When star_iterations > 0 (STaR mode):
-        - Runs multiple reasoning chains concurrently with varying temperatures
-        - Scores each chain based on verification ratio + final answer validity
-        - Returns the best-scoring chain
-        - Early exit if high-confidence chain found
-
-        Args:
-            problem: Problem statement to solve.
-            num_steps: Number of reasoning steps (1-50).
-            verify_intermediate: Whether to verify steps periodically.
-            verification_frequency: Verify every N steps.
-            star_iterations: Number of STaR iterations (0=disabled, 1-10).
-                            Higher values increase accuracy but also latency.
-
-        Returns:
-            ReasoningResult with answer, steps, and verification info.
-
-        Raises:
-            ReasoningException: If reasoning fails.
-
-        """
-        # Validate inputs
-        if not problem or not problem.strip():
-            raise ReasoningException("Problem cannot be empty")
-
-        if not 1 <= num_steps <= 50:
-            raise ReasoningException(f"num_steps must be 1-50, got {num_steps}")
-
-        if not 0 <= star_iterations <= 10:
-            raise ReasoningException(f"star_iterations must be 0-10, got {star_iterations}")
-
-        try:
-            # STaR mode: run multiple iterations concurrently
-            if star_iterations > 0:
-                return await self._run_star_iterations_async(
-                    problem=problem,
-                    num_steps=num_steps,
-                    verify_intermediate=verify_intermediate,
-                    verification_frequency=verification_frequency,
-                    star_iterations=star_iterations,
-                )
-
-            # Standard single-chain mode
-            return await self._run_single_chain_async(
-                problem=problem,
-                num_steps=num_steps,
-                verify_intermediate=verify_intermediate,
-                verification_frequency=verification_frequency,
-                temperature=0.5,
-            )
-
-        except ReasoningException:
-            raise
-        except Exception as e:
-            logger.error(f"Long chain async reasoning failed: {e}")
-            raise ReasoningException(f"Long chain reasoning failed: {e!s}") from e
-
-    async def _run_star_iterations_async(
-        self,
-        problem: str,
-        num_steps: int,
-        verify_intermediate: bool,
-        verification_frequency: int,
-        star_iterations: int,
-    ) -> ReasoningResult:
-        """Run STaR iterations asynchronously with concurrent chain generation.
-
-        Strategy: Run first iteration to get a baseline, then run remaining
-        iterations concurrently. Uses early-exit signaling via asyncio.Event
-        to cancel pending iterations when a high-confidence result is found,
-        saving compute on expensive LLM calls.
-
-        Early-exit flow:
-        1. First iteration runs alone (baseline)
-        2. If score >= 1.4, return immediately
-        3. Otherwise, spawn remaining iterations concurrently
-        4. As each completes, score it immediately
-        5. If any scores >= 1.4, signal cancellation to others
-        6. Return best result found
-
-        Args:
-            problem: Problem statement.
-            num_steps: Number of reasoning steps.
-            verify_intermediate: Whether to verify steps.
-            verification_frequency: Verify every N steps.
-            star_iterations: Number of iterations to run.
-
-        Returns:
-            Best ReasoningResult from all iterations.
-
-        """
-        # Calculate temperatures for each iteration (0.4 to 0.8)
-        temperatures = [
-            0.4 + (i * 0.4 / max(star_iterations - 1, 1)) for i in range(star_iterations)
-        ]
-
-        # Run first iteration to check for early exit
-        first_result = await self._run_single_chain_async(
+        session_id = str(uuid.uuid4())[:8]
+        state = ChainState(
+            session_id=session_id,
             problem=problem,
-            num_steps=num_steps,
-            verify_intermediate=verify_intermediate,
-            verification_frequency=verification_frequency,
-            temperature=temperatures[0],
+            expected_steps=expected_steps,
+            metadata=metadata or {},
         )
-        first_score = await self._score_chain_async(problem, first_result, verify_intermediate)
+        self._sessions[session_id] = state
 
-        logger.debug(f"STaR async iteration 1/{star_iterations}, score={first_score:.3f}")
+        logger.debug(f"Started chain session {session_id} for problem: {problem[:50]}...")
 
-        # Early exit if first iteration is high-confidence
-        if first_score >= 1.4:
-            logger.debug(f"STaR async early exit at iteration 1 (score={first_score:.3f})")
-            return self._add_star_metadata(first_result, star_iterations, 1, first_score)
+        return {
+            "session_id": session_id,
+            "status": "started",
+            "problem": problem,
+            "expected_steps": expected_steps,
+            "next_step": 1,
+            "instruction": (
+                f"Begin reasoning about this problem. "
+                f"Call add_step with your first reasoning step. "
+                f"Aim for {expected_steps} steps of thorough analysis."
+            ),
+        }
 
-        # If only one iteration requested, return it
-        if star_iterations == 1:
-            return self._add_star_metadata(first_result, star_iterations, 1, first_score)
+    def add_step(
+        self,
+        session_id: str,
+        thought: str,
+        step_type: str = "continuation",
+        branch_from: int | None = None,
+        revises: int | None = None,
+        confidence: float | None = None,
+        tags: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Add a reasoning step to the chain.
 
-        # Early-exit signaling: when one iteration finds high-confidence result,
-        # signal others to stop
-        early_exit_event = asyncio.Event()
-        best_result = first_result
-        best_score = first_score
-        iterations_completed = 1  # First iteration already done
+        Args:
+            session_id: Session to add step to.
+            thought: The reasoning content (from calling LLM).
+            step_type: Type of step (continuation, revision, branch, synthesis).
+            branch_from: If branching, which step to branch from.
+            revises: If revising, which step this revises.
+            confidence: Optional confidence score for this step.
+            tags: Optional tags for categorization.
 
-        # Lock to protect best_result/best_score updates
-        result_lock = asyncio.Lock()
+        Returns:
+            Updated state and guidance for next step.
 
-        async def run_and_score_iteration(idx: int, temp: float) -> None:
-            """Run iteration and score immediately, signaling early exit if high-confidence."""
-            nonlocal best_result, best_score, iterations_completed
+        """
+        state = self._get_session(session_id)
+        if state.status != ChainStatus.ACTIVE:
+            return {
+                "error": f"Session {session_id} is {state.status.value}",
+                "status": state.status.value,
+            }
 
-            # Check if we should abort before starting
-            if early_exit_event.is_set():
-                logger.debug(f"STaR iteration {idx} skipped (early exit signaled)")
-                return
-
+        # Determine step number
+        if branch_from is not None:
+            branch_id = f"branch_{len(state.branches) + 1}"
+            step_num = 1
+            stype = StepType.BRANCH
+        elif revises is not None:
+            step_num = len(state.steps) + 1
+            stype = StepType.REVISION
+            branch_id = None
+        else:
+            step_num = len(state.steps) + 1
             try:
-                # Run the chain with cancellation check
-                result = await self._run_single_chain_with_cancellation(
-                    problem=problem,
-                    num_steps=num_steps,
-                    verify_intermediate=verify_intermediate,
-                    verification_frequency=verification_frequency,
-                    temperature=temp,
-                    cancel_event=early_exit_event,
-                )
+                stype = StepType(step_type)
+            except ValueError:
+                stype = StepType.CONTINUATION
+            branch_id = None
 
-                # If cancelled mid-chain, result is None
-                if result is None:
-                    logger.debug(f"STaR iteration {idx} cancelled mid-chain")
-                    return
+        # Create step
+        step = ReasoningStep(
+            step_number=step_num,
+            content=thought,
+            step_type=stype,
+            branch_id=branch_id,
+            revises_step=revises,
+            confidence=confidence,
+            tags=tags or [],
+        )
 
-                # Score immediately
-                score = await self._score_chain_async(problem, result, verify_intermediate)
-                logger.debug(f"STaR async iteration {idx}/{star_iterations}, score={score:.3f}")
+        # Add to appropriate location
+        if branch_id:
+            state.branches[branch_id] = [step]
+        else:
+            state.steps.append(step)
 
-                # Update best result under lock
-                async with result_lock:
-                    iterations_completed += 1
-                    if score > best_score:
-                        best_score = score
-                        best_result = result
+        state.updated_at = datetime.now()
 
-                    # Signal early exit if we found a high-confidence result
-                    if score >= 1.4 and not early_exit_event.is_set():
-                        logger.debug(
-                            f"STaR early exit signaled at iteration {idx} (score={score:.3f})"
-                        )
-                        early_exit_event.set()
+        # Run heuristic checks
+        issues = self._check_step_consistency(state, step)
 
-            except asyncio.CancelledError:
-                logger.debug(f"STaR iteration {idx} cancelled")
-                raise
-            except Exception as e:
-                logger.warning(f"STaR async iteration {idx} failed: {e}")
+        # Determine next action
+        progress = len(state.steps) / max(state.expected_steps, 1)
+        needs_more = len(state.steps) < state.expected_steps
 
-        # Run remaining iterations concurrently with early-exit support
-        tasks = [
-            asyncio.create_task(run_and_score_iteration(i + 2, temp))
-            for i, temp in enumerate(temperatures[1:])
+        response = {
+            "session_id": session_id,
+            "step_added": step_num,
+            "step_type": stype.value,
+            "total_steps": len(state.steps),
+            "expected_steps": state.expected_steps,
+            "progress": round(progress, 2),
+            "branches": list(state.branches.keys()),
+            "needs_more_steps": needs_more,
+        }
+
+        if issues:
+            response["consistency_warnings"] = issues
+
+        if needs_more:
+            response["instruction"] = (
+                f"Continue reasoning. You're at step {len(state.steps)}/{state.expected_steps}. "
+                f"Add your next reasoning step, or call finalize() if you've reached a conclusion."
+            )
+        else:
+            response["instruction"] = (
+                "You've completed the expected steps. "
+                "Call finalize() with your final answer, or add more steps if needed."
+            )
+
+        logger.debug(f"Added step {step_num} to session {session_id}")
+
+        return response
+
+    def get_chain(self, session_id: str) -> dict[str, Any]:
+        """Get the current state of a reasoning chain.
+
+        Args:
+            session_id: Session to retrieve.
+
+        Returns:
+            Full chain state including all steps.
+
+        """
+        state = self._get_session(session_id)
+        return state.to_dict()
+
+    def finalize(
+        self,
+        session_id: str,
+        answer: str,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Finalize the reasoning chain with an answer.
+
+        Args:
+            session_id: Session to finalize.
+            answer: The final answer.
+            confidence: Optional confidence in the answer.
+
+        Returns:
+            Final chain state with summary.
+
+        """
+        state = self._get_session(session_id)
+
+        # Add final step
+        final_step = ReasoningStep(
+            step_number=len(state.steps) + 1,
+            content=answer,
+            step_type=StepType.FINAL,
+            confidence=confidence,
+        )
+        state.steps.append(final_step)
+        state.final_answer = answer
+        state.status = ChainStatus.COMPLETED
+        state.updated_at = datetime.now()
+
+        # Generate summary
+        summary = self._generate_summary(state)
+
+        logger.info(f"Finalized session {session_id} with {len(state.steps)} steps")
+
+        return {
+            "session_id": session_id,
+            "status": "completed",
+            "total_steps": len(state.steps),
+            "branches_explored": len(state.branches),
+            "final_answer": answer,
+            "confidence": confidence,
+            "summary": summary,
+            "chain": state.to_dict(),
+        }
+
+    def adjust_expected_steps(
+        self,
+        session_id: str,
+        new_expected: int,
+    ) -> dict[str, Any]:
+        """Adjust the expected number of steps.
+
+        Args:
+            session_id: Session to adjust.
+            new_expected: New expected step count.
+
+        Returns:
+            Updated state.
+
+        """
+        state = self._get_session(session_id)
+        old_expected = state.expected_steps
+        state.expected_steps = new_expected
+        state.updated_at = datetime.now()
+
+        return {
+            "session_id": session_id,
+            "old_expected": old_expected,
+            "new_expected": new_expected,
+            "current_steps": len(state.steps),
+            "progress": round(len(state.steps) / max(new_expected, 1), 2),
+        }
+
+    def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
+        """Abandon a reasoning chain.
+
+        Args:
+            session_id: Session to abandon.
+            reason: Optional reason for abandoning.
+
+        Returns:
+            Final state.
+
+        """
+        state = self._get_session(session_id)
+        state.status = ChainStatus.ABANDONED
+        state.metadata["abandon_reason"] = reason
+        state.updated_at = datetime.now()
+
+        return {
+            "session_id": session_id,
+            "status": "abandoned",
+            "reason": reason,
+            "steps_completed": len(state.steps),
+        }
+
+    def list_sessions(self) -> dict[str, Any]:
+        """List all active sessions.
+
+        Returns:
+            List of session summaries.
+
+        """
+        sessions = []
+        for sid, state in self._sessions.items():
+            sessions.append(
+                {
+                    "session_id": sid,
+                    "problem": state.problem[:50] + "..."
+                    if len(state.problem) > 50
+                    else state.problem,
+                    "status": state.status.value,
+                    "steps": len(state.steps),
+                    "expected": state.expected_steps,
+                    "created": state.created_at.isoformat(),
+                }
+            )
+        return {"sessions": sessions, "total": len(sessions)}
+
+    def _get_session(self, session_id: str) -> ChainState:
+        """Get session or raise error."""
+        if session_id not in self._sessions:
+            raise ValueError(f"Session {session_id} not found")
+        return self._sessions[session_id]
+
+    def _check_step_consistency(
+        self,
+        state: ChainState,
+        step: ReasoningStep,
+    ) -> list[str]:
+        """Check step for consistency issues (heuristic, no LLM).
+
+        Args:
+            state: Current chain state.
+            step: New step to check.
+
+        Returns:
+            List of warning messages.
+
+        """
+        issues = []
+        content = step.content.lower()
+
+        # Check for contradiction indicators
+        contradiction_phrases = [
+            "actually, that's wrong",
+            "i was mistaken",
+            "that contradicts",
+            "this is incorrect",
+            "wait, no",
         ]
-
-        # Wait for all tasks (they handle their own cancellation via the event)
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Calculate actual iterations used (completed + 1 for first)
-        iterations_used = iterations_completed
-
-        return self._add_star_metadata(best_result, star_iterations, iterations_used, best_score)
-
-    async def _run_single_chain_with_cancellation(
-        self,
-        problem: str,
-        num_steps: int,
-        verify_intermediate: bool,
-        verification_frequency: int,
-        temperature: float,
-        cancel_event: asyncio.Event,
-    ) -> ReasoningResult | None:
-        """Run a single async reasoning chain with cancellation support.
-
-        Checks the cancel_event between steps. If set, returns None immediately
-        to save compute on remaining steps.
-
-        Args:
-            problem: Problem statement.
-            num_steps: Number of reasoning steps.
-            verify_intermediate: Whether to verify steps.
-            verification_frequency: Verify every N steps.
-            temperature: LLM temperature for generation.
-            cancel_event: Event that signals cancellation when set.
-
-        Returns:
-            ReasoningResult if completed, None if cancelled.
-
-        """
-        reasoning_chain: list[str] = []
-        pending_verifications: list[asyncio.Task[dict[str, Any]]] = []
-
-        # Generate reasoning steps with cancellation checks
-        for step_num in range(1, num_steps + 1):
-            # Check for cancellation between steps
-            if cancel_event.is_set():
-                # Cancel pending verifications
-                for task in pending_verifications:
-                    task.cancel()
-                return None
-
-            recent_context = self._build_recent_context(reasoning_chain, max_steps=5)
-
-            next_step = await self._generate_step_async(
-                problem=problem,
-                step_num=step_num,
-                total_steps=num_steps,
-                recent_context=recent_context,
-                temperature=temperature,
-            )
-
-            if not next_step:
-                logger.warning(f"Step {step_num} generation failed, stopping chain")
+        for phrase in contradiction_phrases:
+            if phrase in content:
+                issues.append(
+                    f"Potential self-contradiction detected: '{phrase}'. "
+                    "Consider using revises parameter to properly track the revision."
+                )
                 break
 
-            reasoning_chain.append(next_step)
+        # Check for very short steps
+        if len(step.content.split()) < 10:
+            issues.append("Step seems brief. Consider adding more detailed reasoning.")
 
-            # Fire-and-forget verification
-            if verify_intermediate and step_num % verification_frequency == 0:
-                task = asyncio.create_task(
-                    self._verify_step_async(
-                        problem=problem,
-                        chain=reasoning_chain.copy(),
-                        step_num=step_num,
+        # Check for repetition with previous step
+        if len(state.steps) > 0:
+            prev_content = state.steps[-1].content.lower()
+            # Simple word overlap check
+            prev_words = set(prev_content.split())
+            curr_words = set(content.split())
+            if len(prev_words) > 5 and len(curr_words) > 5:
+                overlap = len(prev_words & curr_words) / len(prev_words | curr_words)
+                if overlap > 0.7:
+                    issues.append(
+                        "High similarity with previous step. "
+                        "Ensure you're making progress rather than repeating."
                     )
+
+        # Check for conclusion without enough steps
+        conclusion_phrases = ["therefore", "in conclusion", "the answer is", "finally"]
+        if (
+            any(phrase in content for phrase in conclusion_phrases)
+            and len(state.steps) < state.expected_steps * 0.5
+        ):
+            issues.append(
+                f"Conclusion reached at step {len(state.steps)}/{state.expected_steps}. "
+                "Consider more thorough analysis before concluding."
+            )
+
+        # Check for numeric consistency
+        numbers_in_step = re.findall(r"\b\d+(?:\.\d+)?\b", step.content)
+        if len(state.steps) > 0 and numbers_in_step:
+            # Check if numbers appear in previous steps
+            all_prev_numbers = set()
+            for prev_step in state.steps[-3:]:  # Check last 3 steps
+                all_prev_numbers.update(re.findall(r"\b\d+(?:\.\d+)?\b", prev_step.content))
+
+            new_numbers = set(numbers_in_step) - all_prev_numbers
+            if new_numbers and len(new_numbers) > 3:
+                issues.append(
+                    f"Multiple new numbers introduced ({len(new_numbers)}). "
+                    "Verify calculations are building on previous steps."
                 )
-                pending_verifications.append(task)
 
-        # Final cancellation check before expensive answer extraction
-        if cancel_event.is_set():
-            for task in pending_verifications:
-                task.cancel()
-            return None
+        return issues
 
-        # Collect verification results
-        verifications: list[dict[str, Any]] = []
-        verification_passed = 0
-        verification_total = 0
-
-        if pending_verifications:
-            results = await asyncio.gather(*pending_verifications, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Verification task failed: {result}")
-                    verifications.append(
-                        {"step": -1, "is_valid": True, "reason": f"Error: {result}"}
-                    )
-                    verification_total += 1
-                elif isinstance(result, dict):
-                    verifications.append(result)
-                    verification_total += 1
-                    if result.get("is_valid", False):
-                        verification_passed += 1
-
-        # Extract final answer
-        final_answer = await self._extract_answer_async(problem, reasoning_chain)
-
-        # Calculate confidence
-        if verification_total > 0:
-            verification_ratio = verification_passed / verification_total
-            confidence = 0.5 + 0.4 * verification_ratio
-        else:
-            confidence = 0.7
-
-        return ReasoningResult(
-            answer=final_answer,
-            confidence=confidence,
-            reasoning_steps=reasoning_chain,
-            verification_results={
-                "total_verifications": verification_total,
-                "passed": verification_passed,
-                "failed": verification_total - verification_passed,
-                "details": verifications[-3:] if verifications else [],
-            },
-            tokens_used=self.llm.estimate_tokens("\n".join(reasoning_chain)),
-            reasoning_trace={
-                "total_steps": len(reasoning_chain),
-                "requested_steps": num_steps,
-                "verify_enabled": verify_intermediate,
-                "temperature": temperature,
-                "async_verification": True,
-            },
-        )
-
-    def _add_star_metadata(
-        self,
-        result: ReasoningResult,
-        star_iterations_requested: int,
-        star_iterations_used: int,
-        best_score: float,
-    ) -> ReasoningResult:
-        """Add STaR metadata to reasoning trace.
+    def _generate_summary(self, state: ChainState) -> dict[str, Any]:
+        """Generate a summary of the reasoning chain.
 
         Args:
-            result: Base reasoning result.
-            star_iterations_requested: Total iterations requested.
-            star_iterations_used: Iterations actually completed.
-            best_score: Best score achieved.
+            state: Completed chain state.
 
         Returns:
-            New ReasoningResult with STaR metadata.
+            Summary statistics.
 
         """
-        trace = dict(result.reasoning_trace) if result.reasoning_trace else {}
-        trace["star_enabled"] = True
-        trace["star_iterations_requested"] = star_iterations_requested
-        trace["star_iterations_used"] = star_iterations_used
-        trace["star_best_score"] = round(best_score, 3)
-        trace["star_async"] = True
-        # Track if early exit saved compute
-        trace["star_early_exit"] = star_iterations_used < star_iterations_requested
+        step_types: dict[str, int] = {}
+        for step in state.steps:
+            step_types[step.step_type.value] = step_types.get(step.step_type.value, 0) + 1
 
-        return ReasoningResult(
-            answer=result.answer,
-            confidence=result.confidence,
-            reasoning_steps=result.reasoning_steps,
-            verification_results=result.verification_results,
-            tokens_used=result.tokens_used,
-            reasoning_trace=trace,
-        )
+        total_words = sum(len(s.content.split()) for s in state.steps)
 
-    async def _run_single_chain_async(
-        self,
-        problem: str,
-        num_steps: int,
-        verify_intermediate: bool,
-        verification_frequency: int,
-        temperature: float = 0.5,
-    ) -> ReasoningResult:
-        """Run a single async reasoning chain with configurable temperature.
+        return {
+            "total_steps": len(state.steps),
+            "step_types": step_types,
+            "total_words": total_words,
+            "avg_words_per_step": round(total_words / max(len(state.steps), 1), 1),
+            "branches_created": len(state.branches),
+            "revisions_made": step_types.get("revision", 0),
+            "duration_seconds": (state.updated_at - state.created_at).total_seconds(),
+        }
 
-        Args:
-            problem: Problem statement.
-            num_steps: Number of reasoning steps.
-            verify_intermediate: Whether to verify steps.
-            verification_frequency: Verify every N steps.
-            temperature: LLM temperature for generation.
 
-        Returns:
-            ReasoningResult from this chain.
+# Global instance for session persistence across tool calls
+_chain_manager = LongChainManager()
 
-        """
-        reasoning_chain: list[str] = []
-        pending_verifications: list[asyncio.Task[dict[str, Any]]] = []
 
-        # Generate reasoning steps
-        for step_num in range(1, num_steps + 1):
-            recent_context = self._build_recent_context(reasoning_chain, max_steps=5)
-
-            next_step = await self._generate_step_async(
-                problem=problem,
-                step_num=step_num,
-                total_steps=num_steps,
-                recent_context=recent_context,
-                temperature=temperature,
-            )
-
-            if not next_step:
-                logger.warning(f"Step {step_num} generation failed, stopping chain")
-                break
-
-            reasoning_chain.append(next_step)
-
-            # Fire-and-forget verification
-            if verify_intermediate and step_num % verification_frequency == 0:
-                task = asyncio.create_task(
-                    self._verify_step_async(
-                        problem=problem,
-                        chain=reasoning_chain.copy(),
-                        step_num=step_num,
-                    )
-                )
-                pending_verifications.append(task)
-
-        # Collect verification results
-        verifications: list[dict[str, Any]] = []
-        verification_passed = 0
-        verification_total = 0
-
-        if pending_verifications:
-            results = await asyncio.gather(*pending_verifications, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.warning(f"Verification task failed: {result}")
-                    verifications.append(
-                        {"step": -1, "is_valid": True, "reason": f"Error: {result}"}
-                    )
-                    verification_total += 1
-                elif isinstance(result, dict):
-                    verifications.append(result)
-                    verification_total += 1
-                    if result.get("is_valid", False):
-                        verification_passed += 1
-
-        # Extract final answer
-        final_answer = await self._extract_answer_async(problem, reasoning_chain)
-
-        # Calculate confidence
-        if verification_total > 0:
-            verification_ratio = verification_passed / verification_total
-            confidence = 0.5 + 0.4 * verification_ratio
-        else:
-            confidence = 0.7
-
-        return ReasoningResult(
-            answer=final_answer,
-            confidence=confidence,
-            reasoning_steps=reasoning_chain,
-            verification_results={
-                "total_verifications": verification_total,
-                "passed": verification_passed,
-                "failed": verification_total - verification_passed,
-                "details": verifications[-3:] if verifications else [],
-            },
-            tokens_used=self.llm.estimate_tokens("\n".join(reasoning_chain)),
-            reasoning_trace={
-                "total_steps": len(reasoning_chain),
-                "requested_steps": num_steps,
-                "verify_enabled": verify_intermediate,
-                "temperature": temperature,
-                "async_verification": True,
-            },
-        )
-
-    async def _score_chain_async(
-        self,
-        problem: str,
-        result: ReasoningResult,
-        verify_intermediate: bool,
-    ) -> float:
-        """Score a reasoning chain asynchronously for STaR selection.
-
-        Score components:
-        - Verification ratio (0-1): How many intermediate steps passed
-        - Answer validity (0-0.5): Self-verification of final answer
-
-        Args:
-            problem: Original problem.
-            result: ReasoningResult to score.
-            verify_intermediate: Whether verification was enabled.
-
-        Returns:
-            Score between 0 and ~1.5.
-
-        """
-        score = 0.0
-
-        # Component 1: Verification ratio
-        if verify_intermediate and result.verification_results:
-            vr = result.verification_results
-            total = vr.get("total_verifications", 0)
-            if total > 0:
-                passed = vr.get("passed", 0)
-                score += passed / total
-
-        # Component 2: Final answer self-verification (async)
-        answer_valid = await self._verify_final_answer_async(problem, result)
-        if answer_valid:
-            score += 0.5
-
-        return score
-
-    async def _verify_final_answer_async(self, problem: str, result: ReasoningResult) -> bool:
-        """Async self-verification that the final answer is correct and consistent.
-
-        Args:
-            problem: Original problem.
-            result: ReasoningResult containing answer and reasoning.
-
-        Returns:
-            True if answer appears valid, False otherwise.
-
-        """
-        if not result.answer or result.answer == "Unable to generate answer":
-            return False
-
-        try:
-            last_steps = result.reasoning_steps[-3:] if result.reasoning_steps else []
-            reasoning_summary = " → ".join(s[:80] + "..." if len(s) > 80 else s for s in last_steps)
-
-            prompt = f"""Problem: {problem}
-
-Proposed answer: {result.answer}
-
-Reasoning path: {reasoning_summary}
-
-Is this answer CORRECT and CONSISTENT with the reasoning shown?
-Answer YES if the answer logically follows from the reasoning.
-Answer NO if there are errors or inconsistencies.
-
-Your verdict (YES/NO):"""
-
-            response = await self.llm.generate_async(prompt, max_tokens=50, temperature=0.2)
-            is_valid = response.strip().upper().startswith("YES")
-
-            logger.debug(f"Async final answer verification: {is_valid}")
-            return is_valid
-
-        except Exception as e:
-            logger.warning(f"Async final answer verification failed: {e}")
-            return False
-
-    async def _generate_step_async(
-        self,
-        problem: str,
-        step_num: int,
-        total_steps: int,
-        recent_context: str,
-        temperature: float = 0.5,
-    ) -> str | None:
-        """Async version of step generation.
-
-        Args:
-            problem: Original problem.
-            step_num: Current step number.
-            total_steps: Total expected steps.
-            recent_context: Context from recent steps.
-            temperature: LLM temperature for generation.
-
-        Returns:
-            Generated step text, or None if failed.
-
-        """
-        try:
-            prompt = f"""Problem: {problem}
-
-Previous reasoning:
-{recent_context if recent_context else "(Starting fresh)"}
-
-Generate Step {step_num}/{total_steps}:
-- Build directly on previous reasoning
-- Make one clear logical advancement
-- Be specific and precise (2-4 sentences)
-
-Step {step_num}:"""
-
-            response = await self.llm.generate_async(
-                prompt=prompt,
-                max_tokens=400,
-                temperature=temperature,
-            )
-
-            return response.strip() if response else None
-
-        except Exception as e:
-            logger.warning(f"Step {step_num} generation error: {e}")
-            return None
-
-    async def _verify_step_async(
-        self,
-        problem: str,
-        chain: list[str],
-        step_num: int,
-    ) -> dict[str, Any]:
-        """Async version of step verification.
-
-        Args:
-            problem: Original problem.
-            chain: Full reasoning chain so far.
-            step_num: Step to verify.
-
-        Returns:
-            Verification result dict with is_valid, reason, step.
-
-        """
-        try:
-            current_step = chain[step_num - 1] if step_num <= len(chain) else ""
-            prev_step = chain[step_num - 2] if step_num > 1 and step_num - 1 <= len(chain) else ""
-
-            prompt = f"""Verify this reasoning step for logical consistency:
-
-Problem: {problem}
-
-Previous step: {prev_step[:200] if prev_step else "(none)"}
-
-Current step to verify: {current_step[:300]}
-
-Is this step:
-1. Logically sound (no logical errors)?
-2. Consistent with previous reasoning?
-3. Making valid progress toward the solution?
-
-Answer with YES if valid, NO if problematic. Then briefly explain (1 sentence):"""
-
-            response = await self.llm.generate_async(prompt, max_tokens=150, temperature=0.3)
-
-            is_valid = response.lower().startswith("yes") or "yes" in response.lower()[:20]
-
-            return {
-                "step": step_num,
-                "is_valid": is_valid,
-                "reason": response[:100] if response else "No response",
-            }
-
-        except Exception as e:
-            logger.warning(f"Async verification failed for step {step_num}: {e}")
-            return {
-                "step": step_num,
-                "is_valid": True,  # Fail open
-                "reason": f"Verification error: {e!s}",
-            }
-
-    async def _extract_answer_async(self, problem: str, chain: list[str]) -> str:
-        """Async version of answer extraction.
-
-        Args:
-            problem: Original problem.
-            chain: Complete reasoning chain.
-
-        Returns:
-            Extracted answer string.
-
-        """
-        if not chain:
-            return "Unable to generate answer"
-
-        try:
-            # Use last few steps as context
-            last_steps = "\n".join(chain[-3:]) if len(chain) >= 3 else "\n".join(chain)
-
-            prompt = f"""Problem: {problem}
-
-Final reasoning steps:
-{last_steps}
-
-Based on the reasoning chain above, what is the FINAL ANSWER to the problem?
-Provide a direct, concise answer (1-2 sentences):"""
-
-            response = await self.llm.generate_async(prompt, max_tokens=200, temperature=0.3)
-            return response.strip() if response else chain[-1].split("\n")[0]
-
-        except Exception as e:
-            logger.warning(f"Async answer extraction failed: {e}")
-            return chain[-1].split("\n")[0] if chain else "Unable to extract answer"
-
-    def _generate_step(
-        self,
-        problem: str,
-        step_num: int,
-        total_steps: int,
-        recent_context: str,
-        temperature: float = 0.5,
-    ) -> str | None:
-        """Generate a single reasoning step.
-
-        Args:
-            problem: Original problem.
-            step_num: Current step number.
-            total_steps: Total expected steps.
-            recent_context: Context from recent steps.
-            temperature: LLM temperature for generation.
-
-        Returns:
-            Generated step text, or None if failed.
-
-        """
-        try:
-            prompt = f"""Problem: {problem}
-
-Previous reasoning:
-{recent_context if recent_context else "(Starting fresh)"}
-
-Generate Step {step_num}/{total_steps}:
-- Build directly on previous reasoning
-- Make one clear logical advancement
-- Be specific and precise (2-4 sentences)
-
-Step {step_num}:"""
-
-            response = self.llm.generate(
-                prompt=prompt,
-                max_tokens=400,
-                temperature=temperature,
-            )
-
-            return response.strip() if response else None
-
-        except Exception as e:
-            logger.warning(f"Step {step_num} generation error: {e}")
-            return None
-
-    def _verify_step(
-        self,
-        problem: str,
-        chain: list[str],
-        step_num: int,
-    ) -> dict[str, Any]:
-        """Verify a reasoning step for logical consistency.
-
-        Args:
-            problem: Original problem.
-            chain: Full reasoning chain so far.
-            step_num: Step to verify.
-
-        Returns:
-            Verification result dict with is_valid, reason, step.
-
-        """
-        try:
-            current_step = chain[step_num - 1] if step_num <= len(chain) else ""
-            prev_step = chain[step_num - 2] if step_num > 1 and step_num - 1 <= len(chain) else ""
-
-            prompt = f"""Verify this reasoning step for logical consistency:
-
-Problem: {problem}
-
-Previous step: {prev_step[:200] if prev_step else "(none)"}
-
-Current step to verify: {current_step[:300]}
-
-Is this step:
-1. Logically sound (no logical errors)?
-2. Consistent with previous reasoning?
-3. Making valid progress toward the solution?
-
-Answer with YES if valid, NO if problematic. Then briefly explain (1 sentence):"""
-
-            response = self.llm.generate(prompt, max_tokens=150, temperature=0.3)
-
-            is_valid = response.lower().startswith("yes") or "yes" in response.lower()[:20]
-
-            return {
-                "step": step_num,
-                "is_valid": is_valid,
-                "reason": response[:100] if response else "No response",
-            }
-
-        except Exception as e:
-            logger.warning(f"Verification failed for step {step_num}: {e}")
-            return {
-                "step": step_num,
-                "is_valid": True,  # Fail open
-                "reason": f"Verification error: {e!s}",
-            }
-
-    def _extract_answer(self, problem: str, chain: list[str]) -> str:
-        """Extract final answer from reasoning chain.
-
-        Args:
-            problem: Original problem.
-            chain: Complete reasoning chain.
-
-        Returns:
-            Extracted answer string.
-
-        """
-        if not chain:
-            return "Unable to generate answer"
-
-        try:
-            # Use last few steps as context
-            last_steps = "\n".join(chain[-3:]) if len(chain) >= 3 else "\n".join(chain)
-
-            prompt = f"""Problem: {problem}
-
-Final reasoning steps:
-{last_steps}
-
-Based on the reasoning chain above, what is the FINAL ANSWER to the problem?
-Provide a direct, concise answer (1-2 sentences):"""
-
-            response = self.llm.generate(prompt, max_tokens=200, temperature=0.3)
-            return response.strip() if response else chain[-1].split("\n")[0]
-
-        except Exception as e:
-            logger.warning(f"Answer extraction failed: {e}")
-            return chain[-1].split("\n")[0] if chain else "Unable to extract answer"
-
-    def _build_recent_context(self, chain: list[str], max_steps: int = 5) -> str:
-        """Build context string from recent reasoning steps.
-
-        Args:
-            chain: Full reasoning chain.
-            max_steps: Maximum steps to include.
-
-        Returns:
-            Formatted context string.
-
-        """
-        if not chain:
-            return ""
-
-        recent = chain[-max_steps:]
-        start_idx = len(chain) - len(recent) + 1
-
-        return "\n".join(
-            f"Step {start_idx + i}: {step[:150]}..."
-            if len(step) > 150
-            else f"Step {start_idx + i}: {step}"
-            for i, step in enumerate(recent)
-        )
+def get_chain_manager() -> LongChainManager:
+    """Get the global chain manager instance."""
+    return _chain_manager

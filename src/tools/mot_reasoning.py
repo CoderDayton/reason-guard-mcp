@@ -1,788 +1,567 @@
-"""Matrix of Thought (MoT) reasoning tool.
+"""Matrix of Thought (MoT) state manager.
 
-Implements multi-dimensional reasoning combining breadth (multiple strategies)
-and depth (iterative refinement) with inter-cell communication.
+Implements a state management tool for tracking matrix-based reasoning.
+The calling LLM does all reasoning; this tool tracks the matrix structure,
+manages cell filling, and provides synthesis guidance.
 
-Based on paper 2509.03918v2 - achieves 7× speedup over RATT with +4.2% F1.
+Based on paper 2509.03918v2 - Matrix of Thought framework.
+
+Architecture:
+    - Tool receives reasoning FROM the calling LLM
+    - Tracks matrix cells (rows=strategies, cols=iterations)
+    - Manages column synthesis
+    - Provides guidance for next cell to fill
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import TYPE_CHECKING
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
-import numpy as np
 from loguru import logger
 
-from src.utils.errors import ReasoningException
-from src.utils.retry import retry_with_backoff
-from src.utils.schema import ReasoningResult
 
-if TYPE_CHECKING:
-    from src.models.knowledge_graph import KnowledgeGraph
-    from src.models.llm_client import LLMClientProtocol
+class MatrixStatus(Enum):
+    """Status of a matrix reasoning session."""
+
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
 
 
-class MatrixOfThoughtTool:
-    """Matrix of Thought reasoning with configurable breadth and depth.
+# Default reasoning strategies for matrix rows
+DEFAULT_STRATEGIES = [
+    "direct_factual",  # Row 1: Direct factual analysis
+    "logical_inference",  # Row 2: Logical deduction and inference
+    "analogical",  # Row 3: Analogical reasoning and comparison
+]
 
-    The MoT framework organizes reasoning in an m×n matrix where:
-    - Rows (m) represent different reasoning strategies/perspectives
-    - Columns (n) represent iterative refinement steps
-    - Inter-cell communication enables knowledge sharing
+STRATEGY_DESCRIPTIONS = {
+    "direct_factual": "Analyze facts directly from the context",
+    "logical_inference": "Apply logical deduction and inference rules",
+    "analogical": "Use analogies and comparisons to similar situations",
+    "causal": "Identify cause-effect relationships",
+    "counterfactual": "Consider alternative scenarios and outcomes",
+}
 
-    Communication patterns control how cells influence each other:
-    - vert&hor-01: Gradual increase in communication weight
-    - uniform: Equal communication across all cells
-    - none: Independent cells (like standard ToT)
 
-    Optional Knowledge Graph integration extracts entities and relations
-    from context to enhance multi-hop reasoning.
+@dataclass
+class MatrixCell:
+    """A single cell in the reasoning matrix."""
 
-    Attributes:
-        llm: LLM client for generating thoughts.
+    row: int
+    col: int
+    strategy: str
+    content: str
+    timestamp: datetime = field(default_factory=datetime.now)
+    confidence: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "row": self.row,
+            "col": self.col,
+            "strategy": self.strategy,
+            "content": self.content,
+            "timestamp": self.timestamp.isoformat(),
+            "confidence": self.confidence,
+        }
+
+
+@dataclass
+class ColumnSynthesis:
+    """Synthesis of a column's reasoning."""
+
+    col: int
+    content: str
+    contributing_cells: list[tuple[int, int]] = field(default_factory=list)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "col": self.col,
+            "content": self.content,
+            "contributing_cells": self.contributing_cells,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+@dataclass
+class MatrixState:
+    """State of a matrix reasoning session."""
+
+    session_id: str
+    question: str
+    context: str
+    rows: int
+    cols: int
+    strategies: list[str]
+    cells: dict[tuple[int, int], MatrixCell] = field(default_factory=dict)
+    syntheses: dict[int, ColumnSynthesis] = field(default_factory=dict)
+    status: MatrixStatus = MatrixStatus.ACTIVE
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    final_answer: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        # Build matrix representation
+        matrix = []
+        for r in range(self.rows):
+            row = []
+            for c in range(self.cols):
+                cell = self.cells.get((r, c))
+                row.append(cell.to_dict() if cell else None)
+            matrix.append(row)
+
+        return {
+            "session_id": self.session_id,
+            "question": self.question,
+            "context": self.context[:200] + "..." if len(self.context) > 200 else self.context,
+            "rows": self.rows,
+            "cols": self.cols,
+            "strategies": self.strategies,
+            "matrix": matrix,
+            "syntheses": {k: v.to_dict() for k, v in self.syntheses.items()},
+            "status": self.status.value,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "final_answer": self.final_answer,
+            "cells_filled": len(self.cells),
+            "total_cells": self.rows * self.cols,
+            "progress": len(self.cells) / (self.rows * self.cols),
+        }
+
+
+class MatrixOfThoughtManager:
+    """Manages Matrix of Thought reasoning sessions.
+
+    This is a STATE MANAGER, not a reasoner. The calling LLM provides
+    reasoning content; this tool tracks and organizes the matrix.
+
+    Example usage flow:
+        1. Agent calls: start_matrix(question="...", context="...")
+        2. Agent fills cells: set_cell(row=0, col=0, thought="...")
+        3. After each column: synthesize_column(col=0, synthesis="...")
+        4. Agent finalizes: finalize(answer="...")
+
+    Matrix structure:
+        - Rows represent different reasoning strategies
+        - Columns represent iterative refinement steps
+        - Each cell builds on previous column's cell + synthesis
 
     """
 
-    # P2 Optimization: Class-level cache for common weight matrices
-    _weight_cache: dict[tuple[int, int, str], np.ndarray] = {}
+    def __init__(self) -> None:
+        """Initialize the matrix manager."""
+        self._sessions: dict[str, MatrixState] = {}
 
-    def __init__(self, llm_client: LLMClientProtocol) -> None:
-        """Initialize MoT tool.
-
-        Args:
-            llm_client: LLM client for text generation.
-
-        """
-        self.llm = llm_client
-
-    @retry_with_backoff(max_attempts=2, base_delay=1.0)
-    def reason(
+    def start_matrix(
         self,
         question: str,
-        context: str,
-        matrix_rows: int = 3,
-        matrix_cols: int = 4,
-        communication_pattern: str = "vert&hor-01",
-        use_knowledge_graph: bool = False,
-    ) -> ReasoningResult:
-        """Execute Matrix of Thought reasoning.
-
-        Algorithm:
-        1. Initialize m×n thought matrix
-        2. Optionally extract knowledge graph from context
-        3. For each column (depth iteration):
-           a. For each row (strategy):
-              - Generate thought with communication from previous column
-              - Weight previous thought by communication matrix α
-           b. Synthesize column into summary node
-        4. Extract final answer from last summary node
+        context: str = "",
+        rows: int = 3,
+        cols: int = 4,
+        strategies: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a new matrix reasoning session.
 
         Args:
-            question: The problem to solve.
-            context: Relevant background information.
-            matrix_rows: Number of strategies (breadth), 2-5.
-            matrix_cols: Number of refinement iterations (depth), 2-5.
-            communication_pattern: Weight pattern for inter-cell communication.
-                                  Options: "vert&hor-01", "uniform", "none".
-            use_knowledge_graph: If True, extract entities and relations from
-                                context to enhance multi-hop reasoning.
+            question: The question to reason about.
+            context: Background context for reasoning.
+            rows: Number of strategies (2-5).
+            cols: Number of refinement iterations (2-6).
+            strategies: Custom strategy names (default: standard 3 strategies).
+            metadata: Optional metadata.
 
         Returns:
-            ReasoningResult with answer, confidence, and reasoning trace.
-
-        Raises:
-            ReasoningException: If reasoning fails due to invalid parameters
-                               or LLM errors.
-
-        Example:
-            >>> tool = MatrixOfThoughtTool(llm_client)
-            >>> result = tool.reason(
-            ...     question="Who invented the telephone?",
-            ...     context="Alexander Graham Bell was an inventor...",
-            ...     matrix_rows=3,
-            ...     matrix_cols=4,
-            ...     use_knowledge_graph=True
-            ... )
-            >>> print(result.answer)
-            >>> print(result.confidence)  # e.g., 0.85
+            Session info with matrix structure.
 
         """
-        # Validate inputs
-        if not question or not question.strip():
-            raise ReasoningException("Question cannot be empty")
-
-        if not context or not context.strip():
-            raise ReasoningException("Context cannot be empty")
-
-        if not 2 <= matrix_rows <= 5:
-            raise ReasoningException(f"matrix_rows must be 2-5, got {matrix_rows}")
-
-        if not 2 <= matrix_cols <= 5:
-            raise ReasoningException(f"matrix_cols must be 2-5, got {matrix_cols}")
-
-        try:
-            # Extract knowledge graph if enabled
-            kg_context = ""
-            kg_stats: dict[str, int] | None = None
-            if use_knowledge_graph:
-                kg_context, kg_stats = self._extract_knowledge_graph(context, question)
-
-            # Generate communication weight matrix
-            weight_matrix = self._generate_weight_matrix(
-                matrix_rows, matrix_cols, communication_pattern
-            )
-
-            # Initialize thought matrix
-            thought_matrix: list[list[str | None]] = [
-                [None for _ in range(matrix_cols)] for _ in range(matrix_rows)
-            ]
-            summary_nodes: list[str] = []
-            reasoning_steps: list[str] = []
-
-            # Column iteration (depth)
-            for col in range(matrix_cols):
-                column_thoughts: list[str] = []
-
-                # Row iteration (breadth)
-                for row in range(matrix_rows):
-                    prev_node = thought_matrix[row][col - 1] if col > 0 else None
-                    alpha = weight_matrix[row, col - 1] if col > 0 else 0.0
-
-                    # Generate thought node
-                    thought = self._generate_thought_node(
-                        question=question,
-                        context=context,
-                        prev_node=prev_node,
-                        alpha=alpha,
-                        row=row,
-                        col=col,
-                        total_rows=matrix_rows,
-                        total_cols=matrix_cols,
-                        kg_context=kg_context,
-                    )
-
-                    if thought:
-                        thought_matrix[row][col] = thought
-                        column_thoughts.append(thought)
-                        reasoning_steps.append(
-                            f"[R{row + 1}C{col + 1}] {thought[:150]}..."
-                            if len(thought) > 150
-                            else f"[R{row + 1}C{col + 1}] {thought}"
-                        )
-
-                # Synthesize column thoughts
-                if column_thoughts:
-                    summary = self._synthesize_column(
-                        question, column_thoughts, context, col + 1, matrix_cols
-                    )
-                    summary_nodes.append(summary)
-
-            # Extract final answer
-            if summary_nodes:
-                final_answer = self._extract_final_answer(question, summary_nodes[-1], context)
-            else:
-                final_answer = "Unable to generate answer"
-
-            # Calculate confidence based on reasoning coverage
-            all_thoughts = [t for row in thought_matrix for t in row if t]
-            coverage = len(all_thoughts) / (matrix_rows * matrix_cols)
-            confidence = min(0.5 + 0.4 * coverage, 0.95)
-
-            # Build reasoning trace with optional KG stats
-            trace: dict[str, object] = {
-                "matrix_shape": [matrix_rows, matrix_cols],
-                "total_thoughts": len(all_thoughts),
-                "summary_iterations": len(summary_nodes),
-                "communication_pattern": communication_pattern,
-                "knowledge_graph_enabled": use_knowledge_graph,
-            }
-            if kg_stats:
-                trace["knowledge_graph_stats"] = kg_stats
-
-            return ReasoningResult(
-                answer=final_answer,
-                confidence=confidence,
-                reasoning_steps=reasoning_steps,
-                tokens_used=self.llm.estimate_tokens("\n".join(reasoning_steps)),
-                reasoning_trace=trace,
-            )
-
-        except ReasoningException:
-            raise
-        except Exception as e:
-            logger.error(f"MoT reasoning failed: {e}")
-            raise ReasoningException(f"Matrix of Thought reasoning failed: {e!s}") from e
-
-    async def reason_async(
-        self,
-        question: str,
-        context: str,
-        matrix_rows: int = 3,
-        matrix_cols: int = 4,
-        communication_pattern: str = "vert&hor-01",
-        use_knowledge_graph: bool = False,
-    ) -> ReasoningResult:
-        """Execute Matrix of Thought reasoning with parallelized row generation.
-
-        P0 Optimization: Rows within each column are generated in parallel using
-        asyncio.gather, reducing latency by ~3-4x for typical matrix sizes.
-
-        Algorithm:
-        1. Initialize m×n thought matrix
-        2. Optionally extract knowledge graph from context
-        3. For each column (depth iteration):
-           a. PARALLEL: Generate all row thoughts concurrently
-           b. Synthesize column into summary node
-        4. Extract final answer from last summary node
-
-        Args:
-            question: The problem to solve.
-            context: Relevant background information.
-            matrix_rows: Number of strategies (breadth), 2-5.
-            matrix_cols: Number of refinement iterations (depth), 2-5.
-            communication_pattern: Weight pattern for inter-cell communication.
-            use_knowledge_graph: If True, extract entities and relations from
-                                context to enhance multi-hop reasoning.
-
-        Returns:
-            ReasoningResult with answer, confidence, and reasoning trace.
-
-        Raises:
-            ReasoningException: If reasoning fails.
-
-        """
-        # Validate inputs
-        if not question or not question.strip():
-            raise ReasoningException("Question cannot be empty")
-
-        if not context or not context.strip():
-            raise ReasoningException("Context cannot be empty")
-
-        if not 2 <= matrix_rows <= 5:
-            raise ReasoningException(f"matrix_rows must be 2-5, got {matrix_rows}")
-
-        if not 2 <= matrix_cols <= 5:
-            raise ReasoningException(f"matrix_cols must be 2-5, got {matrix_cols}")
-
-        try:
-            # Extract knowledge graph if enabled
-            kg_context = ""
-            kg_stats: dict[str, int] | None = None
-            if use_knowledge_graph:
-                kg_context, kg_stats = self._extract_knowledge_graph(context, question)
-
-            # Generate communication weight matrix (cached)
-            weight_matrix = self._generate_weight_matrix(
-                matrix_rows, matrix_cols, communication_pattern
-            )
-
-            # Initialize thought matrix
-            thought_matrix: list[list[str | None]] = [
-                [None for _ in range(matrix_cols)] for _ in range(matrix_rows)
-            ]
-            summary_nodes: list[str] = []
-            reasoning_steps: list[str] = []
-
-            # Column iteration (depth) - must be sequential due to dependencies
-            for col in range(matrix_cols):
-                # P0 OPTIMIZATION: Generate all rows in parallel
-                tasks = []
-                for row in range(matrix_rows):
-                    prev_node = thought_matrix[row][col - 1] if col > 0 else None
-                    alpha = weight_matrix[row, col - 1] if col > 0 else 0.0
-
-                    tasks.append(
-                        self._generate_thought_node_async(
-                            question=question,
-                            context=context,
-                            prev_node=prev_node,
-                            alpha=alpha,
-                            row=row,
-                            col=col,
-                            total_rows=matrix_rows,
-                            total_cols=matrix_cols,
-                            kg_context=kg_context,
-                        )
-                    )
-
-                # Execute all row tasks in parallel
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                column_thoughts: list[str] = []
-                for row, result in enumerate(results):
-                    if isinstance(result, Exception):
-                        logger.warning(f"Thought generation failed at ({row},{col}): {result}")
-                        continue
-                    if isinstance(result, str) and result:
-                        thought_matrix[row][col] = result
-                        column_thoughts.append(result)
-                        reasoning_steps.append(
-                            f"[R{row + 1}C{col + 1}] {result[:150]}..."
-                            if len(result) > 150
-                            else f"[R{row + 1}C{col + 1}] {result}"
-                        )
-
-                # Synthesize column thoughts (async)
-                if column_thoughts:
-                    summary = await self._synthesize_column_async(
-                        question, column_thoughts, context, col + 1, matrix_cols
-                    )
-                    summary_nodes.append(summary)
-
-            # Extract final answer (async)
-            if summary_nodes:
-                final_answer = await self._extract_final_answer_async(
-                    question, summary_nodes[-1], context
-                )
-            else:
-                final_answer = "Unable to generate answer"
-
-            # Calculate confidence based on reasoning coverage
-            all_thoughts = [t for row in thought_matrix for t in row if t]
-            coverage = len(all_thoughts) / (matrix_rows * matrix_cols)
-            confidence = min(0.5 + 0.4 * coverage, 0.95)
-
-            # Build reasoning trace with optional KG stats
-            trace: dict[str, object] = {
-                "matrix_shape": [matrix_rows, matrix_cols],
-                "total_thoughts": len(all_thoughts),
-                "summary_iterations": len(summary_nodes),
-                "communication_pattern": communication_pattern,
-                "parallel_execution": True,
-                "knowledge_graph_enabled": use_knowledge_graph,
-            }
-            if kg_stats:
-                trace["knowledge_graph_stats"] = kg_stats
-
-            return ReasoningResult(
-                answer=final_answer,
-                confidence=confidence,
-                reasoning_steps=reasoning_steps,
-                tokens_used=self.llm.estimate_tokens("\n".join(reasoning_steps)),
-                reasoning_trace=trace,
-            )
-
-        except ReasoningException:
-            raise
-        except Exception as e:
-            logger.error(f"MoT async reasoning failed: {e}")
-            raise ReasoningException(f"Matrix of Thought reasoning failed: {e!s}") from e
-
-    async def _generate_thought_node_async(
-        self,
-        question: str,
-        context: str,
-        prev_node: str | None,
-        alpha: float,
-        row: int,
-        col: int,
-        total_rows: int,
-        total_cols: int,
-        kg_context: str = "",
-    ) -> str | None:
-        """Async version of thought node generation for parallel execution.
-
-        Args:
-            question: The problem being solved.
-            context: Background information.
-            prev_node: Previous thought in same row (if any).
-            alpha: Communication weight from previous node.
-            row: Current row index.
-            col: Current column index.
-            total_rows: Total rows in matrix.
-            total_cols: Total columns in matrix.
-            kg_context: Optional knowledge graph context string.
-
-        Returns:
-            Generated thought string, or None if generation failed.
-
-        """
-        try:
-            # Build strategy guidance based on row
-            strategies = [
-                "direct factual analysis",
-                "logical inference and deduction",
-                "analogical reasoning",
-                "step-by-step decomposition",
-                "critical evaluation",
-            ]
-            strategy = strategies[row % len(strategies)]
-
-            # Build communication context
-            comm_context = ""
-            if prev_node and alpha > 0:
-                prev_summary = prev_node[:200] if len(prev_node) > 200 else prev_node
-                comm_context = (
-                    f"\nPrevious reasoning (weight α={alpha:.2f}): {prev_summary}\n"
-                    "Build upon or contrast with this approach:"
-                )
-
-            prompt = f"""Question: {question}
-
-Context: {context[:800]}{"..." if len(context) > 800 else ""}
-{kg_context}
-Matrix Position: Strategy {row + 1}/{total_rows}, Iteration {col + 1}/{total_cols}
-Strategy Focus: {strategy}
-{comm_context}
-
-Generate ONE focused reasoning step (2-3 sentences) using {strategy}:"""
-
-            response = await self.llm.generate_async(
-                prompt=prompt,
-                max_tokens=300,
-                temperature=0.7 if alpha < 0.5 else 0.5,
-            )
-
-            return response.strip() if response else None
-
-        except Exception as e:
-            logger.warning(f"Failed to generate thought at ({row},{col}): {e}")
-            return None
-
-    async def _synthesize_column_async(
-        self,
-        question: str,
-        thoughts: list[str],
-        context: str,
-        col_num: int,
-        total_cols: int,
-    ) -> str:
-        """Async version of column synthesis.
-
-        Args:
-            question: The problem being solved.
-            thoughts: List of thoughts from this column.
-            context: Background information.
-            col_num: Current column number (1-indexed).
-            total_cols: Total columns.
-
-        Returns:
-            Synthesized summary string.
-
-        """
-        try:
-            thoughts_text = "\n".join(
-                f"- Perspective {i + 1}: {t[:150]}..."
-                if len(t) > 150
-                else f"- Perspective {i + 1}: {t}"
-                for i, t in enumerate(thoughts[:4])
-            )
-
-            prompt = f"""Question: {question}
-
-Multiple reasoning perspectives (iteration {col_num}/{total_cols}):
-{thoughts_text}
-
-Context: {context[:400]}{"..." if len(context) > 400 else ""}
-
-Synthesize these perspectives into ONE coherent insight (3-4 sentences).
-Identify agreements, resolve conflicts, and advance toward the answer:"""
-
-            return await self.llm.generate_async(prompt, max_tokens=400, temperature=0.5)
-
-        except Exception as e:
-            logger.warning(f"Column synthesis failed: {e}")
-            return "Synthesis pending - multiple perspectives identified"
-
-    async def _extract_final_answer_async(
-        self, question: str, final_summary: str, context: str
-    ) -> str:
-        """Async version of final answer extraction.
-
-        Args:
-            question: Original question.
-            final_summary: Final column synthesis.
-            context: Background information.
-
-        Returns:
-            Concise answer string.
-
-        """
-        try:
-            prompt = f"""Question: {question}
-
-Final reasoning synthesis:
-{final_summary}
-
-Context excerpt: {context[:300]}...
-
-Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (1-2 sentences):"""
-
-            return await self.llm.generate_async(prompt, max_tokens=200, temperature=0.3)
-
-        except Exception as e:
-            logger.warning(f"Answer extraction failed: {e}")
-            # Fall back to first line of summary
-            return final_summary.split("\n")[0] if final_summary else "Unable to extract answer"
-
-    def _extract_knowledge_graph(
-        self, context: str, question: str
-    ) -> tuple[str, dict[str, int] | None]:
-        """Extract knowledge graph from context and format for prompts.
-
-        Args:
-            context: The context text to extract from.
-            question: The question to focus extraction on.
-
-        Returns:
-            Tuple of (kg_context_string, kg_stats_dict or None).
-
-        """
-        try:
-            from src.models.knowledge_graph import KnowledgeGraphExtractor
-
-            extractor = KnowledgeGraphExtractor(self.llm, use_llm=True)
-            kg = extractor.extract_for_question(context, question)
-
-            if not kg.relations:
-                logger.debug("No relations extracted from knowledge graph")
-                return "", None
-
-            # Format relations for prompt injection
-            def _format_predicate(pred: object) -> str:
-                """Format predicate as string."""
-                if isinstance(pred, str):
-                    return pred
-                return pred.value if hasattr(pred, "value") else str(pred)
-
-            relations_text = "\n".join(
-                f"- {r.subject.name} → {_format_predicate(r.predicate)} → {r.object_entity.name}"
-                for r in list(kg.relations)[:10]  # Limit to top 10 relations
-            )
-            kg_context = f"\nKnowledge Graph (extracted entities/relations):\n{relations_text}\n"
-
-            # Build stats
-            stats = kg.stats()
-            kg_stats = {
-                "entities": stats.num_entities,
-                "relations": stats.num_relations,
-            }
-
-            logger.debug(
-                f"Extracted KG with {stats.num_entities} entities, {stats.num_relations} relations"
-            )
-            return kg_context, kg_stats
-
-        except Exception as e:
-            logger.warning(f"Knowledge graph extraction failed: {e}")
-            return "", None
-
-    def _format_kg_context(self, kg: KnowledgeGraph) -> str:
-        """Format knowledge graph as context string for prompts.
-
-        Args:
-            kg: The knowledge graph to format.
-
-        Returns:
-            Formatted string of relations for prompt injection.
-
-        """
-        if not kg.relations:
-            return ""
-
-        def _format_predicate(pred: object) -> str:
-            """Format predicate as string."""
-            if isinstance(pred, str):
-                return pred
-            return pred.value if hasattr(pred, "value") else str(pred)
-
-        relations_text = "\n".join(
-            f"- {r.subject.name} → {_format_predicate(r.predicate)} → {r.object_entity.name}"
-            for r in list(kg.relations)[:10]
-        )
-        return f"\nKnowledge Graph:\n{relations_text}\n"
-
-    def _generate_thought_node(
-        self,
-        question: str,
-        context: str,
-        prev_node: str | None,
-        alpha: float,
-        row: int,
-        col: int,
-        total_rows: int,
-        total_cols: int,
-        kg_context: str = "",
-    ) -> str | None:
-        """Generate a single thought node in the matrix.
-
-        Args:
-            question: The problem being solved.
-            context: Background information.
-            prev_node: Previous thought in same row (if any).
-            alpha: Communication weight from previous node.
-            row: Current row index.
-            col: Current column index.
-            total_rows: Total rows in matrix.
-            total_cols: Total columns in matrix.
-            kg_context: Optional knowledge graph context string.
-
-        Returns:
-            Generated thought string, or None if generation failed.
-
-        """
-        try:
-            # Build strategy guidance based on row
-            strategies = [
-                "direct factual analysis",
-                "logical inference and deduction",
-                "analogical reasoning",
-                "step-by-step decomposition",
-                "critical evaluation",
-            ]
-            strategy = strategies[row % len(strategies)]
-
-            # Build communication context
-            comm_context = ""
-            if prev_node and alpha > 0:
-                prev_summary = prev_node[:200] if len(prev_node) > 200 else prev_node
-                comm_context = (
-                    f"\nPrevious reasoning (weight α={alpha:.2f}): {prev_summary}\n"
-                    "Build upon or contrast with this approach:"
-                )
-
-            prompt = f"""Question: {question}
-
-Context: {context[:800]}{"..." if len(context) > 800 else ""}
-{kg_context}
-Matrix Position: Strategy {row + 1}/{total_rows}, Iteration {col + 1}/{total_cols}
-Strategy Focus: {strategy}
-{comm_context}
-
-Generate ONE focused reasoning step (2-3 sentences) using {strategy}:"""
-
-            response = self.llm.generate(
-                prompt=prompt,
-                max_tokens=300,
-                temperature=0.7 if alpha < 0.5 else 0.5,
-            )
-
-            return response.strip() if response else None
-
-        except Exception as e:
-            logger.warning(f"Failed to generate thought at ({row},{col}): {e}")
-            return None
-
-    def _synthesize_column(
-        self,
-        question: str,
-        thoughts: list[str],
-        context: str,
-        col_num: int,
-        total_cols: int,
-    ) -> str:
-        """Synthesize thoughts from a column into a summary.
-
-        Args:
-            question: The problem being solved.
-            thoughts: List of thoughts from this column.
-            context: Background information.
-            col_num: Current column number (1-indexed).
-            total_cols: Total columns.
-
-        Returns:
-            Synthesized summary string.
-
-        """
-        try:
-            thoughts_text = "\n".join(
-                f"- Perspective {i + 1}: {t[:150]}..."
-                if len(t) > 150
-                else f"- Perspective {i + 1}: {t}"
-                for i, t in enumerate(thoughts[:4])
-            )
-
-            prompt = f"""Question: {question}
-
-Multiple reasoning perspectives (iteration {col_num}/{total_cols}):
-{thoughts_text}
-
-Context: {context[:400]}{"..." if len(context) > 400 else ""}
-
-Synthesize these perspectives into ONE coherent insight (3-4 sentences).
-Identify agreements, resolve conflicts, and advance toward the answer:"""
-
-            return self.llm.generate(prompt, max_tokens=400, temperature=0.5)
-
-        except Exception as e:
-            logger.warning(f"Column synthesis failed: {e}")
-            return "Synthesis pending - multiple perspectives identified"
-
-    def _extract_final_answer(self, question: str, final_summary: str, context: str) -> str:
-        """Extract concise final answer from summary.
-
-        Args:
-            question: Original question.
-            final_summary: Final column synthesis.
-            context: Background information.
-
-        Returns:
-            Concise answer string.
-
-        """
-        try:
-            prompt = f"""Question: {question}
-
-Final reasoning synthesis:
-{final_summary}
-
-Context excerpt: {context[:300]}...
-
-Based on the reasoning above, provide a DIRECT, CONCISE answer to the question (1-2 sentences):"""
-
-            return self.llm.generate(prompt, max_tokens=200, temperature=0.3)
-
-        except Exception as e:
-            logger.warning(f"Answer extraction failed: {e}")
-            # Fall back to first line of summary
-            return final_summary.split("\n")[0] if final_summary else "Unable to extract answer"
-
-    def _generate_weight_matrix(self, rows: int, cols: int, pattern: str) -> np.ndarray:
-        """Generate communication weight matrix.
-
-        The weight matrix determines how much influence each cell
-        receives from its predecessor in the same row.
-
-        Args:
-            rows: Number of rows.
-            cols: Number of columns.
-            pattern: Communication pattern name.
-
-        Returns:
-            NumPy array of shape (rows, cols-1) with weights.
-
-        """
-        # P2 Optimization: Cache common weight matrices
-        cache_key = (rows, cols, pattern)
-        if cache_key in self._weight_cache:
-            return self._weight_cache[cache_key]
-
-        matrix = np.zeros((rows, cols - 1))
-
-        if pattern == "vert&hor-01":
-            # Paper 2509.03918v2 formula: α = 0.1*(m-i) + 0.1*j
-            # - (m-i): Earlier rows (strategies) get more communication weight
-            # - j: Later columns (iterations) accumulate more communication
-            for i in range(rows):
-                for j in range(cols - 1):
-                    matrix[i, j] = min(0.1 * (rows - i) + 0.1 * j, 1.0)
-
-        elif pattern == "uniform":
-            # Equal communication everywhere
-            matrix.fill(0.5)
-
-        elif pattern == "none":
-            # No communication (independent cells)
-            matrix.fill(0.0)
-
+        # Validate dimensions
+        rows = max(2, min(5, rows))
+        cols = max(2, min(6, cols))
+
+        # Set up strategies
+        if strategies:
+            strategies = strategies[:rows]
+            while len(strategies) < rows:
+                strategies.append(f"strategy_{len(strategies) + 1}")
         else:
-            # Default: moderate communication
-            matrix.fill(0.3)
-            logger.warning(f"Unknown pattern '{pattern}', using default (0.3)")
+            strategies = DEFAULT_STRATEGIES[:rows]
+            while len(strategies) < rows:
+                strategies.append(f"strategy_{len(strategies) + 1}")
 
-        # Cache common sizes (2-5 rows/cols)
-        if rows <= 5 and cols <= 5:
-            self._weight_cache[cache_key] = matrix
+        session_id = str(uuid.uuid4())[:8]
+        state = MatrixState(
+            session_id=session_id,
+            question=question,
+            context=context,
+            rows=rows,
+            cols=cols,
+            strategies=strategies,
+            metadata=metadata or {},
+        )
+        self._sessions[session_id] = state
 
-        return matrix
+        logger.debug(f"Started matrix session {session_id}: {rows}x{cols}")
+
+        # Build strategy guidance
+        strategy_guide = []
+        for i, strat in enumerate(strategies):
+            desc = STRATEGY_DESCRIPTIONS.get(strat, f"Apply {strat} reasoning")
+            strategy_guide.append(f"Row {i}: {strat} - {desc}")
+
+        return {
+            "session_id": session_id,
+            "status": "started",
+            "question": question,
+            "context_length": len(context),
+            "matrix_dimensions": {"rows": rows, "cols": cols},
+            "strategies": strategies,
+            "strategy_guide": strategy_guide,
+            "total_cells": rows * cols,
+            "instruction": (
+                f"Fill the {rows}x{cols} reasoning matrix. "
+                f"Start with cell (0,0) using '{strategies[0]}' strategy. "
+                f"Call set_cell(row=0, col=0, thought='your reasoning'). "
+                f"After completing each column, call synthesize_column()."
+            ),
+            "next_cell": {"row": 0, "col": 0, "strategy": strategies[0]},
+        }
+
+    def set_cell(
+        self,
+        session_id: str,
+        row: int,
+        col: int,
+        thought: str,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Fill a cell in the matrix.
+
+        Args:
+            session_id: Session to update.
+            row: Row index (0-based).
+            col: Column index (0-based).
+            thought: Reasoning content for this cell.
+            confidence: Optional confidence score.
+
+        Returns:
+            Updated state and guidance for next cell.
+
+        """
+        state = self._get_session(session_id)
+        if state.status != MatrixStatus.ACTIVE:
+            return {"error": f"Session is {state.status.value}"}
+
+        # Validate position
+        if not (0 <= row < state.rows and 0 <= col < state.cols):
+            return {
+                "error": f"Invalid position ({row}, {col}) for {state.rows}x{state.cols} matrix"
+            }
+
+        # Create cell
+        cell = MatrixCell(
+            row=row,
+            col=col,
+            strategy=state.strategies[row],
+            content=thought,
+            confidence=confidence,
+        )
+        state.cells[(row, col)] = cell
+        state.updated_at = datetime.now()
+
+        # Check consistency
+        issues = self._check_cell_consistency(state, cell)
+
+        # Determine next action
+        next_cell = self._get_next_cell(state)
+        col_complete = all((r, col) in state.cells for r in range(state.rows))
+
+        response = {
+            "session_id": session_id,
+            "cell_set": {"row": row, "col": col, "strategy": state.strategies[row]},
+            "cells_filled": len(state.cells),
+            "total_cells": state.rows * state.cols,
+            "progress": round(len(state.cells) / (state.rows * state.cols), 2),
+            "column_complete": col_complete,
+        }
+
+        if issues:
+            response["consistency_warnings"] = issues
+
+        if col_complete and col not in state.syntheses:
+            response["instruction"] = (
+                f"Column {col} is complete. Call synthesize_column(col={col}, synthesis='...') "
+                f"to combine the {state.rows} perspectives into a unified insight."
+            )
+            response["pending_synthesis"] = col
+        elif next_cell:
+            response["next_cell"] = next_cell
+            response["instruction"] = (
+                f"Continue with cell ({next_cell['row']}, {next_cell['col']}) "
+                f"using '{next_cell['strategy']}' strategy."
+            )
+        else:
+            response["instruction"] = (
+                "Matrix complete. Call finalize(answer='...') with your final answer."
+            )
+
+        logger.debug(f"Set cell ({row}, {col}) in session {session_id}")
+
+        return response
+
+    def synthesize_column(
+        self,
+        session_id: str,
+        col: int,
+        synthesis: str,
+    ) -> dict[str, Any]:
+        """Synthesize a column's reasoning into a unified insight.
+
+        Args:
+            session_id: Session to update.
+            col: Column to synthesize.
+            synthesis: Combined insight from all rows in this column.
+
+        Returns:
+            Updated state.
+
+        """
+        state = self._get_session(session_id)
+        if state.status != MatrixStatus.ACTIVE:
+            return {"error": f"Session is {state.status.value}"}
+
+        # Check column is complete
+        missing = [r for r in range(state.rows) if (r, col) not in state.cells]
+        if missing:
+            return {"error": f"Column {col} incomplete. Missing rows: {missing}"}
+
+        # Create synthesis
+        contributing = [(r, col) for r in range(state.rows)]
+        synth = ColumnSynthesis(
+            col=col,
+            content=synthesis,
+            contributing_cells=contributing,
+        )
+        state.syntheses[col] = synth
+        state.updated_at = datetime.now()
+
+        # Determine next action
+        next_cell = self._get_next_cell(state)
+        all_cols_synthesized = len(state.syntheses) == state.cols
+
+        response = {
+            "session_id": session_id,
+            "column_synthesized": col,
+            "syntheses_complete": len(state.syntheses),
+            "total_columns": state.cols,
+        }
+
+        if all_cols_synthesized:
+            response["instruction"] = (
+                "All columns synthesized. Review the progression and "
+                "call finalize(answer='...') with your final answer."
+            )
+            response["synthesis_summary"] = [
+                {
+                    "col": c,
+                    "synthesis": s.content[:100] + "..." if len(s.content) > 100 else s.content,
+                }
+                for c, s in sorted(state.syntheses.items())
+            ]
+        elif next_cell:
+            response["next_cell"] = next_cell
+            response["instruction"] = (
+                f"Continue filling matrix. Next: cell ({next_cell['row']}, {next_cell['col']}) "
+                f"with '{next_cell['strategy']}' strategy. "
+                f"Use the column {col} synthesis to inform your reasoning."
+            )
+
+        logger.debug(f"Synthesized column {col} in session {session_id}")
+
+        return response
+
+    def get_matrix(self, session_id: str) -> dict[str, Any]:
+        """Get the current matrix state.
+
+        Args:
+            session_id: Session to retrieve.
+
+        Returns:
+            Full matrix state.
+
+        """
+        state = self._get_session(session_id)
+        return state.to_dict()
+
+    def finalize(
+        self,
+        session_id: str,
+        answer: str,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Finalize the matrix reasoning with an answer.
+
+        Args:
+            session_id: Session to finalize.
+            answer: The final answer.
+            confidence: Optional confidence score.
+
+        Returns:
+            Final matrix state with summary.
+
+        """
+        state = self._get_session(session_id)
+
+        state.final_answer = answer
+        state.status = MatrixStatus.COMPLETED
+        state.updated_at = datetime.now()
+
+        # Generate summary
+        summary = self._generate_summary(state)
+
+        logger.info(f"Finalized matrix session {session_id}")
+
+        return {
+            "session_id": session_id,
+            "status": "completed",
+            "final_answer": answer,
+            "confidence": confidence,
+            "summary": summary,
+            "matrix": state.to_dict(),
+        }
+
+    def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
+        """Abandon a matrix session.
+
+        Args:
+            session_id: Session to abandon.
+            reason: Optional reason.
+
+        Returns:
+            Final state.
+
+        """
+        state = self._get_session(session_id)
+        state.status = MatrixStatus.ABANDONED
+        state.metadata["abandon_reason"] = reason
+        state.updated_at = datetime.now()
+
+        return {
+            "session_id": session_id,
+            "status": "abandoned",
+            "reason": reason,
+            "cells_filled": len(state.cells),
+        }
+
+    def list_sessions(self) -> dict[str, Any]:
+        """List all sessions."""
+        sessions = []
+        for sid, state in self._sessions.items():
+            sessions.append(
+                {
+                    "session_id": sid,
+                    "question": state.question[:50] + "..."
+                    if len(state.question) > 50
+                    else state.question,
+                    "status": state.status.value,
+                    "dimensions": f"{state.rows}x{state.cols}",
+                    "progress": round(len(state.cells) / (state.rows * state.cols), 2),
+                }
+            )
+        return {"sessions": sessions, "total": len(sessions)}
+
+    def _get_session(self, session_id: str) -> MatrixState:
+        """Get session or raise error."""
+        if session_id not in self._sessions:
+            raise ValueError(f"Session {session_id} not found")
+        return self._sessions[session_id]
+
+    def _get_next_cell(self, state: MatrixState) -> dict[str, Any] | None:
+        """Get the next cell to fill."""
+        for col in range(state.cols):
+            for row in range(state.rows):
+                if (row, col) not in state.cells:
+                    return {
+                        "row": row,
+                        "col": col,
+                        "strategy": state.strategies[row],
+                    }
+        return None
+
+    def _check_cell_consistency(
+        self,
+        state: MatrixState,
+        cell: MatrixCell,
+    ) -> list[str]:
+        """Check cell for consistency issues."""
+        issues = []
+        content = cell.content.lower()
+
+        # Check for short content
+        if len(cell.content.split()) < 10:
+            issues.append("Cell content seems brief. Consider more thorough reasoning.")
+
+        # Check for repetition from previous column
+        if cell.col > 0:
+            prev_cell = state.cells.get((cell.row, cell.col - 1))
+            if prev_cell:
+                prev_words = set(prev_cell.content.lower().split())
+                curr_words = set(content.split())
+                if len(prev_words) > 5 and len(curr_words) > 5:
+                    overlap = len(prev_words & curr_words) / len(prev_words | curr_words)
+                    if overlap > 0.7:
+                        issues.append(
+                            "High similarity with previous column. "
+                            "Ensure you're building on the synthesis, not repeating."
+                        )
+
+        # Check if using assigned strategy
+        strategy = state.strategies[cell.row].lower().replace("_", " ")
+        strategy_keywords = {
+            "direct factual": ["fact", "stated", "according to", "explicitly"],
+            "logical inference": ["therefore", "implies", "because", "since", "if"],
+            "analogical": ["similar", "like", "compared", "analogy", "reminds"],
+            "causal": ["cause", "effect", "result", "leads to", "because of"],
+            "counterfactual": ["if", "would", "could have", "alternatively"],
+        }
+        keywords = strategy_keywords.get(strategy, [])
+        if keywords and not any(kw in content for kw in keywords):
+            issues.append(
+                f"Content may not align with '{state.strategies[cell.row]}' strategy. "
+                f"Consider using relevant reasoning patterns."
+            )
+
+        return issues
+
+    def _generate_summary(self, state: MatrixState) -> dict[str, Any]:
+        """Generate summary of the matrix reasoning."""
+        total_words = sum(len(c.content.split()) for c in state.cells.values())
+        total_words += sum(len(s.content.split()) for s in state.syntheses.values())
+
+        return {
+            "dimensions": f"{state.rows}x{state.cols}",
+            "cells_filled": len(state.cells),
+            "total_cells": state.rows * state.cols,
+            "syntheses": len(state.syntheses),
+            "strategies_used": state.strategies,
+            "total_words": total_words,
+            "duration_seconds": (state.updated_at - state.created_at).total_seconds(),
+        }
+
+
+# Global instance for session persistence
+_matrix_manager = MatrixOfThoughtManager()
+
+
+def get_matrix_manager() -> MatrixOfThoughtManager:
+    """Get the global matrix manager instance."""
+    return _matrix_manager

@@ -1,863 +1,579 @@
-"""Unit tests for src/tools/verify.py, mot_reasoning.py, long_chain.py, compress.py."""
+"""Unit tests for state manager tools: verify.py, mot_reasoning.py, long_chain.py.
+
+These tests verify the state management logic of each tool.
+The tools no longer contain LLM logic - they track state for the calling LLM.
+"""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
-from src.utils.errors import ReasoningException, VerificationException
-
-
-class MockLLMClient:
-    """Mock LLM client for testing."""
-
-    def __init__(self, responses: list[str] | None = None) -> None:
-        """Initialize mock client with optional responses."""
-        self.responses = responses or ["Mock response"]
-        self.call_index = 0
-
-    def generate(
-        self,
-        prompt: str,
-        max_tokens: int = 2000,
-        temperature: float = 0.7,
-        top_p: float = 0.9,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Generate a mock response."""
-        response = self.responses[self.call_index % len(self.responses)]
-        self.call_index += 1
-        return response
-
-    def estimate_tokens(self, text: str) -> int:
-        """Estimate token count."""
-        return len(text) // 4
-
+from src.tools.long_chain import LongChainManager
+from src.tools.mot_reasoning import MatrixOfThoughtManager
+from src.tools.verify import VerificationManager
 
 # =============================================================================
-# FactVerificationTool Tests
+# LongChainManager Tests
 # =============================================================================
 
 
-class TestFactVerificationTool:
-    """Tests for FactVerificationTool."""
+class TestLongChainManager:
+    """Tests for LongChainManager state management."""
 
-    def test_verify_empty_answer_raises(self) -> None:
-        """Test empty answer raises VerificationException."""
-        from src.tools.verify import FactVerificationTool
+    def test_start_chain_creates_session(self) -> None:
+        """Test start_chain() creates a new session with correct state."""
+        manager = LongChainManager()
+        result = manager.start_chain(problem="Test problem", expected_steps=10)
 
-        tool = FactVerificationTool(MockLLMClient())  # type: ignore
+        assert "session_id" in result
+        assert result["status"] == "started"
+        assert result["problem"] == "Test problem"
+        assert result["expected_steps"] == 10
+        assert result["next_step"] == 1
 
-        with pytest.raises(VerificationException, match="Answer cannot be empty"):
-            tool.verify(answer="", context="Some context")
-
-    def test_verify_empty_context_raises(self) -> None:
-        """Test empty context raises VerificationException."""
-        from src.tools.verify import FactVerificationTool
-
-        tool = FactVerificationTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(VerificationException, match="Context cannot be empty"):
-            tool.verify(answer="Some answer", context="")
-
-    def test_verify_invalid_max_claims_raises(self) -> None:
-        """Test invalid max_claims raises VerificationException."""
-        from src.tools.verify import FactVerificationTool
-
-        tool = FactVerificationTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(VerificationException, match="max_claims must be 1-20"):
-            tool.verify(answer="Answer", context="Context", max_claims=0)
-
-        with pytest.raises(VerificationException, match="max_claims must be 1-20"):
-            tool.verify(answer="Answer", context="Context", max_claims=21)
-
-    def test_verify_no_claims_found(self) -> None:
-        """Test verification when no claims are extracted."""
-        from src.tools.verify import FactVerificationTool
-
-        # LLM returns empty response for claim extraction
-        tool = FactVerificationTool(MockLLMClient(["", ""]))  # type: ignore
-
-        result = tool.verify(answer="OK", context="Context here")
-
-        assert result.verified is True
-        assert result.confidence == 0.5
-        assert "No verifiable claims" in result.reason
-
-    def test_verify_claims_supported(self) -> None:
-        """Test verification when claims are supported."""
-        from src.tools.verify import FactVerificationTool
-
-        responses = [
-            "Einstein was a physicist\nHe developed relativity",  # Claims
-            "SUPPORTED - The context confirms this",  # Verify claim 1
-            "SUPPORTED - Yes this is correct",  # Verify claim 2
-        ]
-        tool = FactVerificationTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.verify(
-            answer="Einstein was a physicist who developed relativity",
-            context="Albert Einstein was a theoretical physicist known for relativity",
+    def test_start_chain_with_metadata(self) -> None:
+        """Test start_chain() with optional metadata."""
+        manager = LongChainManager()
+        result = manager.start_chain(
+            problem="Problem",
+            expected_steps=5,
+            metadata={"source": "test"},
         )
 
-        assert result.verified is True
-        assert result.confidence >= 0.7
+        assert result["status"] == "started"
+        # Metadata is stored in state, verify via get_chain
+        state = manager.get_chain(result["session_id"])
+        assert state["session_id"] == result["session_id"]
 
-    def test_verify_claims_contradicted(self) -> None:
-        """Test verification when claims are contradicted."""
-        from src.tools.verify import FactVerificationTool
+    def test_add_step_increments_state(self) -> None:
+        """Test add_step() adds thought and increments counter."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
 
-        responses = [
-            "Einstein was born in 1800",  # Claim
-            "CONTRADICTED - Einstein was born in 1879",  # Verify
-        ]
-        tool = FactVerificationTool(MockLLMClient(responses))  # type: ignore
+        result = manager.add_step(session_id, thought="First thought")
 
-        result = tool.verify(
-            answer="Einstein was born in 1800",
-            context="Einstein was born in 1879",
+        assert result["step_added"] == 1
+        assert result["total_steps"] == 1
+
+    def test_add_step_multiple(self) -> None:
+        """Test adding multiple steps."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="Step 1")
+        manager.add_step(session_id, thought="Step 2")
+        result = manager.add_step(session_id, thought="Step 3")
+
+        assert result["step_added"] == 3
+        assert result["total_steps"] == 3
+
+    def test_add_step_invalid_session(self) -> None:
+        """Test add_step() with invalid session ID."""
+        manager = LongChainManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.add_step("invalid-id", thought="Test")
+
+    def test_add_step_progress_tracking(self) -> None:
+        """Test add_step() tracks progress correctly."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        result = manager.add_step(session_id, thought="Step 1")
+        assert result["progress"] == 0.2  # 1/5
+
+        manager.add_step(session_id, thought="Step 2")
+        manager.add_step(session_id, thought="Step 3")
+        result = manager.add_step(session_id, thought="Step 4")
+        assert result["progress"] == 0.8  # 4/5
+
+    def test_add_step_needs_more_flag(self) -> None:
+        """Test add_step() sets needs_more_steps correctly."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=2)
+        session_id = start["session_id"]
+
+        result1 = manager.add_step(session_id, thought="Step 1")
+        assert result1["needs_more_steps"] is True
+
+        result2 = manager.add_step(session_id, thought="Step 2")
+        assert result2["needs_more_steps"] is False
+
+    def test_finalize_completes_session(self) -> None:
+        """Test finalize() completes session with answer."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="Step 1")
+        result = manager.finalize(session_id, answer="42", confidence=0.9)
+
+        assert result["status"] == "completed"
+        assert result["final_answer"] == "42"
+        assert result["confidence"] == 0.9
+
+    def test_finalize_invalid_session(self) -> None:
+        """Test finalize() with invalid session."""
+        manager = LongChainManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.finalize("invalid-id", answer="X", confidence=0.5)
+
+    def test_get_chain_returns_current_state(self) -> None:
+        """Test get_chain() returns current session state."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="Test", expected_steps=5)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="Step 1")
+        state = manager.get_chain(session_id)
+
+        assert state["current_step"] == 1
+        assert state["status"] == "active"
+
+    def test_multiple_sessions_independent(self) -> None:
+        """Test multiple sessions are independent."""
+        manager = LongChainManager()
+
+        s1 = manager.start_chain(problem="Problem 1", expected_steps=5)
+        s2 = manager.start_chain(problem="Problem 2", expected_steps=10)
+
+        manager.add_step(s1["session_id"], thought="S1 Step")
+
+        state1 = manager.get_chain(s1["session_id"])
+        state2 = manager.get_chain(s2["session_id"])
+
+        assert state1["current_step"] == 1
+        assert state2["current_step"] == 0
+        assert state1["problem"] == "Problem 1"
+        assert state2["problem"] == "Problem 2"
+
+    def test_abandon_marks_session(self) -> None:
+        """Test abandon() marks session as abandoned."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        result = manager.abandon(session_id)
+        assert result["status"] == "abandoned"
+
+        # Session still exists but is abandoned
+        state = manager.get_chain(session_id)
+        assert state["status"] == "abandoned"
+
+    def test_list_sessions(self) -> None:
+        """Test list_sessions() returns all sessions."""
+        manager = LongChainManager()
+
+        manager.start_chain(problem="Problem 1", expected_steps=5)
+        manager.start_chain(problem="Problem 2", expected_steps=5)
+
+        sessions = manager.list_sessions()
+        assert sessions["total"] == 2
+        assert len(sessions["sessions"]) == 2
+
+    def test_add_step_with_branch(self) -> None:
+        """Test add_step() with branching."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="Step 1")
+        manager.add_step(session_id, thought="Step 2")
+
+        # Branch from step 1
+        result = manager.add_step(
+            session_id,
+            thought="Alternative approach",
+            branch_from=1,
         )
 
-        assert result.verified is False
-        assert len(result.claim_details) >= 1
+        assert result["step_type"] == "branch"
+        assert "branch_1" in result["branches"]
 
-    def test_verify_claims_unclear(self) -> None:
-        """Test verification when claims are unclear."""
-        from src.tools.verify import FactVerificationTool
+    def test_add_step_with_revision(self) -> None:
+        """Test add_step() with revision."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
 
-        responses = [
-            "Some random fact",
-            "UNCLEAR - Context doesn't mention this",
-        ]
-        tool = FactVerificationTool(MockLLMClient(responses))  # type: ignore
+        manager.add_step(session_id, thought="Step 1")
+        manager.add_step(session_id, thought="Step 2 - wrong")
 
-        result = tool.verify(
-            answer="Some random fact",
-            context="Unrelated context about weather",
+        # Revise step 2
+        result = manager.add_step(
+            session_id,
+            thought="Step 2 - corrected",
+            revises=2,
         )
 
-        # Unclear is treated as not supported (0 verified / 1 total = 0.0)
-        # The individual claim has confidence=0.5, but result confidence is verified_count/total
-        assert result.confidence == 0.0
-        assert result.claims_verified == 0
-        assert result.claims_total == 1
-        # Check individual claim has the 0.5 confidence
-        assert result.claim_details[0]["confidence"] == 0.5
+        assert result["step_type"] == "revision"
 
-    def test_verify_llm_failure_in_extraction_uses_fallback(self) -> None:
-        """Test fallback to sentence splitting when LLM fails."""
-        from src.tools.verify import FactVerificationTool
 
-        # First call raises exception, subsequent calls work
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = [
-            Exception("LLM Error"),  # Extraction fails
-            "SUPPORTED",  # Verification works
-        ]
-        mock_llm.estimate_tokens.return_value = 100
+# =============================================================================
+# MatrixOfThoughtManager Tests
+# =============================================================================
 
-        tool = FactVerificationTool(mock_llm)
 
-        result = tool.verify(
-            answer="This is a sentence with more than five words. Another good sentence here.",
+class TestMatrixOfThoughtManager:
+    """Tests for MatrixOfThoughtManager state management."""
+
+    def test_start_matrix_creates_matrix(self) -> None:
+        """Test start_matrix() creates matrix with correct dimensions."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="What is X?",
+            rows=3,
+            cols=2,
+        )
+
+        assert "session_id" in result
+        assert result["status"] == "started"
+        assert result["question"] == "What is X?"
+        assert result["matrix_dimensions"]["rows"] == 3
+        assert result["matrix_dimensions"]["cols"] == 2
+
+    def test_start_matrix_with_context(self) -> None:
+        """Test start_matrix() with optional context."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="Q",
+            rows=2,
+            cols=2,
             context="Some context",
         )
 
-        # Fallback should have extracted sentences
-        assert result is not None
+        assert result["status"] == "started"
 
-    def test_verify_llm_failure_in_verification(self) -> None:
-        """Test handling of LLM failure during claim verification."""
-        from src.tools.verify import FactVerificationTool
+    def test_start_matrix_with_strategies(self) -> None:
+        """Test start_matrix() with custom strategies."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="Q",
+            rows=2,
+            cols=2,
+            strategies=["analytical", "creative"],
+        )
 
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = [
-            "Claim one\nClaim two",  # Extraction works
-            Exception("LLM Error"),  # Verification fails
-        ]
-        mock_llm.estimate_tokens.return_value = 100
+        # Strategies stored in session, verify via get_matrix
+        state = manager.get_matrix(result["session_id"])
+        assert state["strategies"] == ["analytical", "creative"]
 
-        tool = FactVerificationTool(mock_llm)
+    def test_set_cell_updates_matrix(self) -> None:
+        """Test set_cell() updates correct matrix position."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
 
-        result = tool.verify(answer="Test answer here", context="Context")
+        result = manager.set_cell(session_id, row=0, col=0, thought="Analysis for 0,0")
 
-        # Should handle error gracefully
-        assert result is not None
+        assert "progress" in result  # Has progress tracking
+        state = manager.get_matrix(session_id)
+        assert state["cells_filled"] == 1
+
+    def test_set_cell_validates_bounds(self) -> None:
+        """Test set_cell() validates row/col bounds."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Out of bounds should return error dict
+        result = manager.set_cell(session_id, row=5, col=0, thought="X")
+        assert "error" in result
+
+        result = manager.set_cell(session_id, row=0, col=5, thought="X")
+        assert "error" in result
+
+    def test_set_cell_invalid_session(self) -> None:
+        """Test set_cell() with invalid session."""
+        manager = MatrixOfThoughtManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.set_cell("invalid", row=0, col=0, thought="X")
+
+    def test_synthesize_column_stores_synthesis(self) -> None:
+        """Test synthesize_column() stores synthesis for a column."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Fill entire column 0 first (required for synthesis)
+        manager.set_cell(session_id, row=0, col=0, thought="A")
+        manager.set_cell(session_id, row=1, col=0, thought="B")
+
+        result = manager.synthesize_column(session_id, col=0, synthesis="Combined: A and B")
+
+        # Should succeed without error
+        assert "error" not in result
+        assert result["column_synthesized"] == 0
+
+    def test_synthesize_column_invalid_session(self) -> None:
+        """Test synthesize_column() with invalid session."""
+        manager = MatrixOfThoughtManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.synthesize_column("invalid", col=0, synthesis="X")
+
+    def test_finalize_completes_session(self) -> None:
+        """Test finalize() completes session."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Fill matrix
+        manager.set_cell(session_id, row=0, col=0, thought="A")
+        manager.set_cell(session_id, row=0, col=1, thought="B")
+        manager.set_cell(session_id, row=1, col=0, thought="C")
+        manager.set_cell(session_id, row=1, col=1, thought="D")
+
+        result = manager.finalize(session_id, answer="Answer", confidence=0.85)
+
+        assert result["status"] == "completed"
+        assert result["final_answer"] == "Answer"
+        assert result["confidence"] == 0.85
+
+    def test_matrix_complete_detection(self) -> None:
+        """Test cells_filled tracks progress correctly."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Partially filled
+        result = manager.set_cell(session_id, row=0, col=0, thought="A")
+        assert result["cells_filled"] == 1
+        assert result["progress"] == 0.25
+
+        # Fill remaining
+        manager.set_cell(session_id, row=0, col=1, thought="B")
+        manager.set_cell(session_id, row=1, col=0, thought="C")
+        result = manager.set_cell(session_id, row=1, col=1, thought="D")
+
+        assert result["cells_filled"] == 4
+        assert result["progress"] == 1.0
+
+    def test_abandon_marks_session(self) -> None:
+        """Test abandon() marks session as abandoned."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        result = manager.abandon(session_id)
+        assert result["status"] == "abandoned"
 
 
 # =============================================================================
-# MatrixOfThoughtTool Tests
+# VerificationManager Tests
 # =============================================================================
 
 
-class TestMatrixOfThoughtTool:
-    """Tests for MatrixOfThoughtTool."""
+class TestVerificationManager:
+    """Tests for VerificationManager state management."""
 
-    def test_reason_empty_question_raises(self) -> None:
-        """Test empty question raises ReasoningException."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="Question cannot be empty"):
-            tool.reason(question="", context="Some context")
-
-    def test_reason_empty_context_raises(self) -> None:
-        """Test empty context raises ReasoningException."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="Context cannot be empty"):
-            tool.reason(question="Question", context="")
-
-    def test_reason_invalid_matrix_rows_raises(self) -> None:
-        """Test invalid matrix_rows raises ReasoningException."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="matrix_rows must be 2-5"):
-            tool.reason(question="Q", context="C", matrix_rows=1)
-
-        with pytest.raises(ReasoningException, match="matrix_rows must be 2-5"):
-            tool.reason(question="Q", context="C", matrix_rows=6)
-
-    def test_reason_invalid_matrix_cols_raises(self) -> None:
-        """Test invalid matrix_cols raises ReasoningException."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="matrix_cols must be 2-5"):
-            tool.reason(question="Q", context="C", matrix_cols=1)
-
-        with pytest.raises(ReasoningException, match="matrix_cols must be 2-5"):
-            tool.reason(question="Q", context="C", matrix_cols=6)
-
-    def test_reason_success(self) -> None:
-        """Test successful MoT reasoning."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        responses = [
-            "Thought 1",
-            "Thought 2",
-            "Thought 3",
-            "Thought 4",
-            "Synthesis 1",
-            "Thought 5",
-            "Thought 6",
-            "Thought 7",
-            "Thought 8",
-            "Synthesis 2",
-            "Final answer: 42",
-        ]
-        tool = MatrixOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            question="What is the answer?",
-            context="Context information here",
-            matrix_rows=2,
-            matrix_cols=2,
+    def test_start_verification_creates_session(self) -> None:
+        """Test start_verification() creates verification session."""
+        manager = VerificationManager()
+        result = manager.start_verification(
+            answer="Test answer",
+            context="Some context to verify against",
         )
 
-        assert result.answer is not None
-        assert result.confidence > 0
+        assert "session_id" in result
+        assert result["status"] == "started"
+        assert "suggested_claims" in result
 
-    def test_reason_with_uniform_pattern(self) -> None:
-        """Test MoT with uniform communication pattern."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
+    def test_add_claim_stores_claim(self) -> None:
+        """Test add_claim() stores claim for verification."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
 
-        tool = MatrixOfThoughtTool(MockLLMClient(["Response"] * 20))  # type: ignore
+        result = manager.add_claim(session_id, content="The sky is blue")
 
-        result = tool.reason(
-            question="Q",
-            context="C",
-            matrix_rows=2,
-            matrix_cols=2,
-            communication_pattern="uniform",
+        assert result["claim_id"] == 0
+        assert result["total_claims"] == 1
+
+    def test_add_claim_multiple(self) -> None:
+        """Test adding multiple claims."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim 1")
+        manager.add_claim(session_id, content="Claim 2")
+        result = manager.add_claim(session_id, content="Claim 3")
+
+        assert result["total_claims"] == 3
+
+    def test_add_claim_invalid_session(self) -> None:
+        """Test add_claim() with invalid session."""
+        manager = VerificationManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.add_claim("invalid", content="X")
+
+    def test_verify_claim_updates_status(self) -> None:
+        """Test verify_claim() updates claim verification status."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Test claim")
+
+        result = manager.verify_claim(
+            session_id,
+            claim_id=0,
+            status="supported",
+            evidence="Found in context",
+            confidence=0.9,
         )
 
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace["communication_pattern"] == "uniform"
-
-    def test_reason_with_none_pattern(self) -> None:
-        """Test MoT with no communication pattern."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient(["Response"] * 20))  # type: ignore
-
-        result = tool.reason(
-            question="Q",
-            context="C",
-            matrix_rows=2,
-            matrix_cols=2,
-            communication_pattern="none",
-        )
-
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace["communication_pattern"] == "none"
-
-    def test_reason_with_unknown_pattern(self) -> None:
-        """Test MoT with unknown pattern uses default."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient(["Response"] * 20))  # type: ignore
-
-        result = tool.reason(
-            question="Q",
-            context="C",
-            matrix_rows=2,
-            matrix_cols=2,
-            communication_pattern="unknown_pattern",
-        )
-
-        assert result is not None
-
-    def test_reason_thought_generation_failure(self) -> None:
-        """Test handling of thought generation failure."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = ""  # Empty response
-        mock_llm.estimate_tokens.return_value = 0
-
-        tool = MatrixOfThoughtTool(mock_llm)
-
-        result = tool.reason(question="Q", context="C", matrix_rows=2, matrix_cols=2)
-
-        assert result.answer == "Unable to generate answer"
-
-    def test_reason_synthesis_failure(self) -> None:
-        """Test handling of synthesis failure."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = [
-            "Thought 1",
-            "Thought 2",
-            Exception("Synthesis failed"),  # Synthesis
-            "Thought 3",
-            "Thought 4",
-            "Final synthesis",
-            "Final answer",
-        ]
-        mock_llm.estimate_tokens.return_value = 100
-
-        tool = MatrixOfThoughtTool(mock_llm)
-
-        result = tool.reason(question="Q", context="C", matrix_rows=2, matrix_cols=2)
-
-        assert result is not None
-
-    def test_reason_answer_extraction_failure(self) -> None:
-        """Test fallback when answer extraction fails."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        mock_llm = MagicMock()
-        # All thoughts and synthesis work, final extraction fails
-        responses = ["Thought"] * 10 + ["Synthesis is here"]
-        mock_llm.generate.side_effect = responses + [Exception("Extract failed")]
-        mock_llm.estimate_tokens.return_value = 100
-
-        tool = MatrixOfThoughtTool(mock_llm)
-
-        result = tool.reason(question="Q", context="C", matrix_rows=2, matrix_cols=2)
-
-        # Should fallback to summary
-        assert result is not None
-
-    def test_weight_matrix_vert_hor_01_formula(self) -> None:
-        """Test vert&hor-01 weight matrix follows paper 2509.03918v2 formula.
-
-        Formula: α[i,j] = 0.1*(m-i) + 0.1*j
-        - Earlier rows (strategies) get more communication weight
-        - Later columns (iterations) accumulate more communication
-        """
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-
-        # Test 3x4 matrix (weights are 3x3)
-        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="vert&hor-01")
-
-        # Row 0: highest weights (first strategy has most established knowledge)
-        assert matrix[0, 0] == pytest.approx(0.3)  # 0.1*(3-0) + 0.1*0
-        assert matrix[0, 1] == pytest.approx(0.4)  # 0.1*(3-0) + 0.1*1
-        assert matrix[0, 2] == pytest.approx(0.5)  # 0.1*(3-0) + 0.1*2
-
-        # Row 1: medium weights
-        assert matrix[1, 0] == pytest.approx(0.2)  # 0.1*(3-1) + 0.1*0
-        assert matrix[1, 1] == pytest.approx(0.3)  # 0.1*(3-1) + 0.1*1
-        assert matrix[1, 2] == pytest.approx(0.4)  # 0.1*(3-1) + 0.1*2
-
-        # Row 2: lowest weights (last strategy)
-        assert matrix[2, 0] == pytest.approx(0.1)  # 0.1*(3-2) + 0.1*0
-        assert matrix[2, 1] == pytest.approx(0.2)  # 0.1*(3-2) + 0.1*1
-        assert matrix[2, 2] == pytest.approx(0.3)  # 0.1*(3-2) + 0.1*2
-
-    def test_weight_matrix_uniform_pattern(self) -> None:
-        """Test uniform pattern has equal weights."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="uniform")
-
-        assert (matrix == 0.5).all()
-
-    def test_weight_matrix_none_pattern(self) -> None:
-        """Test none pattern has zero weights (no communication)."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient())  # type: ignore
-        matrix = tool._generate_weight_matrix(rows=3, cols=4, pattern="none")
-
-        assert (matrix == 0.0).all()
-
-    def test_reason_with_knowledge_graph(self) -> None:
-        """Test MoT with knowledge graph extraction enabled."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        # Responses include KG extraction response + thought generations
-        kg_response = (
-            "ENTITY: Einstein | PERSON\n"
-            "ENTITY: Relativity | CONCEPT\n"
-            "RELATION: Einstein | authored | Relativity"
-        )
-        responses = [
-            # KG extraction response
-            kg_response,
-            # Thought nodes and synthesis
-            "Thought 1",
-            "Thought 2",
-            "Synthesis 1",
-            "Thought 3",
-            "Thought 4",
-            "Synthesis 2",
-            "Final answer: Einstein authored the theory of relativity",
-        ]
-        tool = MatrixOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            question="Who authored the theory of relativity?",
-            context="Albert Einstein was a physicist who developed the theory of relativity.",
-            matrix_rows=2,
-            matrix_cols=2,
-            use_knowledge_graph=True,
-        )
-
-        assert result.answer is not None
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace["knowledge_graph_enabled"] is True
-
-    def test_reason_knowledge_graph_disabled_by_default(self) -> None:
-        """Test that knowledge graph is disabled by default."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        tool = MatrixOfThoughtTool(MockLLMClient(["Response"] * 20))  # type: ignore
-
-        result = tool.reason(
-            question="Q",
-            context="C",
-            matrix_rows=2,
-            matrix_cols=2,
-        )
-
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace["knowledge_graph_enabled"] is False
-
-    def test_extract_knowledge_graph_helper(self) -> None:
-        """Test _extract_knowledge_graph helper method."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
-
-        # Response for KG extraction
-        kg_response = (
-            "ENTITY: Alice | PERSON\nENTITY: Bob | PERSON\nRELATION: Alice | works_for | Bob"
-        )
-        tool = MatrixOfThoughtTool(MockLLMClient([kg_response]))  # type: ignore
-
-        kg_context, kg_stats = tool._extract_knowledge_graph(
-            context="Alice works for Bob at the company.", question="Who does Alice work for?"
-        )
-
-        assert "Knowledge Graph" in kg_context
-        assert "Alice" in kg_context
-        assert kg_stats is not None
-        assert kg_stats["entities"] >= 1
-
-
-# =============================================================================
-# LongChainOfThoughtTool Tests
-# =============================================================================
-
-
-class TestLongChainOfThoughtTool:
-    """Tests for LongChainOfThoughtTool."""
-
-    def test_reason_empty_problem_raises(self) -> None:
-        """Test empty problem raises ReasoningException."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="Problem cannot be empty"):
-            tool.reason(problem="")
-
-    def test_reason_invalid_num_steps_raises(self) -> None:
-        """Test invalid num_steps raises ReasoningException."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="num_steps must be 1-50"):
-            tool.reason(problem="P", num_steps=0)
-
-        with pytest.raises(ReasoningException, match="num_steps must be 1-50"):
-            tool.reason(problem="P", num_steps=51)
-
-    def test_reason_success_with_verification(self) -> None:
-        """Test successful reasoning with intermediate verification."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        responses = [
-            "Step 1 reasoning",
-            "Step 2 reasoning",
-            "Step 3 reasoning",
-            "YES - Step 3 is valid",  # Verification
-            "Step 4 reasoning",
-            "Step 5 reasoning",
-            "Step 6 reasoning",
-            "YES - Step 6 is valid",  # Verification
-            "Final answer is 42",  # Answer extraction
-        ]
-        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            problem="Solve this problem",
-            num_steps=6,
-            verify_intermediate=True,
-            verification_frequency=3,
-        )
-
-        assert result.answer is not None
-        assert result.verification_results is not None
-        assert result.verification_results["total_verifications"] == 2
-        assert result.verification_results["passed"] == 2
-
-    def test_reason_without_verification(self) -> None:
-        """Test reasoning without intermediate verification."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient(["Response"] * 10))  # type: ignore
-
-        result = tool.reason(
-            problem="Problem",
-            num_steps=5,
-            verify_intermediate=False,
-        )
-
-        assert result.verification_results is not None
-        assert result.verification_results["total_verifications"] == 0
-        assert result.confidence == 0.7  # Default without verification
-
-    def test_reason_verification_failure(self) -> None:
-        """Test handling of verification failure."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        responses = [
-            "Step 1",
-            "Step 2",
-            "Step 3",
-            "NO - This step is invalid",  # Verification fails
-            "Step 4",
-            "Step 5",
-            "Step 6",
-            "YES - Valid",  # Verification passes
-            "Final answer",
-        ]
-        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            problem="P",
-            num_steps=6,
-            verify_intermediate=True,
-            verification_frequency=3,
-        )
-
-        assert result.verification_results is not None
-        assert result.verification_results["passed"] == 1
-        assert result.verification_results["failed"] == 1
-
-    def test_reason_step_generation_failure(self) -> None:
-        """Test handling when step generation fails."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = [
-            "Step 1",
-            "Step 2",
-            "",  # Empty response stops chain
-        ]
-        mock_llm.estimate_tokens.return_value = 100
-
-        tool = LongChainOfThoughtTool(mock_llm)
-
-        result = tool.reason(problem="P", num_steps=5, verify_intermediate=False)
-
-        # Chain should stop early but still produce result
-        assert len(result.reasoning_steps) == 2
-
-    def test_reason_answer_extraction_failure(self) -> None:
-        """Test fallback when answer extraction fails."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = [
-            "Step 1",
-            "Step 2",
-            "Step 3",
-            Exception("Extraction failed"),  # Answer extraction fails
-        ]
-        mock_llm.estimate_tokens.return_value = 100
-
-        tool = LongChainOfThoughtTool(mock_llm)
-
-        result = tool.reason(problem="P", num_steps=3, verify_intermediate=False)
-
-        # Should fallback to last step
-        assert "Step 3" in result.answer
-
-    def test_reason_empty_chain(self) -> None:
-        """Test handling of empty reasoning chain."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = ""  # All steps fail
-        mock_llm.estimate_tokens.return_value = 0
-
-        tool = LongChainOfThoughtTool(mock_llm)
-
-        result = tool.reason(problem="P", num_steps=3, verify_intermediate=False)
-
-        assert result.answer == "Unable to generate answer"
-
-    def test_build_recent_context_empty(self) -> None:
-        """Test _build_recent_context with empty chain."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
-
-        result = tool._build_recent_context([], max_steps=5)
-        assert result == ""
-
-    def test_build_recent_context_truncates_long_steps(self) -> None:
-        """Test _build_recent_context truncates long steps."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
-
-        long_step = "A" * 200  # Longer than 150
-        result = tool._build_recent_context([long_step], max_steps=5)
-
-        assert "..." in result
-
-    def test_reason_with_star_iterations_disabled(self) -> None:
-        """Test that star_iterations=0 uses standard single-chain mode."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        responses = ["Step 1", "Step 2", "Step 3", "Final answer: 42"]
-        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            problem="Test problem",
-            num_steps=3,
-            verify_intermediate=False,
-            star_iterations=0,
-        )
-
-        assert result.answer is not None
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace.get("star_enabled") is None
-
-    def test_reason_with_star_iterations_enabled(self) -> None:
-        """Test that star_iterations > 0 runs multiple iterations."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        # Each iteration: 3 steps + answer extraction + final answer verification
-        # We provide enough responses for 2 iterations
-        responses = [
-            # Iteration 1
-            "Step 1 iter1",
-            "Step 2 iter1",
-            "Step 3 iter1",
-            "Answer iter1",
-            "NO - not valid",  # Final answer verification fails
-            # Iteration 2
-            "Step 1 iter2",
-            "Step 2 iter2",
-            "Step 3 iter2",
-            "Answer iter2",
-            "YES - valid",  # Final answer verification passes
-        ]
-        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            problem="Test problem",
-            num_steps=3,
-            verify_intermediate=False,
-            star_iterations=2,
-        )
-
-        assert result.answer is not None
-        assert result.reasoning_trace is not None
-        assert result.reasoning_trace.get("star_enabled") is True
-        assert result.reasoning_trace.get("star_iterations_requested") == 2
-
-    def test_star_invalid_iterations_raises(self) -> None:
-        """Test that invalid star_iterations raises exception."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        tool = LongChainOfThoughtTool(MockLLMClient())  # type: ignore
-
-        with pytest.raises(ReasoningException, match="star_iterations must be 0-10"):
-            tool.reason(problem="P", num_steps=3, star_iterations=11)
-
-        with pytest.raises(ReasoningException, match="star_iterations must be 0-10"):
-            tool.reason(problem="P", num_steps=3, star_iterations=-1)
-
-    def test_star_early_exit_on_high_score(self) -> None:
-        """Test that STaR exits early when a high-scoring chain is found."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        # Provide responses for first iteration only - it should pass verification
-        # and exit early without needing more iterations
-        responses = [
-            # Iteration 1: steps + intermediate verification + answer + final verify
-            "Step 1",
-            "Step 2",
-            "Step 3",
-            "YES - step valid",  # Intermediate verification
-            "Answer: 42",
-            "YES - answer valid",  # Final answer verification -> early exit
-        ]
-        tool = LongChainOfThoughtTool(MockLLMClient(responses))  # type: ignore
-
-        result = tool.reason(
-            problem="Test",
-            num_steps=3,
-            verify_intermediate=True,
-            verification_frequency=3,
-            star_iterations=5,  # Request 5 but should exit after 1
-        )
-
-        assert result.reasoning_trace is not None
-        # Should exit early (iterations_used < iterations_requested)
-        assert result.reasoning_trace.get("star_iterations_used", 0) <= 2
-
-    def test_verify_final_answer_helper(self) -> None:
-        """Test _verify_final_answer helper method."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-        from src.utils.schema import ReasoningResult
-
-        tool = LongChainOfThoughtTool(MockLLMClient(["YES - correct"]))  # type: ignore
-
-        result = ReasoningResult(
-            answer="42",
-            confidence=0.8,
-            reasoning_steps=["Step 1", "Step 2", "Therefore 42"],
-            tokens_used=100,
-        )
-
-        is_valid = tool._verify_final_answer("What is 6*7?", result)
-        assert is_valid is True
-
-    def test_verify_final_answer_returns_false_on_no(self) -> None:
-        """Test _verify_final_answer returns False when LLM says NO."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-        from src.utils.schema import ReasoningResult
-
-        tool = LongChainOfThoughtTool(MockLLMClient(["NO - incorrect"]))  # type: ignore
-
-        result = ReasoningResult(
-            answer="wrong answer",
+        assert result["claim_id"] == 0
+        assert result["status"] == "supported"
+
+    def test_verify_claim_validates_claim_id(self) -> None:
+        """Test verify_claim() validates claim ID."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Only claim")
+
+        result = manager.verify_claim(
+            session_id,
+            claim_id=999,
+            status="supported",
+            evidence="X",
             confidence=0.5,
-            reasoning_steps=["Bad step"],
-            tokens_used=50,
         )
+        assert "error" in result
 
-        is_valid = tool._verify_final_answer("What is 6*7?", result)
-        assert is_valid is False
+    def test_finalize_computes_summary(self) -> None:
+        """Test finalize() computes verification summary."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim 1")
+        manager.add_claim(session_id, content="Claim 2")
+        manager.add_claim(session_id, content="Claim 3")
+
+        manager.verify_claim(session_id, 0, "supported", "E1", 0.9)
+        manager.verify_claim(session_id, 1, "contradicted", "E2", 0.8)
+        manager.verify_claim(session_id, 2, "supported", "E3", 0.95)
+
+        result = manager.finalize(session_id)
+
+        assert result["status"] == "completed"
+        assert result["summary"]["total_claims"] == 3
+        assert result["summary"]["supported"] == 2
+        assert result["summary"]["contradicted"] == 1
+
+    def test_finalize_overall_verdict_fully_supported(self) -> None:
+        """Test verified=True when all claims supported."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim 1")
+        manager.add_claim(session_id, content="Claim 2")
+
+        manager.verify_claim(session_id, 0, "supported", "E1", 0.9)
+        manager.verify_claim(session_id, 1, "supported", "E2", 0.85)
+
+        result = manager.finalize(session_id)
+
+        assert result["verified"] is True
+
+    def test_finalize_overall_verdict_contradicted(self) -> None:
+        """Test verified=False when any claim contradicted."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim 1")
+        manager.add_claim(session_id, content="Claim 2")
+
+        manager.verify_claim(session_id, 0, "supported", "E1", 0.9)
+        manager.verify_claim(session_id, 1, "contradicted", "E2", 0.95)
+
+        result = manager.finalize(session_id)
+
+        assert result["verified"] is False
+
+    def test_valid_statuses(self) -> None:
+        """Test all valid status values."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test context")
+        session_id = start["session_id"]
+
+        # Valid statuses are: supported, contradicted
+        valid_statuses = ["supported", "contradicted"]
+
+        for i, status in enumerate(valid_statuses):
+            manager.add_claim(session_id, content=f"Claim for {status}")
+            result = manager.verify_claim(session_id, i, status, f"Evidence for {status}", 0.5)
+            # verify_claim returns claim_id and status
+            assert result["claim_id"] == i
+            assert result["status"] == status
+
+    def test_abandon_marks_session(self) -> None:
+        """Test abandon() marks session as abandoned."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Test")
+        session_id = start["session_id"]
+
+        result = manager.abandon(session_id)
+        assert result["status"] == "abandoned"
 
 
 # =============================================================================
-# Integration Tests for Error Propagation
+# Compress Tool Tests (doesn't use sessions)
 # =============================================================================
 
 
-class TestToolErrorPropagation:
-    """Test error handling behaviors in tools."""
+class TestCompress:
+    """Tests for compression tool."""
 
-    def test_verify_uses_fallback_on_extraction_error(self) -> None:
-        """Test that verify uses fallback sentence splitting when extraction fails."""
-        from src.tools.verify import FactVerificationTool
+    @pytest.fixture
+    def compressor(self):
+        """Create compressor with default model."""
+        from src.tools.compress import ContextAwareCompressionTool
 
-        mock_llm = MagicMock()
-        # First call (extraction) fails, second (verification) succeeds
-        mock_llm.generate.side_effect = [
-            Exception("Extraction error"),
-            "SUPPORTED - this is verified",
-        ]
+        return ContextAwareCompressionTool()
 
-        tool = FactVerificationTool(mock_llm)
+    def test_compress_reduces_tokens(self, compressor) -> None:
+        """Test compression reduces token count."""
+        long_context = "This is a test sentence. " * 50
+        question = "What is this?"
 
-        # Should not raise - uses fallback
-        result = tool.verify(
-            answer="This sentence has more than five words for testing purposes.",
-            context="Test context",
+        result = compressor.compress(
+            context=long_context,
+            question=question,
+            compression_ratio=0.5,
         )
-        # Fallback splits by sentence and uses sentences with >= 5 words
-        assert result is not None
 
-    def test_mot_generates_empty_matrix_on_failure(self) -> None:
-        """Test MoT handles generation failures gracefully."""
-        from src.tools.mot_reasoning import MatrixOfThoughtTool
+        assert result.original_tokens > result.compressed_tokens
+        assert result.compression_ratio <= 0.7  # Allow some tolerance
 
-        mock_llm = MagicMock()
-        # All generations fail, then synthesis still works
-        mock_llm.generate.side_effect = [
-            Exception("Gen error"),  # (0,0)
-            Exception("Gen error"),  # (1,0)
-            Exception("Gen error"),  # (0,1)
-            Exception("Gen error"),  # (1,1)
-            "Final synthesis answer",  # synthesis
-            "42",  # answer extraction
-        ]
-        mock_llm.estimate_tokens.return_value = 0
+    def test_compress_preserves_relevant_content(self, compressor) -> None:
+        """Test compression preserves question-relevant content."""
+        context = """
+        The quick brown fox jumps over the lazy dog.
+        Albert Einstein was born in 1879.
+        The weather today is sunny with clear skies.
+        Einstein developed the theory of relativity.
+        Random filler text that is not relevant.
+        """
+        question = "When was Einstein born?"
 
-        tool = MatrixOfThoughtTool(mock_llm)
+        result = compressor.compress(
+            context=context,
+            question=question,
+            compression_ratio=0.5,
+        )
 
-        # Should not raise - handles gracefully with empty thoughts
-        result = tool.reason(question="Q", context="C", matrix_rows=2, matrix_cols=2)
-        assert result is not None
-
-    def test_long_chain_stops_on_failure(self) -> None:
-        """Test long chain stops when step generation fails."""
-        from src.tools.long_chain import LongChainOfThoughtTool
-
-        mock_llm = MagicMock()
-        # First step fails
-        mock_llm.generate.side_effect = [
-            RuntimeError("Step error"),  # step 1 fails
-            "Final answer",  # answer extraction still runs
-        ]
-        mock_llm.estimate_tokens.return_value = 0
-
-        tool = LongChainOfThoughtTool(mock_llm)
-
-        # Should not raise - stops chain early
-        result = tool.reason(problem="P", num_steps=3, verify_intermediate=False)
-        # Result will have empty chain but still returns
-        assert result is not None
-        assert len(result.reasoning_steps) == 0  # No successful steps
+        # Should preserve "1879" as it's relevant to the question
+        assert "1879" in result.compressed_context

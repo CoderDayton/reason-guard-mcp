@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
 from src.models.knowledge_graph import (
@@ -611,29 +609,22 @@ class TestKnowledgeGraph:
 class TestKnowledgeGraphExtractor:
     """Test KnowledgeGraphExtractor class."""
 
-    def test_init_without_llm(self) -> None:
-        """Test initialization without LLM."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
-        assert extractor.llm is None
-        assert not extractor.use_llm
-
-    def test_init_with_llm(self) -> None:
-        """Test initialization with LLM."""
-        mock_llm = MagicMock()
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
-        assert extractor.llm == mock_llm
-        assert extractor.use_llm
+    def test_init(self) -> None:
+        """Test initialization."""
+        extractor = KnowledgeGraphExtractor()
+        # Should initialize without error
+        assert extractor is not None
 
     def test_extract_empty_text_raises(self) -> None:
         """Test extraction from empty text raises exception."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         with pytest.raises(KnowledgeGraphException, match="empty text"):
             extractor.extract("")
 
     def test_extract_with_rules_dates(self) -> None:
         """Test rule-based extraction extracts dates."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         # Use years that match the DATE_PATTERN (19xx or 20xx)
         kg = extractor.extract(
@@ -646,7 +637,7 @@ class TestKnowledgeGraphExtractor:
 
     def test_extract_with_rules_quantities(self) -> None:
         """Test rule-based extraction extracts quantities."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         kg = extractor.extract("The temperature was 100 percent accurate.")
 
@@ -655,7 +646,7 @@ class TestKnowledgeGraphExtractor:
 
     def test_extract_with_rules_capitalized_phrases(self) -> None:
         """Test rule-based extraction extracts capitalized phrases."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         kg = extractor.extract("Albert Einstein worked at Princeton University.")
 
@@ -664,7 +655,7 @@ class TestKnowledgeGraphExtractor:
 
     def test_extract_with_existing_graph(self) -> None:
         """Test extraction extends existing graph."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         existing_kg = KnowledgeGraph()
         existing_kg.add_entity("Existing Entity", EntityType.OTHER)
@@ -674,87 +665,21 @@ class TestKnowledgeGraphExtractor:
         assert kg.get_entity("Existing Entity") is not None
         assert kg is existing_kg
 
-    def test_extract_with_llm_success(self) -> None:
-        """Test LLM-based extraction."""
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = """ENTITY: Albert Einstein | PERSON
-ENTITY: Theory of Relativity | CONCEPT
-RELATION: Albert Einstein | authored | Theory of Relativity"""
-
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
-        kg = extractor.extract("Einstein developed relativity.")
-
-        assert kg.get_entity("Albert Einstein") is not None
-        assert kg.get_entity("Theory of Relativity") is not None
-        assert len(kg.relations) >= 1
-
-    def test_extract_with_llm_invalid_type_fallback(self) -> None:
-        """Test LLM extraction falls back to OTHER for invalid types."""
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = "ENTITY: Test | INVALID_TYPE"
-
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
-        kg = extractor.extract("Test text.")
-
-        entity = kg.get_entity("Test")
-        if entity:
-            assert entity.entity_type == EntityType.OTHER
-
-    def test_extract_with_llm_failure_fallback(self) -> None:
-        """Test LLM extraction falls back to rules on failure."""
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = Exception("LLM error")
-
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
-        kg = extractor.extract("Test text from 2020.")
-
-        # Should have used rule-based extraction
-        assert len(kg.entities) > 0
-
     def test_extract_for_question(self) -> None:
         """Test question-focused extraction."""
-        mock_llm = MagicMock()
-        mock_llm.generate.return_value = """ENTITY: Einstein | PERSON
-ENTITY: 1905 | DATE
-RELATION: Einstein | published_in | 1905"""
+        extractor = KnowledgeGraphExtractor()
 
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
         kg = extractor.extract_for_question(
-            text="Einstein published his theory.",
+            text="Einstein published his theory in 1905.",
             question="When did Einstein publish?",
         )
 
+        # Should extract entities relevant to the question
         assert len(kg.entities) > 0
-
-    def test_extract_for_question_without_llm(self) -> None:
-        """Test question-focused extraction without LLM."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
-
-        kg = extractor.extract_for_question(
-            text="Text from 1990.",
-            question="What year?",
-        )
-
-        # Should fall back to regular extraction
-        assert len(kg.entities) > 0
-
-    def test_extract_for_question_llm_failure(self) -> None:
-        """Test question extraction falls back on LLM failure."""
-        mock_llm = MagicMock()
-        mock_llm.generate.side_effect = Exception("LLM error")
-
-        extractor = KnowledgeGraphExtractor(llm_client=mock_llm, use_llm=True)
-        kg = extractor.extract_for_question(
-            text="Text from 2000.",
-            question="What?",
-        )
-
-        # Should have fallen back
-        assert len(kg.entities) >= 0
 
     def test_extract_detects_organization_keywords(self) -> None:
         """Test rule-based extraction detects organizations by keywords."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         kg = extractor.extract("He works at Acme Company.")
 
@@ -763,7 +688,7 @@ RELATION: Einstein | published_in | 1905"""
 
     def test_extract_detects_person_titles(self) -> None:
         """Test rule-based extraction detects persons by titles."""
-        extractor = KnowledgeGraphExtractor(use_llm=False)
+        extractor = KnowledgeGraphExtractor()
 
         kg = extractor.extract("Dr. Smith was a famous scientist.")
 

@@ -1,403 +1,480 @@
-"""Fact verification tool for quality assurance.
+"""Fact verification state manager.
 
-Verifies generated answers against context by extracting and
-checking individual claims. Helps prevent hallucinations.
+Implements a state management tool for tracking claim verification.
+The calling LLM does all reasoning; this tool tracks claims,
+verification status, and provides consistency analysis.
+
+Architecture:
+    - Tool receives claims and verifications FROM the calling LLM
+    - Tracks claim status (pending, verified, contradicted, unclear)
+    - Provides heuristic consistency checks
+    - Returns verification summary
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Any
 
 from loguru import logger
 
-from src.utils.errors import VerificationException
-from src.utils.retry import retry_with_backoff
-from src.utils.schema import VerificationResult
 
-if TYPE_CHECKING:
-    from src.models.llm_client import LLMClientProtocol
+class ClaimStatus(Enum):
+    """Status of a claim verification."""
+
+    PENDING = "pending"
+    SUPPORTED = "supported"
+    CONTRADICTED = "contradicted"
+    UNCLEAR = "unclear"
 
 
-class FactVerificationTool:
-    """Fact consistency verification for generated answers.
+class SessionStatus(Enum):
+    """Status of a verification session."""
 
-    Extracts factual claims from an answer and verifies each
-    against the provided context. Returns verification confidence
-    and details.
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    ABANDONED = "abandoned"
 
-    Attributes:
-        llm: LLM client for claim extraction and verification.
+
+@dataclass
+class Claim:
+    """A factual claim to verify."""
+
+    claim_id: int
+    content: str
+    status: ClaimStatus = ClaimStatus.PENDING
+    evidence: str | None = None
+    confidence: float | None = None
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "claim_id": self.claim_id,
+            "content": self.content,
+            "status": self.status.value,
+            "evidence": self.evidence,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp.isoformat(),
+        }
+
+
+@dataclass
+class VerificationState:
+    """State of a verification session."""
+
+    session_id: str
+    answer: str
+    context: str
+    claims: list[Claim] = field(default_factory=list)
+    status: SessionStatus = SessionStatus.ACTIVE
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        verified = sum(1 for c in self.claims if c.status == ClaimStatus.SUPPORTED)
+        contradicted = sum(1 for c in self.claims if c.status == ClaimStatus.CONTRADICTED)
+        pending = sum(1 for c in self.claims if c.status == ClaimStatus.PENDING)
+
+        return {
+            "session_id": self.session_id,
+            "answer": self.answer[:200] + "..." if len(self.answer) > 200 else self.answer,
+            "context_length": len(self.context),
+            "claims": [c.to_dict() for c in self.claims],
+            "status": self.status.value,
+            "summary": {
+                "total_claims": len(self.claims),
+                "supported": verified,
+                "contradicted": contradicted,
+                "pending": pending,
+                "unclear": len(self.claims) - verified - contradicted - pending,
+            },
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+class VerificationManager:
+    """Manages fact verification sessions.
+
+    This is a STATE MANAGER, not a verifier. The calling LLM extracts
+    claims and verifies them; this tool tracks the verification state.
+
+    Example usage flow:
+        1. Agent calls: start_verification(answer="...", context="...")
+        2. Agent extracts claims: add_claim(content="Einstein was born in 1879")
+        3. Agent verifies each: verify_claim(claim_id=0, status="supported", evidence="...")
+        4. Agent finalizes: finalize()
 
     """
 
-    def __init__(self, llm_client: LLMClientProtocol) -> None:
-        """Initialize verification tool.
+    def __init__(self) -> None:
+        """Initialize the verification manager."""
+        self._sessions: dict[str, VerificationState] = {}
 
-        Args:
-            llm_client: LLM client for text generation.
-
-        """
-        self.llm = llm_client
-
-    @retry_with_backoff(max_attempts=2, base_delay=1.0)
-    def verify(
+    def start_verification(
         self,
         answer: str,
         context: str,
-        max_claims: int = 10,
-        confidence_threshold: float = 0.7,
-    ) -> VerificationResult:
-        """Verify answer claims against context.
-
-        Algorithm:
-        1. Extract factual claims from answer
-        2. For each claim, check if supported by context
-        3. Calculate overall confidence and verification status
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Start a new verification session.
 
         Args:
-            answer: Answer text to verify.
-            context: Factual context for verification.
-            max_claims: Maximum claims to extract and verify.
-            confidence_threshold: Threshold for "verified" status (0-1).
+            answer: The answer to verify.
+            context: The context to verify against.
+            metadata: Optional metadata.
 
         Returns:
-            VerificationResult with verification status and details.
-
-        Raises:
-            VerificationException: If verification fails due to invalid input.
-
-        Example:
-            >>> tool = FactVerificationTool(llm_client)
-            >>> result = tool.verify(
-            ...     answer="Einstein published relativity in 1905.",
-            ...     context="Albert Einstein published special relativity in 1905..."
-            ... )
-            >>> print(result.verified)  # True
-            >>> print(result.confidence)  # 0.9
+            Session info and guidance.
 
         """
-        # Validate inputs
-        if not answer or not answer.strip():
-            raise VerificationException("Answer cannot be empty")
+        session_id = str(uuid.uuid4())[:8]
+        state = VerificationState(
+            session_id=session_id,
+            answer=answer,
+            context=context,
+            metadata=metadata or {},
+        )
+        self._sessions[session_id] = state
 
-        if not context or not context.strip():
-            raise VerificationException("Context cannot be empty")
+        # Provide heuristic claim suggestions
+        suggested_claims = self._suggest_claims(answer)
 
-        if not 1 <= max_claims <= 20:
-            raise VerificationException(f"max_claims must be 1-20, got {max_claims}")
+        logger.debug(f"Started verification session {session_id}")
 
-        try:
-            # Extract claims from answer
-            claims = self._extract_claims(answer, max_claims)
+        return {
+            "session_id": session_id,
+            "status": "started",
+            "answer_length": len(answer),
+            "context_length": len(context),
+            "suggested_claims": suggested_claims,
+            "instruction": (
+                "Extract factual claims from the answer. "
+                "Call add_claim() for each distinct factual assertion, "
+                "then verify_claim() for each against the context."
+            ),
+        }
 
-            if not claims:
-                return VerificationResult(
-                    verified=True,
-                    confidence=0.5,
-                    claims_verified=0,
-                    claims_total=0,
-                    reason="No verifiable claims found in answer",
-                    claim_details=[],
-                )
-
-            # Verify each claim
-            claim_details: list[dict[str, Any]] = []
-            verified_count = 0
-
-            for claim in claims:
-                result = self._verify_claim(claim, context)
-                claim_details.append(result)
-
-                if result.get("supported", False):
-                    verified_count += 1
-
-            # Calculate confidence
-            confidence = verified_count / len(claims) if claims else 0.5
-            is_verified = confidence >= confidence_threshold
-
-            return VerificationResult(
-                verified=is_verified,
-                confidence=confidence,
-                claims_verified=verified_count,
-                claims_total=len(claims),
-                reason=f"Verified {verified_count}/{len(claims)} claims against context",
-                claim_details=claim_details,
-            )
-
-        except VerificationException:
-            raise
-        except Exception as e:
-            logger.error(f"Verification failed: {e}")
-            raise VerificationException(f"Verification failed: {e!s}") from e
-
-    async def verify_async(
+    def add_claim(
         self,
-        answer: str,
-        context: str,
-        max_claims: int = 10,
-        confidence_threshold: float = 0.7,
-    ) -> VerificationResult:
-        """Verify answer claims against context (async version).
-
-        Uses async LLM calls for claim extraction and verification,
-        enabling non-blocking operation in async contexts.
+        session_id: str,
+        content: str,
+    ) -> dict[str, Any]:
+        """Add a claim to verify.
 
         Args:
-            answer: Answer text to verify.
-            context: Factual context for verification.
-            max_claims: Maximum claims to extract and verify.
-            confidence_threshold: Threshold for "verified" status (0-1).
+            session_id: Session to add claim to.
+            content: The factual claim to verify.
 
         Returns:
-            VerificationResult with verification status and details.
-
-        Raises:
-            VerificationException: If verification fails due to invalid input.
+            Updated state with claim ID.
 
         """
-        # Validate inputs
-        if not answer or not answer.strip():
-            raise VerificationException("Answer cannot be empty")
+        state = self._get_session(session_id)
+        if state.status != SessionStatus.ACTIVE:
+            return {"error": f"Session is {state.status.value}"}
 
-        if not context or not context.strip():
-            raise VerificationException("Context cannot be empty")
+        claim_id = len(state.claims)
+        claim = Claim(claim_id=claim_id, content=content)
+        state.claims.append(claim)
+        state.updated_at = datetime.now()
 
-        if not 1 <= max_claims <= 20:
-            raise VerificationException(f"max_claims must be 1-20, got {max_claims}")
+        # Check for potential issues
+        issues = self._check_claim(state, claim)
 
+        response = {
+            "session_id": session_id,
+            "claim_id": claim_id,
+            "claim": content,
+            "total_claims": len(state.claims),
+            "pending_verification": sum(1 for c in state.claims if c.status == ClaimStatus.PENDING),
+        }
+
+        if issues:
+            response["warnings"] = issues
+
+        response["instruction"] = (
+            f"Verify claim {claim_id} against the context. "
+            f"Call verify_claim(claim_id={claim_id}, status='supported'|'contradicted'|'unclear', "
+            f"evidence='relevant text from context')."
+        )
+
+        logger.debug(f"Added claim {claim_id} to session {session_id}")
+
+        return response
+
+    def verify_claim(
+        self,
+        session_id: str,
+        claim_id: int,
+        status: str,
+        evidence: str | None = None,
+        confidence: float | None = None,
+    ) -> dict[str, Any]:
+        """Verify a claim.
+
+        Args:
+            session_id: Session containing the claim.
+            claim_id: ID of the claim to verify.
+            status: Verification status (supported, contradicted, unclear).
+            evidence: Supporting/contradicting evidence from context.
+            confidence: Confidence in the verification (0-1).
+
+        Returns:
+            Updated verification state.
+
+        """
+        state = self._get_session(session_id)
+        if state.status != SessionStatus.ACTIVE:
+            return {"error": f"Session is {state.status.value}"}
+
+        if claim_id < 0 or claim_id >= len(state.claims):
+            return {"error": f"Invalid claim_id {claim_id}"}
+
+        # Update claim
         try:
-            # Extract claims from answer (async)
-            claims = await self._extract_claims_async(answer, max_claims)
+            claim_status = ClaimStatus(status.lower())
+        except ValueError:
+            return {"error": f"Invalid status '{status}'. Use: supported, contradicted, unclear"}
 
-            if not claims:
-                return VerificationResult(
-                    verified=True,
-                    confidence=0.5,
-                    claims_verified=0,
-                    claims_total=0,
-                    reason="No verifiable claims found in answer",
-                    claim_details=[],
-                )
+        claim = state.claims[claim_id]
+        claim.status = claim_status
+        claim.evidence = evidence
+        claim.confidence = confidence
+        claim.timestamp = datetime.now()
+        state.updated_at = datetime.now()
 
-            # Verify each claim (async, in parallel)
-            import asyncio
-
-            tasks = [self._verify_claim_async(claim, context) for claim in claims]
-            claim_details = await asyncio.gather(*tasks)
-
-            verified_count = sum(1 for r in claim_details if r.get("supported", False))
-
-            # Calculate confidence
-            confidence = verified_count / len(claims) if claims else 0.5
-            is_verified = confidence >= confidence_threshold
-
-            return VerificationResult(
-                verified=is_verified,
-                confidence=confidence,
-                claims_verified=verified_count,
-                claims_total=len(claims),
-                reason=f"Verified {verified_count}/{len(claims)} claims against context",
-                claim_details=list(claim_details),
+        # Check evidence quality
+        issues = []
+        if (
+            evidence
+            and claim_status == ClaimStatus.SUPPORTED
+            and evidence.lower() not in state.context.lower()
+        ):
+            issues.append(
+                "Evidence text not found verbatim in context. "
+                "Ensure you're quoting directly from the provided context."
             )
 
-        except VerificationException:
-            raise
-        except Exception as e:
-            logger.error(f"Async verification failed: {e}")
-            raise VerificationException(f"Verification failed: {e!s}") from e
+        # Summary
+        pending = sum(1 for c in state.claims if c.status == ClaimStatus.PENDING)
+        supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
+        contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
 
-    async def _extract_claims_async(self, text: str, max_claims: int) -> list[str]:
-        """Extract factual claims from text (async version).
+        response = {
+            "session_id": session_id,
+            "claim_id": claim_id,
+            "status": claim_status.value,
+            "summary": {
+                "total": len(state.claims),
+                "supported": supported,
+                "contradicted": contradicted,
+                "pending": pending,
+            },
+        }
+
+        if issues:
+            response["warnings"] = issues
+
+        if pending > 0:
+            next_pending = next(c for c in state.claims if c.status == ClaimStatus.PENDING)
+            response["instruction"] = (
+                f"{pending} claims still pending. "
+                f"Verify claim {next_pending.claim_id}: '{next_pending.content[:50]}...'"
+            )
+            response["next_claim"] = {"id": next_pending.claim_id, "content": next_pending.content}
+        else:
+            response["instruction"] = (
+                "All claims verified. Call finalize() to complete verification."
+            )
+
+        logger.debug(f"Verified claim {claim_id} as {claim_status.value} in session {session_id}")
+
+        return response
+
+    def get_status(self, session_id: str) -> dict[str, Any]:
+        """Get verification status.
 
         Args:
-            text: Text to extract claims from.
-            max_claims: Maximum number of claims.
+            session_id: Session to retrieve.
 
         Returns:
-            List of claim strings.
+            Full verification state.
 
         """
-        try:
-            prompt = f"""Extract the key FACTUAL CLAIMS from this text that can be verified.
-Each claim should be a single, specific statement of fact.
+        state = self._get_session(session_id)
+        return state.to_dict()
 
-Text: {text}
+    def finalize(self, session_id: str) -> dict[str, Any]:
+        """Finalize the verification.
 
-List up to {max_claims} factual claims, one per line (just the claim, no numbering):"""
+        Args:
+            session_id: Session to finalize.
 
-            response = await self.llm.generate_async(prompt, max_tokens=500, temperature=0.3)
+        Returns:
+            Final verification result.
 
-            # Parse response into claims
-            lines = response.strip().split("\n")
-            claims = []
+        """
+        state = self._get_session(session_id)
 
-            for line in lines:
-                # Clean up line
-                claim = line.strip().lstrip("0123456789.-) ").strip()
-                if claim and len(claim.split()) >= 3:  # At least 3 words
-                    claims.append(claim)
+        # Check for pending claims
+        pending = [c for c in state.claims if c.status == ClaimStatus.PENDING]
+        if pending:
+            return {
+                "error": f"{len(pending)} claims still pending verification",
+                "pending_claims": [{"id": c.claim_id, "content": c.content} for c in pending],
+            }
 
-                if len(claims) >= max_claims:
+        state.status = SessionStatus.COMPLETED
+        state.updated_at = datetime.now()
+
+        # Calculate overall result
+        supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
+        contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
+        total = len(state.claims)
+
+        if total == 0:
+            overall_confidence = 1.0
+            verified = True
+        else:
+            overall_confidence = supported / total if total > 0 else 0.0
+            verified = contradicted == 0 and overall_confidence >= 0.5
+
+        logger.info(f"Finalized verification session {session_id}: {supported}/{total} supported")
+
+        return {
+            "session_id": session_id,
+            "status": "completed",
+            "verified": verified,
+            "confidence": round(overall_confidence, 2),
+            "summary": {
+                "total_claims": total,
+                "supported": supported,
+                "contradicted": contradicted,
+                "unclear": total - supported - contradicted,
+            },
+            "claims": [c.to_dict() for c in state.claims],
+            "recommendation": (
+                "Answer appears factually consistent with context."
+                if verified
+                else f"Answer has {contradicted} contradicted claim(s). Review and revise."
+            ),
+        }
+
+    def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
+        """Abandon a verification session."""
+        state = self._get_session(session_id)
+        state.status = SessionStatus.ABANDONED
+        state.metadata["abandon_reason"] = reason
+        state.updated_at = datetime.now()
+
+        return {
+            "session_id": session_id,
+            "status": "abandoned",
+            "reason": reason,
+            "claims_added": len(state.claims),
+        }
+
+    def list_sessions(self) -> dict[str, Any]:
+        """List all verification sessions."""
+        sessions = []
+        for sid, state in self._sessions.items():
+            sessions.append(
+                {
+                    "session_id": sid,
+                    "status": state.status.value,
+                    "claims": len(state.claims),
+                    "created": state.created_at.isoformat(),
+                }
+            )
+        return {"sessions": sessions, "total": len(sessions)}
+
+    def _get_session(self, session_id: str) -> VerificationState:
+        """Get session or raise error."""
+        if session_id not in self._sessions:
+            raise ValueError(f"Session {session_id} not found")
+        return self._sessions[session_id]
+
+    def _suggest_claims(self, answer: str) -> list[str]:
+        """Suggest potential claims to extract (heuristic)."""
+        suggestions = []
+
+        # Look for sentences with factual indicators
+        sentences = re.split(r"[.!?]+", answer)
+        factual_patterns = [
+            r"\b\d{4}\b",  # Years
+            r"\b\d+(?:\.\d+)?%?\b",  # Numbers/percentages
+            r"\b(?:is|was|are|were|has|have|had)\b",  # Being/having verbs
+            r"\b(?:founded|created|invented|discovered|published)\b",  # Action verbs
+            r"\b(?:located|born|died|started|ended)\b",  # State verbs
+        ]
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence) > 20:  # Minimum meaningful length
+                for pattern in factual_patterns:
+                    if re.search(pattern, sentence, re.IGNORECASE):
+                        suggestions.append(sentence)
+                        break
+
+            if len(suggestions) >= 5:  # Limit suggestions
+                break
+
+        return suggestions
+
+    def _check_claim(self, state: VerificationState, claim: Claim) -> list[str]:
+        """Check claim for potential issues."""
+        issues = []
+        content = claim.content.lower()
+
+        # Check if claim is in the answer
+        if claim.content.lower() not in state.answer.lower():
+            # Fuzzy check - at least some overlap
+            claim_words = set(content.split())
+            answer_words = set(state.answer.lower().split())
+            overlap = len(claim_words & answer_words) / len(claim_words) if claim_words else 0
+            if overlap < 0.5:
+                issues.append(
+                    "Claim may not be derived from the answer. "
+                    "Ensure you're extracting claims that appear in the answer text."
+                )
+
+        # Check for vague claims
+        vague_phrases = ["something", "someone", "somewhere", "somehow", "some kind"]
+        if any(phrase in content for phrase in vague_phrases):
+            issues.append("Claim contains vague language. Extract specific factual assertions.")
+
+        # Check for opinion vs fact
+        opinion_phrases = ["i think", "i believe", "probably", "might be", "could be"]
+        if any(phrase in content for phrase in opinion_phrases):
+            issues.append("Claim appears to be an opinion. Extract verifiable facts only.")
+
+        # Check for duplicate claims
+        for existing in state.claims[:-1]:  # Exclude current
+            existing_words = set(existing.content.lower().split())
+            claim_words = set(content.split())
+            if len(existing_words) > 3 and len(claim_words) > 3:
+                overlap = len(existing_words & claim_words) / len(existing_words | claim_words)
+                if overlap > 0.8:
+                    issues.append(
+                        f"Claim similar to existing claim {existing.claim_id}. Avoid duplicates."
+                    )
                     break
 
-            return claims
+        return issues
 
-        except Exception as e:
-            logger.warning(f"Async claim extraction failed: {e}")
-            # Fallback: simple sentence splitting
-            sentences = [s.strip() for s in text.split(".") if s.strip()]
-            return [s for s in sentences if len(s.split()) >= 5][:max_claims]
 
-    async def _verify_claim_async(self, claim: str, context: str) -> dict[str, Any]:
-        """Verify a single claim against context (async version).
+# Global instance for session persistence
+_verification_manager = VerificationManager()
 
-        Args:
-            claim: Claim to verify.
-            context: Context to check against.
 
-        Returns:
-            Dict with claim, supported (bool), confidence, and reason.
-
-        """
-        try:
-            prompt = f"""Is this claim supported by the given context?
-
-CLAIM: {claim}
-
-CONTEXT: {context[:1500]}{"..." if len(context) > 1500 else ""}
-
-Answer with:
-- SUPPORTED: if the context clearly supports this claim
-- CONTRADICTED: if the context contradicts this claim
-- UNCLEAR: if the context doesn't contain relevant information
-
-Then briefly explain why (1 sentence):"""
-
-            response = await self.llm.generate_async(prompt, max_tokens=100, temperature=0.2)
-            response_lower = response.lower()
-
-            # Parse response
-            if "supported" in response_lower[:50]:
-                supported = True
-                confidence = 0.9
-            elif "contradicted" in response_lower[:50]:
-                supported = False
-                confidence = 0.9
-            else:
-                supported = False
-                confidence = 0.5
-
-            return {
-                "claim": claim[:100] + "..." if len(claim) > 100 else claim,
-                "supported": supported,
-                "confidence": confidence,
-                "reason": response[:150] if response else "No explanation",
-            }
-
-        except Exception as e:
-            logger.warning(f"Async claim verification failed: {e}")
-            return {
-                "claim": claim[:100],
-                "supported": False,
-                "confidence": 0.5,
-                "reason": f"Verification error: {e!s}",
-            }
-
-    def _extract_claims(self, text: str, max_claims: int) -> list[str]:
-        """Extract factual claims from text.
-
-        Uses LLM to identify distinct factual statements that can be verified.
-
-        Args:
-            text: Text to extract claims from.
-            max_claims: Maximum number of claims.
-
-        Returns:
-            List of claim strings.
-
-        """
-        try:
-            prompt = f"""Extract the key FACTUAL CLAIMS from this text that can be verified.
-Each claim should be a single, specific statement of fact.
-
-Text: {text}
-
-List up to {max_claims} factual claims, one per line (just the claim, no numbering):"""
-
-            response = self.llm.generate(prompt, max_tokens=500, temperature=0.3)
-
-            # Parse response into claims
-            lines = response.strip().split("\n")
-            claims = []
-
-            for line in lines:
-                # Clean up line
-                claim = line.strip().lstrip("0123456789.-) ").strip()
-                if claim and len(claim.split()) >= 3:  # At least 3 words
-                    claims.append(claim)
-
-                if len(claims) >= max_claims:
-                    break
-
-            return claims
-
-        except Exception as e:
-            logger.warning(f"Claim extraction failed: {e}")
-            # Fallback: simple sentence splitting
-            sentences = [s.strip() for s in text.split(".") if s.strip()]
-            return [s for s in sentences if len(s.split()) >= 5][:max_claims]
-
-    def _verify_claim(self, claim: str, context: str) -> dict[str, Any]:
-        """Verify a single claim against context.
-
-        Args:
-            claim: Claim to verify.
-            context: Context to check against.
-
-        Returns:
-            Dict with claim, supported (bool), confidence, and reason.
-
-        """
-        try:
-            prompt = f"""Is this claim supported by the given context?
-
-CLAIM: {claim}
-
-CONTEXT: {context[:1500]}{"..." if len(context) > 1500 else ""}
-
-Answer with:
-- SUPPORTED: if the context clearly supports this claim
-- CONTRADICTED: if the context contradicts this claim
-- UNCLEAR: if the context doesn't contain relevant information
-
-Then briefly explain why (1 sentence):"""
-
-            response = self.llm.generate(prompt, max_tokens=100, temperature=0.2)
-            response_lower = response.lower()
-
-            # Parse response
-            if "supported" in response_lower[:50]:
-                supported = True
-                confidence = 0.9
-            elif "contradicted" in response_lower[:50]:
-                supported = False
-                confidence = 0.9
-            else:
-                supported = False
-                confidence = 0.5
-
-            return {
-                "claim": claim[:100] + "..." if len(claim) > 100 else claim,
-                "supported": supported,
-                "confidence": confidence,
-                "reason": response[:150] if response else "No explanation",
-            }
-
-        except Exception as e:
-            logger.warning(f"Claim verification failed: {e}")
-            return {
-                "claim": claim[:100],
-                "supported": False,
-                "confidence": 0.5,
-                "reason": f"Verification error: {e!s}",
-            }
+def get_verification_manager() -> VerificationManager:
+    """Get the global verification manager instance."""
+    return _verification_manager

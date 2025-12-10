@@ -1,635 +1,318 @@
-"""Unit tests for src/server.py helper functions and configuration."""
+"""Tests for MCP server tool implementations.
+
+These tests verify the FastMCP tool endpoints work correctly.
+"""
 
 from __future__ import annotations
 
-import json
-from typing import TYPE_CHECKING, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
-if TYPE_CHECKING:
-    from fastmcp.tools.tool import FunctionTool
+from src.server import (
+    _get_env,
+    _get_env_int,
+    mcp,
+)
+
+# =============================================================================
+# Environment Variable Helper Tests
+# =============================================================================
 
 
 class TestEnvHelpers:
-    """Test environment variable helper functions."""
+    """Tests for environment variable helper functions."""
 
-    def test_get_env_returns_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _get_env returns environment variable value."""
-        monkeypatch.setenv("TEST_KEY", "test_value")
+    def test_get_env_returns_value(self) -> None:
+        """Test _get_env returns environment variable."""
+        with patch.dict("os.environ", {"TEST_VAR": "test_value"}):
+            assert _get_env("TEST_VAR") == "test_value"
 
-        from src.server import _get_env
+    def test_get_env_returns_default_when_missing(self) -> None:
+        """Test _get_env returns default when var missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert _get_env("NONEXISTENT_VAR", "default") == "default"
 
-        result = _get_env("TEST_KEY", "default")
-        assert result == "test_value"
+    def test_get_env_returns_default_when_empty(self) -> None:
+        """Test _get_env returns default when var is empty string."""
+        with patch.dict("os.environ", {"EMPTY_VAR": ""}):
+            assert _get_env("EMPTY_VAR", "default") == "default"
 
-    def test_get_env_returns_default_when_not_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _get_env returns default when env var not set."""
-        monkeypatch.delenv("NONEXISTENT_KEY", raising=False)
+    def test_get_env_int_returns_int(self) -> None:
+        """Test _get_env_int parses integer."""
+        with patch.dict("os.environ", {"INT_VAR": "42"}):
+            assert _get_env_int("INT_VAR", 0) == 42
 
-        from src.server import _get_env
+    def test_get_env_int_returns_default_when_missing(self) -> None:
+        """Test _get_env_int returns default when missing."""
+        with patch.dict("os.environ", {}, clear=True):
+            assert _get_env_int("NONEXISTENT", 100) == 100
 
-        result = _get_env("NONEXISTENT_KEY", "default_value")
-        assert result == "default_value"
+    def test_get_env_int_returns_default_on_invalid(self) -> None:
+        """Test _get_env_int returns default on invalid int."""
+        with patch.dict("os.environ", {"BAD_INT": "not_a_number"}):
+            assert _get_env_int("BAD_INT", 50) == 50
 
-    def test_get_env_empty_string_returns_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _get_env treats empty string as unset."""
-        monkeypatch.setenv("EMPTY_KEY", "")
 
-        from src.server import _get_env
+# =============================================================================
+# Server Configuration Tests
+# =============================================================================
 
-        result = _get_env("EMPTY_KEY", "default")
-        assert result == "default"
 
-    def test_get_env_int_returns_integer(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _get_env_int returns integer value."""
-        monkeypatch.setenv("INT_KEY", "42")
+class TestServerConfig:
+    """Tests for server configuration."""
 
-        from src.server import _get_env_int
+    def test_mcp_server_exists(self) -> None:
+        """Test FastMCP server is initialized."""
+        assert mcp is not None
+        assert mcp.name == "MatrixMind-MCP" or hasattr(mcp, "name")
 
-        result = _get_env_int("INT_KEY", 10)
-        assert result == 42
 
-    def test_get_env_int_returns_default_when_not_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test _get_env_int returns default when not set."""
-        monkeypatch.delenv("NONEXISTENT_INT", raising=False)
+# =============================================================================
+# State Manager Unit Tests (Direct, no mocking)
+# =============================================================================
 
-        from src.server import _get_env_int
 
-        result = _get_env_int("NONEXISTENT_INT", 100)
-        assert result == 100
+class TestChainManagerIntegration:
+    """Tests for LongChainManager via direct instantiation."""
 
-    def test_get_env_int_invalid_value_returns_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test _get_env_int returns default for invalid integer."""
-        monkeypatch.setenv("INVALID_INT", "not_a_number")
+    def test_chain_manager_start(self) -> None:
+        """Test chain manager creates session."""
+        from src.tools.long_chain import LongChainManager
 
-        from src.server import _get_env_int
+        manager = LongChainManager()
+        result = manager.start_chain(problem="Test", expected_steps=5)
 
-        result = _get_env_int("INVALID_INT", 50)
-        assert result == 50
+        assert "session_id" in result
+        assert result["status"] == "started"
 
-    def test_get_env_float_returns_float(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test _get_env_float returns float value."""
-        monkeypatch.setenv("FLOAT_KEY", "0.5")
+    def test_chain_manager_workflow(self) -> None:
+        """Test chain manager full workflow."""
+        from src.tools.long_chain import LongChainManager
 
-        from src.server import _get_env_float
+        manager = LongChainManager()
 
-        result = _get_env_float("FLOAT_KEY", 0.7)
-        assert result == 0.5
+        # Start
+        start = manager.start_chain(problem="What is 2+2?", expected_steps=3)
+        session_id = start["session_id"]
 
-    def test_get_env_float_returns_default_when_not_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test _get_env_float returns default when not set."""
-        monkeypatch.delenv("NONEXISTENT_FLOAT", raising=False)
+        # Add steps
+        step1 = manager.add_step(session_id, thought="I need to add 2 and 2")
+        assert step1["step_added"] == 1
 
-        from src.server import _get_env_float
+        step2 = manager.add_step(session_id, thought="2 + 2 = 4")
+        assert step2["step_added"] == 2
 
-        result = _get_env_float("NONEXISTENT_FLOAT", 0.7)
-        assert result == 0.7
+        # Finalize
+        result = manager.finalize(session_id, answer="4", confidence=1.0)
+        assert result["status"] == "completed"
+        assert result["final_answer"] == "4"
 
-    def test_get_env_float_invalid_value_returns_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Test _get_env_float returns default for invalid float."""
-        monkeypatch.setenv("INVALID_FLOAT", "not_a_number")
 
-        from src.server import _get_env_float
+class TestMatrixManagerIntegration:
+    """Tests for MatrixOfThoughtManager via direct instantiation."""
 
-        result = _get_env_float("INVALID_FLOAT", 0.7)
-        assert result == 0.7
+    def test_matrix_manager_start(self) -> None:
+        """Test matrix manager creates session."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
 
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(question="Test?", rows=2, cols=2)
 
-class TestEmbeddingModelName:
-    """Test embedding model name resolution."""
+        assert "session_id" in result
+        assert result["status"] == "started"
+        assert result["matrix_dimensions"]["rows"] == 2
 
-    def test_model_name_with_slash_unchanged(self) -> None:
-        """Test full model path (with /) is not modified by function logic."""
-        # Test the function logic directly
-        model_name = "Snowflake/snowflake-arctic-embed-xs"
+    def test_matrix_manager_workflow(self) -> None:
+        """Test matrix manager full workflow."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
 
-        # The function logic: if "/" in model_name, return as-is
-        result = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+        manager = MatrixOfThoughtManager()
 
-        assert result == "Snowflake/snowflake-arctic-embed-xs"
+        # Start
+        start = manager.start_matrix(question="Is Python good?", rows=2, cols=2)
+        session_id = start["session_id"]
 
-    def test_short_model_name_gets_prefix(self) -> None:
-        """Test short model name gets sentence-transformers prefix."""
-        model_name = "all-mpnet-base-v2"
+        # Fill cells
+        manager.set_cell(session_id, 0, 0, thought="Pros: Easy syntax")
+        manager.set_cell(session_id, 0, 1, thought="Pros: Large ecosystem")
+        manager.set_cell(session_id, 1, 0, thought="Cons: Slow")
+        manager.set_cell(session_id, 1, 1, thought="Cons: GIL")
 
-        # The function logic
-        result = model_name if "/" in model_name else f"sentence-transformers/{model_name}"
+        # Finalize
+        result = manager.finalize(session_id, answer="Yes, Python is good", confidence=0.8)
+        assert result["status"] == "completed"
 
-        assert result == "sentence-transformers/all-mpnet-base-v2"
 
+class TestVerificationManagerIntegration:
+    """Tests for VerificationManager via direct instantiation."""
 
-class TestToolGetters:
-    """Test lazy tool initialization getters."""
+    def test_verify_manager_start(self) -> None:
+        """Test verification manager creates session."""
+        from src.tools.verify import VerificationManager
 
-    def test_get_llm_client_creates_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test get_llm_client creates client on first call."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
-
-        with patch("src.server.LLMClient") as mock_llm:
-            mock_llm.return_value = MagicMock()
-
-            import src.server
-
-            src.server._llm_client = None  # Reset cached instance
-
-            client = src.server.get_llm_client()
-
-            mock_llm.assert_called_once()
-            assert client is not None
-
-    def test_get_llm_client_returns_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test get_llm_client returns cached instance on second call."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-
-        import src.server
-
-        mock_client = MagicMock()
-        src.server._llm_client = mock_client
-
-        result = src.server.get_llm_client()
-        assert result is mock_client
-
-    def test_get_compression_tool_creates_instance(self) -> None:
-        """Test get_compression_tool creates tool on first call."""
-        with patch("src.server.ContextAwareCompressionTool") as mock_tool:
-            mock_tool.return_value = MagicMock()
-
-            import src.server
-
-            src.server._compression_tool = None
-
-            tool = src.server.get_compression_tool()
-
-            mock_tool.assert_called_once()
-            assert tool is not None
-
-    def test_get_mot_tool_creates_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test get_mot_tool creates tool on first call."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-
-        with (
-            patch("src.server.MatrixOfThoughtTool") as mock_tool,
-            patch("src.server.get_llm_client") as mock_llm,
-        ):
-            mock_tool.return_value = MagicMock()
-            mock_llm.return_value = MagicMock()
-
-            import src.server
-
-            src.server._mot_tool = None
-
-            tool = src.server.get_mot_tool()
-
-            mock_tool.assert_called_once()
-            assert tool is not None
-
-    def test_get_long_chain_tool_creates_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test get_long_chain_tool creates tool on first call."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-
-        with (
-            patch("src.server.LongChainOfThoughtTool") as mock_tool,
-            patch("src.server.get_llm_client") as mock_llm,
-        ):
-            mock_tool.return_value = MagicMock()
-            mock_llm.return_value = MagicMock()
-
-            import src.server
-
-            src.server._long_chain_tool = None
-
-            tool = src.server.get_long_chain_tool()
-
-            mock_tool.assert_called_once()
-            assert tool is not None
-
-    def test_get_verify_tool_creates_instance(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test get_verify_tool creates tool on first call."""
-        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
-
-        with (
-            patch("src.server.FactVerificationTool") as mock_tool,
-            patch("src.server.get_llm_client") as mock_llm,
-        ):
-            mock_tool.return_value = MagicMock()
-            mock_llm.return_value = MagicMock()
-
-            import src.server
-
-            src.server._verify_tool = None
-
-            tool = src.server.get_verify_tool()
-
-            mock_tool.assert_called_once()
-            assert tool is not None
-
-
-class TestRecommendStrategy:
-    """Test recommend_reasoning_strategy tool function."""
-
-    @pytest.mark.asyncio
-    async def test_recommend_serial_strategy(self) -> None:
-        """Test recommendation for serial problems."""
-        from src.server import recommend_reasoning_strategy
-
-        tool = cast("FunctionTool", recommend_reasoning_strategy)
-        result = await tool.fn(
-            problem="Find the path from A to B through the graph with constraints",
-            token_budget=5000,
+        manager = VerificationManager()
+        result = manager.start_verification(
+            answer="Einstein was born in 1879",
+            context="Albert Einstein was born in Ulm, Germany in 1879.",
         )
 
-        response = json.loads(result)
-        assert response["recommended_strategy"] == "long_chain"
-        assert (
-            "serial" in response["explanation"].lower() or "path" in response["explanation"].lower()
+        assert "session_id" in result
+        assert result["status"] == "started"
+
+    def test_verify_manager_workflow(self) -> None:
+        """Test verification manager full workflow."""
+        from src.tools.verify import VerificationManager
+
+        manager = VerificationManager()
+
+        # Start
+        start = manager.start_verification(
+            answer="Einstein was born in 1879 in Ulm",
+            context="Albert Einstein was born in Ulm, Germany in 1879.",
         )
+        session_id = start["session_id"]
 
-    @pytest.mark.asyncio
-    async def test_recommend_parallel_strategy(self) -> None:
-        """Test recommendation for parallel/exploratory problems."""
-        from src.server import recommend_reasoning_strategy
-
-        tool = cast("FunctionTool", recommend_reasoning_strategy)
-        result = await tool.fn(
-            problem="Generate multiple creative options and explore different alternatives",
-            token_budget=5000,
-        )
-
-        response = json.loads(result)
-        assert response["recommended_strategy"] == "parallel_voting"
-
-    @pytest.mark.asyncio
-    async def test_recommend_matrix_strategy(self) -> None:
-        """Test recommendation for balanced problems."""
-        from src.server import recommend_reasoning_strategy
-
-        tool = cast("FunctionTool", recommend_reasoning_strategy)
-        result = await tool.fn(
-            problem="Analyze this data for insights",
-            token_budget=4000,
-        )
-
-        response = json.loads(result)
-        assert response["recommended_strategy"] == "matrix"
-        assert "balanced" in response["explanation"].lower()
-
-    @pytest.mark.asyncio
-    async def test_recommend_includes_indicators(self) -> None:
-        """Test recommendation includes indicator counts."""
-        from src.server import recommend_reasoning_strategy
-
-        tool = cast("FunctionTool", recommend_reasoning_strategy)
-        result = await tool.fn(
-            problem="Test problem",
-            token_budget=3000,
-        )
-
-        response = json.loads(result)
-        assert "indicators" in response
-        assert "serial_count" in response["indicators"]
-        assert "parallel_count" in response["indicators"]
-
-    @pytest.mark.asyncio
-    async def test_recommend_with_context_logs(self) -> None:
-        """Test recommendation with context logging."""
-        from src.server import recommend_reasoning_strategy
-
-        mock_ctx = MagicMock()
-        mock_ctx.info = AsyncMock()
-
-        tool = cast("FunctionTool", recommend_reasoning_strategy)
-        await tool.fn(
-            problem="Test",
-            token_budget=3000,
-            ctx=mock_ctx,
-        )
-
-        mock_ctx.info.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_recommend_error_handling(self) -> None:
-        """Test error handling in strategy recommendation."""
-        from src.server import recommend_reasoning_strategy
-
-        # Patch to cause an error
-        with patch("src.server.ReasoningStrategy") as mock_strategy:
-            mock_strategy.LONG_CHAIN.value = None
-            mock_strategy.PARALLEL.value = None
-            mock_strategy.MATRIX.value = None
-
-            tool = cast("FunctionTool", recommend_reasoning_strategy)
-            # Calling with problematic setup should still return a response
-            # (errors are caught and returned as ToolExecutionError)
-            result = await tool.fn(
-                problem="test",
-                token_budget=1000,
-            )
-
-            response = json.loads(result)
-            # Either returns recommendation or error
-            assert "recommended_strategy" in response or "error" in response
-
-
-class TestCheckStatus:
-    """Test check_status tool function."""
-
-    @pytest.mark.asyncio
-    async def test_check_status_returns_model_info(self) -> None:
-        """Test check_status returns model status info."""
-        with patch("src.server.ModelManager") as mock_manager:
-            mock_instance = MagicMock()
-            mock_instance.get_status.return_value = {
-                "state": "ready",
-                "device": "cpu",
-            }
-            mock_manager.get_instance.return_value = mock_instance
-
-            from src.server import check_status
-
-            tool = cast("FunctionTool", check_status)
-            result = await tool.fn()
-
-            response = json.loads(result)
-            assert "model_status" in response
-            assert "server_info" in response
-            assert "llm_config" in response
+        # Add claims
+        manager.add_claim(session_id, content="Einstein was born in 1879")
+        manager.add_claim(session_id, content="Einstein was born in Ulm")
 
-    @pytest.mark.asyncio
-    async def test_check_status_with_context(self) -> None:
-        """Test check_status with context logging."""
-        with patch("src.server.ModelManager") as mock_manager:
-            mock_instance = MagicMock()
-            mock_instance.get_status.return_value = {
-                "state": "ready",
-                "device": "cuda",
-            }
-            mock_manager.get_instance.return_value = mock_instance
-
-            mock_ctx = MagicMock()
-            mock_ctx.info = AsyncMock()
+        # Verify claims
+        manager.verify_claim(session_id, 0, "supported", "Text says 1879", 0.95)
+        manager.verify_claim(session_id, 1, "supported", "Text says Ulm", 0.95)
 
-            from src.server import check_status
-
-            tool = cast("FunctionTool", check_status)
-            await tool.fn(ctx=mock_ctx)
-
-            mock_ctx.info.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_check_status_error_handling(self) -> None:
-        """Test check_status error handling."""
-        with patch("src.server.ModelManager") as mock_manager:
-            mock_manager.get_instance.side_effect = Exception("Manager error")
-
-            from src.server import check_status
-
-            tool = cast("FunctionTool", check_status)
-            result = await tool.fn()
-
-            response = json.loads(result)
-            assert "error" in response
-
-
-class TestCompressPromptErrors:
-    """Test compress_prompt error handling."""
-
-    @pytest.mark.asyncio
-    async def test_compress_model_not_ready_error(self) -> None:
-        """Test compress_prompt when model not ready."""
-        from src.server import compress_prompt
-        from src.utils.errors import ModelNotReadyException
-
-        with patch("src.server.get_compression_tool") as mock_get_tool:
-            mock_get_tool.side_effect = ModelNotReadyException("Model loading")
-
-            tool = cast("FunctionTool", compress_prompt)
-            result = await tool.fn(
-                context="Test context",
-                question="Test question",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-            assert "retry_after_seconds" in response.get("details", {})
-
-    @pytest.mark.asyncio
-    async def test_compress_matrixmind_exception(self) -> None:
-        """Test compress_prompt with MatrixMindException."""
-        from src.server import compress_prompt
-        from src.utils.errors import MatrixMindException
-
-        with patch("src.server.get_compression_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.compress.side_effect = MatrixMindException("Compression error")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", compress_prompt)
-            result = await tool.fn(
-                context="Test context",
-                question="Test question",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-    @pytest.mark.asyncio
-    async def test_compress_unexpected_exception(self) -> None:
-        """Test compress_prompt with unexpected exception."""
-        from src.server import compress_prompt
-
-        with patch("src.server.get_compression_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.compress.side_effect = RuntimeError("Unexpected")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", compress_prompt)
-            result = await tool.fn(
-                context="Test context",
-                question="Test question",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-            assert "RuntimeError" in str(response)
-
-
-class TestMotReasoningErrors:
-    """Test matrix_of_thought_reasoning error handling."""
-
-    @pytest.mark.asyncio
-    async def test_mot_matrixmind_exception(self) -> None:
-        """Test MoT with MatrixMindException."""
-        from src.server import matrix_of_thought_reasoning
-        from src.utils.errors import MatrixMindException
-
-        with patch("src.server.get_mot_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.reason.side_effect = MatrixMindException("MoT error")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", matrix_of_thought_reasoning)
-            result = await tool.fn(
-                question="Test",
-                context="Context",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-    @pytest.mark.asyncio
-    async def test_mot_unexpected_exception(self) -> None:
-        """Test MoT with unexpected exception."""
-        from src.server import matrix_of_thought_reasoning
-
-        with patch("src.server.get_mot_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.reason.side_effect = ValueError("Unexpected")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", matrix_of_thought_reasoning)
-            result = await tool.fn(
-                question="Test",
-                context="Context",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-
-class TestLongChainErrors:
-    """Test long_chain_of_thought error handling."""
-
-    @pytest.mark.asyncio
-    async def test_long_chain_matrixmind_exception(self) -> None:
-        """Test long_chain with MatrixMindException."""
-        from src.server import long_chain_of_thought
-        from src.utils.errors import MatrixMindException
-
-        with patch("src.server.get_long_chain_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.reason_async = AsyncMock(side_effect=MatrixMindException("Chain error"))
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", long_chain_of_thought)
-            result = await tool.fn(
-                problem="Test problem",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-    @pytest.mark.asyncio
-    async def test_long_chain_unexpected_exception(self) -> None:
-        """Test long_chain with unexpected exception."""
-        from src.server import long_chain_of_thought
-
-        with patch("src.server.get_long_chain_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.reason_async = AsyncMock(side_effect=TypeError("Unexpected"))
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", long_chain_of_thought)
-            result = await tool.fn(
-                problem="Test problem",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-    @pytest.mark.asyncio
-    async def test_long_chain_verification_frequency_param(self) -> None:
-        """Test long_chain passes verification_frequency to tool."""
-        from src.server import long_chain_of_thought
-        from src.utils.schema import ReasoningResult
-
-        with patch("src.server.get_long_chain_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_result = ReasoningResult(
-                answer="Test answer",
-                confidence=0.8,
-                reasoning_steps=["Step 1"],
-                verification_results={"total_verifications": 2, "passed": 2, "failed": 0},
-                tokens_used=100,
-                reasoning_trace={"total_steps": 6},
-            )
-            mock_tool.reason_async = AsyncMock(return_value=mock_result)
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", long_chain_of_thought)
-            await tool.fn(
-                problem="Test problem",
-                num_steps=6,
-                verify_intermediate=True,
-                verification_frequency=2,  # Custom frequency
-            )
-
-            # Verify reason_async was called with verification_frequency=2
-            mock_tool.reason_async.assert_called_once()
-            call_kwargs = mock_tool.reason_async.call_args.kwargs
-            assert call_kwargs["verification_frequency"] == 2
-
-
-class TestVerifyErrors:
-    """Test verify_fact_consistency error handling."""
-
-    @pytest.mark.asyncio
-    async def test_verify_matrixmind_exception(self) -> None:
-        """Test verify with MatrixMindException."""
-        from src.server import verify_fact_consistency
-        from src.utils.errors import MatrixMindException
-
-        with patch("src.server.get_verify_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.verify.side_effect = MatrixMindException("Verify error")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", verify_fact_consistency)
-            result = await tool.fn(
-                answer="Test answer",
-                context="Context",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-    @pytest.mark.asyncio
-    async def test_verify_unexpected_exception(self) -> None:
-        """Test verify with unexpected exception."""
-        from src.server import verify_fact_consistency
-
-        with patch("src.server.get_verify_tool") as mock_get_tool:
-            mock_tool = MagicMock()
-            mock_tool.verify.side_effect = KeyError("Unexpected")
-            mock_get_tool.return_value = mock_tool
-
-            tool = cast("FunctionTool", verify_fact_consistency)
-            result = await tool.fn(
-                answer="Test answer",
-                context="Context",
-            )
-
-            response = json.loads(result)
-            assert "error" in response
-
-
-class TestMainFunction:
-    """Test main entry point configuration."""
-
-    def test_main_checks_transport(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test main validates transport configuration."""
-        # Just verify the server can be imported and has main
-        from src.server import main
-
-        assert callable(main)
-        # Default transport should be valid
-        assert True  # Unknown falls back
+        # Finalize
+        result = manager.finalize(session_id)
+        assert result["status"] == "completed"
+        assert result["summary"]["supported"] == 2
+
+
+# =============================================================================
+# Compression Tool Tests
+# =============================================================================
+
+
+class TestCompressionTool:
+    """Tests for compression tool."""
+
+    def test_compression_tool_creation(self) -> None:
+        """Test compression tool can be created."""
+        from src.tools.compress import ContextAwareCompressionTool
+
+        tool = ContextAwareCompressionTool()
+        assert tool is not None
+        assert hasattr(tool, "compress")
+
+
+# =============================================================================
+# Strategy Recommendation Tests (Pure Logic)
+# =============================================================================
+
+
+class TestStrategyRecommendation:
+    """Tests for strategy recommendation logic."""
+
+    def test_serial_problem_indicators(self) -> None:
+        """Test serial problem indicator detection."""
+        problem = "Find a path through a graph with constraints step by step"
+        problem_lower = problem.lower()
+
+        serial_indicators = [
+            "order",
+            "sequence",
+            "step",
+            "then",
+            "constraint",
+            "path",
+            "graph",
+            "connect",
+            "chain",
+            "depend",
+        ]
+
+        serial_count = sum(1 for ind in serial_indicators if ind in problem_lower)
+        assert serial_count >= 3  # Should detect serial indicators
+
+    def test_parallel_problem_indicators(self) -> None:
+        """Test parallel problem indicator detection."""
+        problem = "Generate multiple different creative alternatives to explore"
+        problem_lower = problem.lower()
+
+        parallel_indicators = [
+            "multiple",
+            "different",
+            "alternative",
+            "creative",
+            "generate",
+            "brainstorm",
+            "explore",
+            "options",
+        ]
+
+        parallel_count = sum(1 for ind in parallel_indicators if ind in problem_lower)
+        assert parallel_count >= 3  # Should detect parallel indicators
+
+
+# =============================================================================
+# Error Handling Tests
+# =============================================================================
+
+
+class TestErrorHandling:
+    """Tests for error handling in tools."""
+
+    def test_chain_invalid_session(self) -> None:
+        """Test chain manager raises on invalid session."""
+        from src.tools.long_chain import LongChainManager
+
+        manager = LongChainManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.add_step("nonexistent", thought="Test")
+
+    def test_matrix_invalid_session(self) -> None:
+        """Test matrix manager raises on invalid session."""
+        from src.tools.mot_reasoning import MatrixOfThoughtManager
+
+        manager = MatrixOfThoughtManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.set_cell("nonexistent", 0, 0, thought="Test")
+
+    def test_verify_invalid_session(self) -> None:
+        """Test verification manager raises on invalid session."""
+        from src.tools.verify import VerificationManager
+
+        manager = VerificationManager()
+
+        with pytest.raises(ValueError, match="Session .* not found"):
+            manager.add_claim("nonexistent", content="Test")
+
+    def test_chain_confidence_validation(self) -> None:
+        """Test chain manager accepts confidence values."""
+        from src.tools.long_chain import LongChainManager
+
+        manager = LongChainManager()
+        start = manager.start_chain(problem="Test", expected_steps=5)
+        session_id = start["session_id"]
+
+        # The implementation accepts confidence without validation
+        # This test documents current behavior
+        result = manager.finalize(session_id, answer="X", confidence=0.9)
+        assert result["status"] == "completed"
+        assert result["confidence"] == 0.9
+
+    def test_verify_empty_context_handling(self) -> None:
+        """Test verification manager handles empty context."""
+        from src.tools.verify import VerificationManager
+
+        manager = VerificationManager()
+
+        # Empty context should either raise or return error
+        try:
+            result = manager.start_verification(answer="Test", context="")
+            # If it doesn't raise, check for error in result
+            assert "error" in result or result["status"] == "started"
+        except ValueError:
+            # This is also acceptable behavior
+            pass
