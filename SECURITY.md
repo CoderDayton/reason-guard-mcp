@@ -49,16 +49,16 @@ The following are in scope for security reports:
 
 ## Security Best Practices for Users
 
-### API Key Management
+### Environment Variables
 
 ```bash
-# ✅ DO: Use environment variables
-export OPENAI_API_KEY=sk-...
+# ✅ DO: Use environment variables for configuration
+export LOG_LEVEL=INFO
 
 # ✅ DO: Use .env files (excluded from git)
-echo "OPENAI_API_KEY=sk-..." > .env
+echo "LOG_LEVEL=DEBUG" > .env
 
-# ❌ DON'T: Hardcode in source files
+# ❌ DON'T: Hardcode sensitive values in source files
 # ❌ DON'T: Commit .env files to git
 ```
 
