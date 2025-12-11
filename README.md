@@ -352,14 +352,47 @@ This implementation synthesizes techniques from:
 
 ## Benchmark Results
 
+### Performance Metrics
+
+Run `python examples/benchmark.py --full` to reproduce.
+
+| Operation | p50 | p95 | p99 | Throughput |
+|-----------|-----|-----|-----|------------|
+| Status (baseline) | 4.2ms | 4.9ms | 5.1ms | 298 ops/s |
+| Compress (435 tokens) | 5.4ms | 6.1ms | 6.4ms | — |
+| Chain workflow (3 ops) | 9.7ms | 11.3ms | 11.6ms | — |
+| Matrix workflow (2x2, 8 ops) | 26.4ms | 31.2ms | 36.2ms | — |
+| Verify workflow (4 ops) | 14.4ms | 15.8ms | 16.0ms | — |
+
+### Compression Efficiency
+
+| Context Size | Tokens | Latency | ms/token |
+|--------------|--------|---------|----------|
+| Small | 100 | 6.6ms | 0.066 |
+| Medium | 1,000 | 5.8ms | 0.006 |
+| Large | 5,000 | 9.2ms | 0.002 |
+
+**Key metrics:** 48% token reduction, 100% key information preserved.
+
+### Concurrency Scaling
+
+| Concurrent Sessions | Total Time | Throughput | Errors |
+|---------------------|------------|------------|--------|
+| 1 | 4.2ms | 237 ops/s | 0 |
+| 5 | 13.5ms | 371 ops/s | 0 |
+| 10 | 30.5ms | 328 ops/s | 0 |
+| 20 | 52.7ms | 380 ops/s | 0 |
+
+### Strategy Comparison
+
 | Strategy | Win Rate | Avg Coverage | Avg Time | Best For |
 |----------|----------|--------------|----------|----------|
 | **Matrix of Thought** | **83%** | 0.73 | 8ms | All problem types |
 | Long Chain + MPPA | 14% | 0.72 | 5ms | Math, Logic |
 | Baseline | 1% | 0.34 | 1ms | — |
 
-| Type | MoT | Long Chain | Baseline |
-|------|-----|------------|----------|
+| Problem Type | MoT Wins | Long Chain | Baseline |
+|--------------|----------|------------|----------|
 | Math (25) | **24** | 1 | 0 |
 | Logic (25) | **16** | 7 | 0 |
 | Multi-hop (25) | **24** | 0 | 1 |

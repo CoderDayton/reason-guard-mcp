@@ -209,6 +209,17 @@ class BenchmarkResult:
 # =============================================================================
 
 
+def parse_tool_response(result: Any) -> dict[str, Any]:
+    """Parse tool response content to dict."""
+    from mcp.types import TextContent
+
+    if hasattr(result, "content") and result.content:
+        content = result.content[0]
+        text = content.text if isinstance(content, TextContent) else "{}"
+        return json.loads(text)
+    return {}
+
+
 async def measure_latency(
     fn: Callable[[], Any],
     iterations: int = DEFAULT_ITERATIONS,
@@ -276,7 +287,7 @@ def measure_memory(fn: Callable[[], Any]) -> tuple[MemoryStats, Any]:
     return MemoryStats(
         peak_mb=peak / (1024 * 1024),
         current_mb=current / (1024 * 1024),
-        allocated_blocks=0,  # tracemalloc doesn't expose this easily
+        allocated_blocks=0,
     ), result
 
 
@@ -287,8 +298,6 @@ def measure_memory(fn: Callable[[], Any]) -> tuple[MemoryStats, Any]:
 
 async def bench_compress_latency(client: Any, iterations: int) -> BenchmarkResult:
     """Benchmark compression latency with varying context sizes."""
-    from mcp.types import TextContent
-
     # Medium-sized context (realistic use case)
     context = (
         """
@@ -305,20 +314,21 @@ async def bench_compress_latency(client: Any, iterations: int) -> BenchmarkResul
 
     async def compress_call() -> dict[str, Any]:
         result = await client.call_tool(
-            "compress_prompt",
+            "compress",
             {
                 "context": context,
-                "question": "When did Einstein receive the Nobel Prize?",
-                "compression_ratio": 0.5,
+                "query": "When did Einstein receive the Nobel Prize?",
+                "ratio": 0.5,
             },
         )
-        content = result.content[0]
-        return json.loads(content.text if isinstance(content, TextContent) else "{}")
+        return parse_tool_response(result)
 
     latency, results = await measure_latency(compress_call, iterations)
 
     # Calculate compression stats from results
     valid_results = [r for r in results if isinstance(r, dict) and "error" not in r]
+    compression: CompressionStats | None = None
+
     if valid_results:
         avg_original = sum(r.get("original_tokens", 0) for r in valid_results) / len(valid_results)
         avg_compressed = sum(r.get("compressed_tokens", 0) for r in valid_results) / len(
@@ -327,9 +337,9 @@ async def bench_compress_latency(client: Any, iterations: int) -> BenchmarkResul
         avg_ratio = sum(r.get("compression_ratio", 1) for r in valid_results) / len(valid_results)
 
         # Check if key fact preserved
-        preserved = sum(
-            1 for r in valid_results if "1921" in r.get("compressed_context", "")
-        ) / len(valid_results)
+        preserved = sum(1 for r in valid_results if "1921" in r.get("compressed", "")) / len(
+            valid_results
+        )
 
         compression = CompressionStats(
             original_tokens=int(avg_original),
@@ -338,12 +348,10 @@ async def bench_compress_latency(client: Any, iterations: int) -> BenchmarkResul
             tokens_saved=int(avg_original - avg_compressed),
             preservation_score=preserved,
         )
-    else:
-        compression = None
 
     return BenchmarkResult(
-        name="compress_prompt_latency",
-        category=BenchmarkCategory.LATENCY,
+        name="compress_latency",
+        category=BenchmarkCategory.COMPRESSION,
         latency=latency,
         compression=compression,
         metadata={"context_size": len(context), "target_ratio": 0.5},
@@ -352,8 +360,6 @@ async def bench_compress_latency(client: Any, iterations: int) -> BenchmarkResul
 
 async def bench_compress_sizes(client: Any) -> BenchmarkResult:
     """Benchmark compression across different context sizes."""
-    from mcp.types import TextContent
-
     base_text = "The quick brown fox jumps over the lazy dog. " * 10
 
     sizes = [
@@ -370,23 +376,20 @@ async def bench_compress_sizes(client: Any) -> BenchmarkResult:
             start = time.perf_counter()
             try:
                 result = await client.call_tool(
-                    "compress_prompt",
-                    {
-                        "context": context,
-                        "question": "What does the fox do?",
-                        "compression_ratio": 0.5,
-                    },
+                    "compress",
+                    {"context": context, "query": "What does the fox do?", "ratio": 0.5},
                 )
-                content = result.content[0]
-                resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
+                resp = parse_tool_response(result)
                 elapsed_ms = (time.perf_counter() - start) * 1000
                 samples.append(elapsed_ms)
 
                 if samples and resp.get("original_tokens"):
                     size_metrics[size_name] = {
                         "tokens": resp["original_tokens"],
-                        "latency_ms": statistics.mean(samples),
-                        "ms_per_token": statistics.mean(samples) / resp["original_tokens"],
+                        "latency_ms": round(statistics.mean(samples), 2),
+                        "ms_per_token": round(
+                            statistics.mean(samples) / resp["original_tokens"], 3
+                        ),
                     }
             except Exception:
                 pass
@@ -398,155 +401,128 @@ async def bench_compress_sizes(client: Any) -> BenchmarkResult:
     )
 
 
-async def bench_strategy_recommendation(client: Any, iterations: int) -> BenchmarkResult:
-    """Benchmark strategy recommendation latency."""
-    from mcp.types import TextContent
-
-    problems = [
-        ("serial", "Find a path from A to Z in a graph with 100 nodes."),
-        ("parallel", "What are 5 different approaches to reduce carbon emissions?"),
-        ("matrix", "Compare Python, Rust, and Go for building web services."),
-    ]
-
-    all_samples: list[float] = []
-    strategy_results: dict[str, list[str]] = {p[0]: [] for p in problems}
-
-    for problem_type, problem in problems:
-        for _ in range(iterations // len(problems)):
-            start = time.perf_counter()
-            try:
-                result = await client.call_tool(
-                    "recommend_reasoning_strategy",
-                    {"problem": problem, "token_budget": 5000},
-                )
-                content = result.content[0]
-                resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
-                elapsed_ms = (time.perf_counter() - start) * 1000
-                all_samples.append(elapsed_ms)
-
-                if "recommended_strategy" in resp:
-                    strategy_results[problem_type].append(resp["recommended_strategy"])
-            except Exception:
-                pass
-
-    # Analyze strategy consistency
-    consistency: dict[str, float] = {}
-    for ptype, strategies in strategy_results.items():
-        if strategies:
-            most_common = max(set(strategies), key=strategies.count)
-            consistency[ptype] = strategies.count(most_common) / len(strategies)
-
-    return BenchmarkResult(
-        name="recommend_strategy_latency",
-        category=BenchmarkCategory.STRATEGY,
-        latency=LatencyStats.from_samples(all_samples),
-        metadata={
-            "strategy_consistency": consistency,
-            "problem_types_tested": len(problems),
-        },
-    )
-
-
-async def bench_session_lifecycle(client: Any, iterations: int) -> BenchmarkResult:
-    """Benchmark session creation and management overhead."""
-    from mcp.types import TextContent
-
-    create_samples: list[float] = []
-    step_samples: list[float] = []
-    finalize_samples: list[float] = []
+async def bench_chain_workflow(client: Any, iterations: int) -> BenchmarkResult:
+    """Benchmark chain reasoning workflow (start → continue → finish)."""
+    start_samples: list[float] = []
+    continue_samples: list[float] = []
+    finish_samples: list[float] = []
+    workflow_samples: list[float] = []
 
     for _ in range(iterations):
-        # Measure session creation
+        workflow_start = time.perf_counter()
+
+        # Start chain
         start = time.perf_counter()
         result = await client.call_tool(
-            "chain_start",
-            {"problem": "Test problem", "expected_steps": 3},
+            "think",
+            {"action": "start", "mode": "chain", "problem": "What is 2+2?", "expected_steps": 3},
         )
-        content = result.content[0]
-        resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
-        create_samples.append((time.perf_counter() - start) * 1000)
+        resp = parse_tool_response(result)
+        start_samples.append((time.perf_counter() - start) * 1000)
 
         session_id = resp.get("session_id")
         if not session_id:
             continue
 
-        # Measure step addition
+        # Continue (add step)
         start = time.perf_counter()
         await client.call_tool(
-            "chain_add_step",
-            {"session_id": session_id, "thought": "Step 1 reasoning"},
+            "think",
+            {"action": "continue", "session_id": session_id, "thought": "Let me add 2 and 2"},
         )
-        step_samples.append((time.perf_counter() - start) * 1000)
+        continue_samples.append((time.perf_counter() - start) * 1000)
 
-        # Measure finalization
+        # Finish
         start = time.perf_counter()
         await client.call_tool(
-            "chain_finalize",
-            {"session_id": session_id, "answer": "Result", "confidence": 0.9},
+            "think",
+            {
+                "action": "finish",
+                "session_id": session_id,
+                "thought": "The answer is 4",
+                "confidence": 0.99,
+            },
         )
-        finalize_samples.append((time.perf_counter() - start) * 1000)
+        finish_samples.append((time.perf_counter() - start) * 1000)
+
+        workflow_samples.append((time.perf_counter() - workflow_start) * 1000)
 
     return BenchmarkResult(
-        name="session_lifecycle",
+        name="chain_workflow",
         category=BenchmarkCategory.SESSION,
-        latency=LatencyStats.from_samples(create_samples + step_samples + finalize_samples),
+        latency=LatencyStats.from_samples(workflow_samples),
         metadata={
-            "create_latency": LatencyStats.from_samples(create_samples).to_dict(),
-            "step_latency": LatencyStats.from_samples(step_samples).to_dict(),
-            "finalize_latency": LatencyStats.from_samples(finalize_samples).to_dict(),
+            "start_latency": LatencyStats.from_samples(start_samples).to_dict(),
+            "continue_latency": LatencyStats.from_samples(continue_samples).to_dict(),
+            "finish_latency": LatencyStats.from_samples(finish_samples).to_dict(),
+            "operations_per_workflow": 3,
         },
     )
 
 
 async def bench_matrix_workflow(client: Any, iterations: int) -> BenchmarkResult:
     """Benchmark complete matrix workflow."""
-    from mcp.types import TextContent
-
     workflow_samples: list[float] = []
     cell_samples: list[float] = []
 
     for _ in range(iterations):
         workflow_start = time.perf_counter()
 
-        # Start matrix
+        # Start matrix (2x2 for speed)
         result = await client.call_tool(
-            "matrix_start",
-            {"question": "Evaluate Python for ML", "rows": 2, "cols": 2},
+            "think",
+            {
+                "action": "start",
+                "mode": "matrix",
+                "problem": "Evaluate Python",
+                "rows": 2,
+                "cols": 2,
+            },
         )
-        content = result.content[0]
-        resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
+        resp = parse_tool_response(result)
         session_id = resp.get("session_id")
 
         if not session_id:
             continue
 
         # Fill cells (2x2 = 4 cells)
-        thoughts = [
-            "Good libraries like PyTorch",
-            "Can be slow for large data",
-            "Easy to prototype",
-            "Memory management issues",
-        ]
+        thoughts = ["Good libraries", "Can be slow", "Easy syntax", "Memory issues"]
         for i, thought in enumerate(thoughts):
             row, col = divmod(i, 2)
             start = time.perf_counter()
             await client.call_tool(
-                "matrix_set_cell",
-                {"session_id": session_id, "row": row, "col": col, "thought": thought},
+                "think",
+                {
+                    "action": "continue",
+                    "session_id": session_id,
+                    "row": row,
+                    "col": col,
+                    "thought": thought,
+                },
             )
             cell_samples.append((time.perf_counter() - start) * 1000)
 
         # Synthesize columns
         for col in range(2):
             await client.call_tool(
-                "matrix_synthesize",
-                {"session_id": session_id, "col": col, "synthesis": f"Column {col} summary"},
+                "think",
+                {
+                    "action": "synthesize",
+                    "session_id": session_id,
+                    "col": col,
+                    "thought": f"Column {col} synthesis",
+                },
             )
 
-        # Finalize
+        # Finish
         await client.call_tool(
-            "matrix_finalize",
-            {"session_id": session_id, "answer": "Python is good for ML", "confidence": 0.85},
+            "think",
+            {
+                "action": "finish",
+                "session_id": session_id,
+                "thought": "Python is good for ML",
+                "confidence": 0.85,
+            },
         )
 
         workflow_samples.append((time.perf_counter() - workflow_start) * 1000)
@@ -556,99 +532,125 @@ async def bench_matrix_workflow(client: Any, iterations: int) -> BenchmarkResult
         category=BenchmarkCategory.LATENCY,
         latency=LatencyStats.from_samples(workflow_samples),
         metadata={
-            "workflow_type": "2x2 matrix",
+            "matrix_size": "2x2",
             "cell_latency": LatencyStats.from_samples(cell_samples).to_dict(),
-            "total_operations_per_workflow": 8,  # start + 4 cells + 2 synth + finalize
+            "operations_per_workflow": 8,  # start + 4 cells + 2 synth + finish
         },
     )
 
 
-async def bench_verification_workflow(client: Any, iterations: int) -> BenchmarkResult:
+async def bench_verify_workflow(client: Any, iterations: int) -> BenchmarkResult:
     """Benchmark verification workflow."""
-    from mcp.types import TextContent
-
     workflow_samples: list[float] = []
-    claim_samples: list[float] = []
+    verify_samples: list[float] = []
 
     for _ in range(iterations):
         workflow_start = time.perf_counter()
 
         # Start verification
         result = await client.call_tool(
-            "verify_start",
+            "think",
             {
-                "answer": "Paris is the capital of France. It has 2 million people.",
-                "context": "Paris is the capital of France with ~2.1 million people.",
+                "action": "start",
+                "mode": "verify",
+                "problem": "Paris is the capital of France",
+                "context": "Paris is the capital city of France with ~2 million people.",
             },
         )
-        content = result.content[0]
-        resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
+        resp = parse_tool_response(result)
         session_id = resp.get("session_id")
 
         if not session_id:
             continue
 
-        # Add claims
-        claims = ["Paris is the capital of France", "Paris has 2 million people"]
-        for claim in claims:
-            await client.call_tool(
-                "verify_add_claim",
-                {"session_id": session_id, "claim": claim},
-            )
+        # Add a claim via continue
+        await client.call_tool(
+            "think",
+            {"action": "continue", "session_id": session_id, "thought": "Paris is capital"},
+        )
 
-        # Verify claims
-        for i, status in enumerate(["supported", "supported"]):
-            start = time.perf_counter()
-            await client.call_tool(
-                "verify_claim",
-                {
-                    "session_id": session_id,
-                    "claim_id": str(i),
-                    "status": status,
-                    "evidence": "Found in context",
-                },
-            )
-            claim_samples.append((time.perf_counter() - start) * 1000)
+        # Verify the claim
+        start = time.perf_counter()
+        await client.call_tool(
+            "think",
+            {
+                "action": "verify",
+                "session_id": session_id,
+                "claim_id": 0,
+                "verdict": "supported",
+                "evidence": "Stated in context",
+            },
+        )
+        verify_samples.append((time.perf_counter() - start) * 1000)
 
-        # Finalize
-        await client.call_tool("verify_finalize", {"session_id": session_id})
+        # Finish
+        await client.call_tool("think", {"action": "finish", "session_id": session_id})
 
         workflow_samples.append((time.perf_counter() - workflow_start) * 1000)
 
     return BenchmarkResult(
-        name="verification_workflow",
+        name="verify_workflow",
         category=BenchmarkCategory.LATENCY,
         latency=LatencyStats.from_samples(workflow_samples),
         metadata={
-            "claims_per_workflow": 2,
-            "claim_verification_latency": LatencyStats.from_samples(claim_samples).to_dict(),
+            "verify_latency": LatencyStats.from_samples(verify_samples).to_dict(),
+            "operations_per_workflow": 4,
         },
+    )
+
+
+async def bench_status(client: Any, iterations: int) -> BenchmarkResult:
+    """Benchmark status tool (lightweight operation baseline)."""
+
+    async def status_call() -> dict[str, Any]:
+        result = await client.call_tool("status", {})
+        return parse_tool_response(result)
+
+    latency, _ = await measure_latency(status_call, iterations)
+
+    return BenchmarkResult(
+        name="status_latency",
+        category=BenchmarkCategory.LATENCY,
+        latency=latency,
+        metadata={"operation": "status (baseline)"},
     )
 
 
 async def bench_concurrent_sessions(client: Any) -> BenchmarkResult:
     """Benchmark concurrent session handling."""
-    from mcp.types import TextContent
 
     async def create_and_use_session(session_num: int) -> float:
         start = time.perf_counter()
 
         result = await client.call_tool(
-            "chain_start",
-            {"problem": f"Problem {session_num}", "expected_steps": 2},
+            "think",
+            {
+                "action": "start",
+                "mode": "chain",
+                "problem": f"Problem {session_num}",
+                "expected_steps": 2,
+            },
         )
-        content = result.content[0]
-        resp = json.loads(content.text if isinstance(content, TextContent) else "{}")
+        resp = parse_tool_response(result)
         session_id = resp.get("session_id")
 
         if session_id:
             await client.call_tool(
-                "chain_add_step",
-                {"session_id": session_id, "thought": f"Thought for {session_num}"},
+                "think",
+                {
+                    "action": "continue",
+                    "session_id": session_id,
+                    "thought": f"Thought for {session_num}",
+                },
             )
             await client.call_tool(
-                "chain_finalize",
-                {"session_id": session_id, "answer": f"Answer {session_num}", "confidence": 0.8},
+                "think",
+                {
+                    "action": "finish",
+                    "session_id": session_id,
+                    "thought": f"Answer {session_num}",
+                    "confidence": 0.8,
+                },
             )
 
         return (time.perf_counter() - start) * 1000
@@ -682,16 +684,11 @@ async def bench_concurrent_sessions(client: Any) -> BenchmarkResult:
 
 
 async def bench_throughput(client: Any, duration_s: float = 5.0) -> BenchmarkResult:
-    """Measure sustained throughput."""
-    from mcp.types import TextContent
+    """Measure sustained throughput using status (lightweight op)."""
 
     async def light_operation() -> None:
-        result = await client.call_tool(
-            "recommend_reasoning_strategy",
-            {"problem": "Simple test", "token_budget": 1000},
-        )
-        content = result.content[0]
-        json.loads(content.text if isinstance(content, TextContent) else "{}")
+        result = await client.call_tool("status", {})
+        parse_tool_response(result)
 
     throughput = await measure_throughput(light_operation, duration_s)
 
@@ -699,7 +696,7 @@ async def bench_throughput(client: Any, duration_s: float = 5.0) -> BenchmarkRes
         name="sustained_throughput",
         category=BenchmarkCategory.THROUGHPUT,
         throughput=throughput,
-        metadata={"operation": "recommend_reasoning_strategy", "duration_s": duration_s},
+        metadata={"operation": "status", "duration_s": duration_s},
     )
 
 
@@ -727,86 +724,99 @@ def print_report(results: list[BenchmarkResult], verbose: bool = False) -> None:
             continue
 
         cat_results = by_category[category]
-        print(f"\n┌─ {category.value.upper()} {'─' * (73 - len(category.value))}")
+        print(f"\n{'─' * 78}")
+        print(f"  {category.value.upper()}")
+        print("─" * 78)
 
         for result in cat_results:
-            status = "✅" if result.passed else "❌"
-            print(f"│\n│  {status} {result.name}")
+            status = "PASS" if result.passed else "FAIL"
+            print(f"\n  [{status}] {result.name}")
 
             if result.error:
-                print(f"│     Error: {result.error}")
+                print(f"         Error: {result.error}")
                 continue
 
             # Latency stats
             if result.latency and result.latency.samples > 0:
                 lat = result.latency
-                print(f"│     Latency (n={lat.samples}):")
-                print(f"│       p50: {lat.median_ms:>8.2f} ms")
-                print(f"│       p95: {lat.p95_ms:>8.2f} ms")
-                print(f"│       p99: {lat.p99_ms:>8.2f} ms")
-                print(f"│       min: {lat.min_ms:>8.2f} ms  max: {lat.max_ms:.2f} ms")
+                print(f"         Latency (n={lat.samples}):")
+                print(f"           p50: {lat.median_ms:>8.2f} ms")
+                print(f"           p95: {lat.p95_ms:>8.2f} ms")
+                print(f"           p99: {lat.p99_ms:>8.2f} ms")
+                print(f"           min: {lat.min_ms:>8.2f} ms    max: {lat.max_ms:>8.2f} ms")
 
             # Throughput stats
             if result.throughput:
                 tp = result.throughput
-                print(f"│     Throughput: {tp.ops_per_second:.1f} ops/sec")
-                print(f"│       Total ops: {tp.total_ops}, Errors: {tp.errors}")
+                print(f"         Throughput: {tp.ops_per_second:.1f} ops/sec")
+                print(f"           Total: {tp.total_ops} ops, Errors: {tp.errors}")
                 if tp.total_ops > 0:
                     success_rate = (tp.total_ops - tp.errors) / tp.total_ops * 100
-                    print(f"│       Success rate: {success_rate:.1f}%")
+                    print(f"           Success rate: {success_rate:.1f}%")
 
             # Compression stats
             if result.compression:
                 comp = result.compression
-                print("│     Compression:")
-                print(f"│       Ratio: {comp.compression_ratio:.1%}")
-                print(f"│       Tokens: {comp.original_tokens} → {comp.compressed_tokens}")
-                saved_pct = comp.tokens_saved / comp.original_tokens * 100
-                print(f"│       Saved: {comp.tokens_saved} tokens ({saved_pct:.1f}%)")
-                print(f"│       Key info preserved: {comp.preservation_score:.0%}")
+                print("         Compression:")
+                print(f"           Ratio: {comp.compression_ratio:.1%}")
+                print(f"           Tokens: {comp.original_tokens} -> {comp.compressed_tokens}")
+                saved_pct = (
+                    comp.tokens_saved / comp.original_tokens * 100
+                    if comp.original_tokens > 0
+                    else 0
+                )
+                print(f"           Saved: {comp.tokens_saved} tokens ({saved_pct:.1f}%)")
+                print(f"           Key info preserved: {comp.preservation_score:.0%}")
 
             # Metadata highlights
             if result.metadata and verbose:
-                print("│     Details:")
+                print("         Details:")
                 for key, value in result.metadata.items():
                     if isinstance(value, dict):
-                        print(f"│       {key}:")
+                        print(f"           {key}:")
                         for k, v in value.items():
-                            print(f"│         {k}: {v}")
+                            if isinstance(v, dict):
+                                print(f"             {k}: {v}")
+                            else:
+                                print(f"             {k}: {v}")
                     else:
-                        print(f"│       {key}: {value}")
-
-        print("│")
+                        print(f"           {key}: {value}")
 
     # Summary
-    print("└" + "─" * 77)
     print("\n" + "=" * 78)
-    print("SUMMARY")
+    print("  SUMMARY")
     print("=" * 78)
 
     total = len(results)
     passed = sum(1 for r in results if r.passed)
     failed = total - passed
 
-    print(f"  Tests:  {passed}/{total} passed ({100 * passed / total:.0f}%)")
+    print(f"  Benchmarks: {passed}/{total} passed")
 
     # Key metrics summary
     latency_results = [r for r in results if r.latency and r.latency.samples > 0]
     if latency_results:
+        all_p50 = [r.latency.median_ms for r in latency_results if r.latency]
         all_p95 = [r.latency.p95_ms for r in latency_results if r.latency]
-        print(f"  p95 Latency Range: {min(all_p95):.1f} - {max(all_p95):.1f} ms")
+        print(f"  p50 Range:  {min(all_p50):.1f} - {max(all_p50):.1f} ms")
+        print(f"  p95 Range:  {min(all_p95):.1f} - {max(all_p95):.1f} ms")
 
     throughput_results = [r for r in results if r.throughput]
     if throughput_results:
-        max_throughput = max(
-            r.throughput.ops_per_second for r in throughput_results if r.throughput
+        max_tp = max(r.throughput.ops_per_second for r in throughput_results if r.throughput)
+        print(f"  Peak Throughput: {max_tp:.1f} ops/sec")
+
+    compression_results = [r for r in results if r.compression]
+    if compression_results:
+        avg_ratio = statistics.mean(
+            r.compression.compression_ratio for r in compression_results if r.compression
         )
-        print(f"  Peak Throughput: {max_throughput:.1f} ops/sec")
+        print(f"  Avg Compression: {avg_ratio:.1%}")
 
     if failed > 0:
-        print(f"\n  ❌ {failed} benchmark(s) failed")
+        print(f"\n  {failed} benchmark(s) FAILED")
     else:
-        print("\n  ✅ All benchmarks passed")
+        print("\n  All benchmarks PASSED")
 
     print("=" * 78)
 
@@ -852,32 +862,33 @@ async def run_benchmarks(
     print(f"\nRunning {'full' if full else 'quick'} benchmark ({iterations} iterations)...")
 
     async with Client("src/server.py") as client:
-        # Core latency benchmarks
-        print("  → Compression latency...")
+        # Baseline latency
+        print("  -> Status (baseline)...")
+        results.append(await bench_status(client, iterations))
+
+        # Compression benchmarks
+        print("  -> Compression latency...")
         results.append(await bench_compress_latency(client, iterations))
 
-        print("  → Strategy recommendation...")
-        results.append(await bench_strategy_recommendation(client, iterations))
-
-        print("  → Session lifecycle...")
-        results.append(await bench_session_lifecycle(client, iterations))
-
         # Workflow benchmarks
-        print("  → Matrix workflow...")
+        print("  -> Chain workflow...")
+        results.append(await bench_chain_workflow(client, iterations))
+
+        print("  -> Matrix workflow...")
         results.append(await bench_matrix_workflow(client, iterations // 2))
 
-        print("  → Verification workflow...")
-        results.append(await bench_verification_workflow(client, iterations // 2))
+        print("  -> Verify workflow...")
+        results.append(await bench_verify_workflow(client, iterations // 2))
 
         # Scaling benchmarks (only in full mode)
         if full or compare:
-            print("  → Compression scaling...")
+            print("  -> Compression scaling...")
             results.append(await bench_compress_sizes(client))
 
-            print("  → Concurrent sessions...")
+            print("  -> Concurrent sessions...")
             results.append(await bench_concurrent_sessions(client))
 
-            print("  → Sustained throughput...")
+            print("  -> Sustained throughput...")
             results.append(await bench_throughput(client, duration_s=10.0 if full else 5.0))
 
     return results

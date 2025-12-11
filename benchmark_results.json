@@ -1,0 +1,233 @@
+{
+  "timestamp": "2025-12-11T15:21:17Z",
+  "results": [
+    {
+      "name": "status_latency",
+      "category": "latency",
+      "passed": true,
+      "latency": {
+        "min_ms": 3.81,
+        "max_ms": 5.07,
+        "mean_ms": 4.24,
+        "median_ms": 4.17,
+        "p95_ms": 4.86,
+        "p99_ms": 5.07,
+        "std_dev_ms": 0.3,
+        "samples": 50
+      },
+      "metadata": {
+        "operation": "status (baseline)"
+      }
+    },
+    {
+      "name": "compress_latency",
+      "category": "compression",
+      "passed": true,
+      "latency": {
+        "min_ms": 5.09,
+        "max_ms": 6.41,
+        "mean_ms": 5.48,
+        "median_ms": 5.42,
+        "p95_ms": 6.14,
+        "p99_ms": 6.41,
+        "std_dev_ms": 0.28,
+        "samples": 50
+      },
+      "compression": {
+        "original_tokens": 435,
+        "compressed_tokens": 225,
+        "compression_ratio": 0.517,
+        "tokens_saved": 210,
+        "tokens_saved_pct": 48.3,
+        "preservation_score": 1.0
+      },
+      "metadata": {
+        "context_size": 2430,
+        "target_ratio": 0.5
+      }
+    },
+    {
+      "name": "chain_workflow",
+      "category": "session",
+      "passed": true,
+      "latency": {
+        "min_ms": 8.99,
+        "max_ms": 11.64,
+        "mean_ms": 9.78,
+        "median_ms": 9.66,
+        "p95_ms": 11.34,
+        "p99_ms": 11.64,
+        "std_dev_ms": 0.57,
+        "samples": 50
+      },
+      "metadata": {
+        "start_latency": {
+          "min_ms": 2.88,
+          "max_ms": 4.79,
+          "mean_ms": 3.25,
+          "median_ms": 3.2,
+          "p95_ms": 3.79,
+          "p99_ms": 4.79,
+          "std_dev_ms": 0.3,
+          "samples": 50
+        },
+        "continue_latency": {
+          "min_ms": 2.88,
+          "max_ms": 4.15,
+          "mean_ms": 3.22,
+          "median_ms": 3.17,
+          "p95_ms": 3.68,
+          "p99_ms": 4.15,
+          "std_dev_ms": 0.26,
+          "samples": 50
+        },
+        "finish_latency": {
+          "min_ms": 3.01,
+          "max_ms": 4.25,
+          "mean_ms": 3.31,
+          "median_ms": 3.26,
+          "p95_ms": 3.85,
+          "p99_ms": 4.25,
+          "std_dev_ms": 0.26,
+          "samples": 50
+        },
+        "operations_per_workflow": 3
+      }
+    },
+    {
+      "name": "matrix_workflow",
+      "category": "latency",
+      "passed": true,
+      "latency": {
+        "min_ms": 24.7,
+        "max_ms": 36.15,
+        "mean_ms": 27.15,
+        "median_ms": 26.39,
+        "p95_ms": 31.15,
+        "p99_ms": 36.15,
+        "std_dev_ms": 2.51,
+        "samples": 25
+      },
+      "metadata": {
+        "matrix_size": "2x2",
+        "cell_latency": {
+          "min_ms": 2.91,
+          "max_ms": 4.47,
+          "mean_ms": 3.34,
+          "median_ms": 3.24,
+          "p95_ms": 3.98,
+          "p99_ms": 4.47,
+          "std_dev_ms": 0.31,
+          "samples": 100
+        },
+        "operations_per_workflow": 8
+      }
+    },
+    {
+      "name": "verify_workflow",
+      "category": "latency",
+      "passed": true,
+      "latency": {
+        "min_ms": 13.06,
+        "max_ms": 15.95,
+        "mean_ms": 14.46,
+        "median_ms": 14.4,
+        "p95_ms": 15.76,
+        "p99_ms": 15.95,
+        "std_dev_ms": 0.84,
+        "samples": 25
+      },
+      "metadata": {
+        "verify_latency": {
+          "min_ms": 3.15,
+          "max_ms": 4.41,
+          "mean_ms": 3.69,
+          "median_ms": 3.69,
+          "p95_ms": 4.3,
+          "p99_ms": 4.41,
+          "std_dev_ms": 0.34,
+          "samples": 25
+        },
+        "operations_per_workflow": 4
+      }
+    },
+    {
+      "name": "compress_scaling",
+      "category": "compression",
+      "passed": true,
+      "metadata": {
+        "size_metrics": {
+          "small": {
+            "tokens": 100,
+            "latency_ms": 6.64,
+            "ms_per_token": 0.066
+          },
+          "medium": {
+            "tokens": 1000,
+            "latency_ms": 5.81,
+            "ms_per_token": 0.006
+          },
+          "large": {
+            "tokens": 5000,
+            "latency_ms": 9.23,
+            "ms_per_token": 0.002
+          }
+        }
+      }
+    },
+    {
+      "name": "concurrent_sessions",
+      "category": "throughput",
+      "passed": true,
+      "metadata": {
+        "concurrency_scaling": {
+          "1": {
+            "total_time_ms": 4.21,
+            "avg_per_session_ms": 4.14,
+            "throughput_ops_s": 237.27,
+            "errors": 0
+          },
+          "5": {
+            "total_time_ms": 13.47,
+            "avg_per_session_ms": 11.72,
+            "throughput_ops_s": 371.1,
+            "errors": 0
+          },
+          "10": {
+            "total_time_ms": 30.48,
+            "avg_per_session_ms": 25.65,
+            "throughput_ops_s": 328.06,
+            "errors": 0
+          },
+          "20": {
+            "total_time_ms": 52.68,
+            "avg_per_session_ms": 43.87,
+            "throughput_ops_s": 379.67,
+            "errors": 0
+          }
+        }
+      }
+    },
+    {
+      "name": "sustained_throughput",
+      "category": "throughput",
+      "passed": true,
+      "throughput": {
+        "ops_per_second": 297.65,
+        "total_ops": 2977,
+        "total_duration_s": 10.002,
+        "errors": 0,
+        "success_rate": 100.0
+      },
+      "metadata": {
+        "operation": "status",
+        "duration_s": 10.0
+      }
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 8,
+    "failed": 0
+  }
+}
