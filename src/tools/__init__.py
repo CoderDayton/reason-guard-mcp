@@ -2,12 +2,16 @@
 
 from .compress import ContextAwareCompressionTool
 from .long_chain import (
+    CandidateThought,
     ChainState,
     ChainStatus,
     LongChainManager,
     ReasoningStep,
     StepType,
+    calculate_survival_score,
     get_chain_manager,
+    is_planning_step,
+    should_explore_alternatives,
 )
 from .mot_reasoning import (
     MatrixOfThoughtManager,
@@ -32,6 +36,11 @@ __all__ = [
     "ReasoningStep",
     "StepType",
     "get_chain_manager",
+    # MPPA functions
+    "CandidateThought",
+    "is_planning_step",
+    "calculate_survival_score",
+    "should_explore_alternatives",
     # Matrix of Thought state manager
     "MatrixOfThoughtManager",
     "MatrixState",
