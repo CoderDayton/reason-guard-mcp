@@ -1,13 +1,12 @@
 """Constraint Solving example for MatrixMind MCP Server.
 
-Demonstrates how to use Long Chain of Thought reasoning for
-constraint satisfaction problems that require serial reasoning.
+Demonstrates Long Chain of Thought reasoning for constraint satisfaction
+problems that require serial reasoning steps.
 
 Examples include:
 - Game of 24 (make 24 from 4 numbers)
-- Logic puzzles (Einstein's riddle style)
+- Logic puzzles
 - Path finding with constraints
-- Scheduling problems
 
 Run after starting the server:
     fastmcp run src/server.py
@@ -29,6 +28,12 @@ from mcp.types import TextContent
 load_dotenv()
 
 
+def parse_response(result) -> dict:
+    """Parse MCP tool result to dict."""
+    content = result.content[0]
+    return json.loads(content.text if isinstance(content, TextContent) else "{}")
+
+
 @dataclass
 class ConstraintProblem:
     """A constraint satisfaction problem example."""
@@ -37,31 +42,25 @@ class ConstraintProblem:
     problem: str
     problem_type: str
     expected_steps: int
-    hint: str = ""
+    reasoning_steps: list[str]  # Pre-defined steps (LLM would generate these)
+    answer: str
 
 
-# Example constraint problems
+# Example constraint problems with their reasoning chains
 PROBLEMS = [
     ConstraintProblem(
         name="Game of 24 - Basic",
-        problem="""Using the numbers 3, 4, 5, 6, make the number 24.
-You can use +, -, *, / and each number exactly once.
-Show your work step by step.""",
+        problem="Using 3, 4, 5, 6, make 24. Use +, -, *, / and each number once.",
         problem_type="arithmetic_constraint",
-        expected_steps=6,
-        hint=(
-            "One solution: (6 - 3) * (4 + 5) = 3 * 8 = 24, "
-            "but try (5 - 3) * (6 + 4) = 2 * 10... no. Try 6 / (1 - 3/4) = 24"
-        ),
-    ),
-    ConstraintProblem(
-        name="Game of 24 - Medium",
-        problem="""Using the numbers 1, 5, 5, 5, make the number 24.
-You can use +, -, *, / and each number exactly once.
-Show your work step by step.""",
-        problem_type="arithmetic_constraint",
-        expected_steps=8,
-        hint="Think about: 5 * 5 = 25, 25 - 1 = 24. Then 24 * (5/5) = 24",
+        expected_steps=5,
+        reasoning_steps=[
+            "I need to make 24 using 3, 4, 5, 6 with basic operations.",
+            "Let me try multiplication first: 4 × 6 = 24. Still need 3 and 5.",
+            "If 3 and 5 make 1: (5-3-1... no). Try: (5-3) = 2, then 2 × ... no.",
+            "Different approach: 6 / (1 - 3/4) = 24. Uses 6, 3, 4. Need 5.",
+            "Try: (6 - 3) × (4 + 5 - 5) = 12. No. 4 × (6 - (5-3)) = 16. No.",
+        ],
+        answer="Requires creative grouping. One path: explore (a+b)*(c-d) forms.",
     ),
     ConstraintProblem(
         name="Logic Puzzle - Houses",
@@ -69,247 +68,208 @@ Show your work step by step.""",
 - Alice does not live in the red house.
 - Bob does not live in the blue house.
 - Carol lives in the green house.
-- The person in the red house is not Carol.
-
 Determine who lives in which house.""",
         problem_type="logic_constraint",
-        expected_steps=10,
-        hint="Start with what we know for certain, then eliminate",
+        expected_steps=6,
+        reasoning_steps=[
+            "Given: Alice ≠ Red, Bob ≠ Blue, Carol = Green. Three houses: Red, Blue, Green.",
+            "Since Carol lives in Green, that leaves Red and Blue for Alice and Bob.",
+            "Alice cannot live in Red (given), so Alice must live in Blue.",
+            "That leaves only Red for Bob.",
+            "Verify: Bob in Red (allowed, constraint was Bob ≠ Blue). Alice=Blue, Carol=Green.",
+            "All constraints satisfied: Alice-Blue, Bob-Red, Carol-Green.",
+        ],
+        answer="Alice lives in Blue, Bob lives in Red, Carol lives in Green.",
     ),
     ConstraintProblem(
         name="Path Constraint",
-        problem="""Find a path from A to F in this graph. Visit exactly 4 nodes:
-
-Graph edges:
-A -> B, A -> C
-B -> D, B -> E
-C -> D, C -> F
-D -> F
-E -> F
-
-Find a valid path of exactly 4 nodes from A to F.""",
+        problem="""Find a path from A to F visiting exactly 4 nodes.
+Graph: A→B, A→C, B→D, B→E, C→D, C→F, D→F, E→F""",
         problem_type="graph_constraint",
-        expected_steps=8,
-        hint="Try paths: A->C->D->F (only 4 nodes including start/end)",
-    ),
-    ConstraintProblem(
-        name="Scheduling Constraint",
-        problem="""Schedule 4 meetings (A, B, C, D) into 4 time slots (9am, 10am, 11am, 12pm).
-Constraints:
-- Meeting A must be before meeting B
-- Meeting C cannot be at 9am or 12pm
-- Meeting D must be immediately after meeting C
-- Meeting B cannot be at 10am
-
-Find a valid schedule.""",
-        problem_type="scheduling_constraint",
-        expected_steps=12,
-        hint="C must be at 10am or 11am. If C at 10am, D at 11am...",
-    ),
-    ConstraintProblem(
-        name="Cryptarithmetic",
-        problem="""Solve this cryptarithmetic puzzle:
-    SEND
-  + MORE
-  ------
-   MONEY
-
-Each letter represents a unique digit (0-9).
-Leading digits (S and M) cannot be 0.
-Find the mapping of letters to digits.""",
-        problem_type="cryptarithmetic",
-        expected_steps=15,
-        hint="M must be 1 (carry from addition). S must be 8 or 9...",
+        expected_steps=5,
+        reasoning_steps=[
+            "Need path A to F with exactly 4 nodes (including A and F).",
+            "From A, I can go to B or C.",
+            "Path A→C→F is only 3 nodes. Need one more.",
+            "Path A→C→D→F is exactly 4 nodes: A, C, D, F. Check edges: A→C ✓, C→D ✓, D→F ✓",
+            "Valid path found: A → C → D → F (4 nodes).",
+        ],
+        answer="A → C → D → F",
     ),
 ]
 
 
-async def run_constraint_solving() -> None:
-    """Run constraint solving examples using the MCP server."""
-    try:
-        from fastmcp import Client
-    except ImportError:
-        print("Please install fastmcp: pip install fastmcp")
-        sys.exit(1)
+async def solve_with_chain(client, problem: ConstraintProblem) -> dict:
+    """Solve a constraint problem using Long Chain of Thought."""
+    print(f"\n{'─' * 60}")
+    print(f"Problem: {problem.name}")
+    print(f"Type: {problem.problem_type}")
+    print(f"{'─' * 60}")
+    print(f"\n{problem.problem}\n")
 
-    print("=" * 70)
-    print("Enhanced Chain-of-Thought MCP - Constraint Solving Examples")
-    print("=" * 70)
-    print("\nConstraint satisfaction problems benefit from long-chain serial")
-    print("reasoning where each step builds on previous deductions.")
+    # Step 1: Get strategy recommendation
+    print("► Getting strategy recommendation...")
+    result = await client.call_tool(
+        "recommend_reasoning_strategy",
+        {"problem": problem.problem, "token_budget": 3000},
+    )
+    data = parse_response(result)
+    if "error" not in data:
+        strategy = data.get("recommended_strategy")
+        confidence = data.get("strategy_confidence", 0)
+        print(f"  Recommended: {strategy} ({confidence:.0%} confidence)")
 
-    async with Client("src/server.py") as client:
-        for i, problem in enumerate(PROBLEMS, 1):
-            print(f"\n{'=' * 70}")
-            print(f"Problem {i}: {problem.name}")
-            print(f"Type: {problem.problem_type}")
-            print(f"{'=' * 70}")
-            print(f"\n{problem.problem}")
-            print(f"\nExpected reasoning steps: ~{problem.expected_steps}")
+    # Step 2: Start chain session
+    print("\n► Starting chain reasoning session...")
+    result = await client.call_tool(
+        "chain_start",
+        {"problem": problem.problem, "expected_steps": problem.expected_steps},
+    )
+    data = parse_response(result)
 
-            # Step 1: Get strategy recommendation
-            print("\n--- Step 1: Strategy Recommendation ---")
-            strategy_result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {
-                    "problem": problem.problem,
-                    "token_budget": 4000,
-                },
-            )
-            content = strategy_result.content[0]
-            strategy_data = json.loads(content.text if isinstance(content, TextContent) else "{}")
+    if data.get("error"):
+        print(f"  Error: {data['error']}")
+        return {"error": data["error"]}
 
-            if "error" not in strategy_data:
-                print(f"Recommended: {strategy_data.get('recommended_strategy', 'N/A')}")
-                print(f"Confidence: {strategy_data.get('strategy_confidence', 0):.1%}")
-                print(f"Explanation: {strategy_data.get('explanation', 'N/A')}")
+    session_id = data["session_id"]
+    print(f"  Session: {session_id[:8]}...")
 
-            # Step 2: Use Long Chain of Thought (preferred for constraints)
-            print("\n--- Step 2: Long Chain of Thought Reasoning ---")
-            lc_result = await client.call_tool(
-                "long_chain_of_thought",
-                {
-                    "problem": problem.problem,
-                    "num_steps": problem.expected_steps + 5,  # Extra steps for safety
-                    "verify_intermediate": True,
-                },
-            )
-            lc_content = lc_result.content[0]
-            lc_data = json.loads(lc_content.text if isinstance(lc_content, TextContent) else "{}")
+    # Step 3: Add reasoning steps
+    print("\n► Adding reasoning steps...")
+    for i, thought in enumerate(problem.reasoning_steps, 1):
+        result = await client.call_tool(
+            "chain_add_step",
+            {"session_id": session_id, "thought": thought},
+        )
+        step_data = parse_response(result)
 
-            if "error" in lc_data:
-                print(f"Error: {lc_data['error']}")
-                continue
+        # Show step with any feedback
+        print(f"  Step {i}: {thought[:60]}...")
+        if step_data.get("issues"):
+            for issue in step_data["issues"]:
+                print(f"    ⚠ {issue}")
 
-            print(f"\nFinal Answer: {lc_data.get('answer', 'N/A')}")
-            print(f"Confidence: {lc_data.get('confidence', 0):.1%}")
+    # Step 4: Check progress
+    result = await client.call_tool("chain_get", {"session_id": session_id})
+    data = parse_response(result)
+    print(f"\n► Progress: {data.get('current_step')}/{data.get('expected_steps')} steps")
 
-            verif = lc_data.get("verification_results", {})
-            passed = verif.get("passed", 0)
-            total = verif.get("total_verifications", 0)
-            print(f"Intermediate verifications: {passed}/{total} passed")
+    # Step 5: Finalize
+    print("\n► Finalizing with answer...")
+    result = await client.call_tool(
+        "chain_finalize",
+        {"session_id": session_id, "answer": problem.answer},
+    )
+    data = parse_response(result)
 
-            # Show reasoning chain
-            steps = lc_data.get("reasoning_steps", [])
-            if steps:
-                print(f"\nReasoning chain ({len(steps)} steps):")
-                for j, step in enumerate(steps[:5], 1):
-                    step_preview = step[:80] + "..." if len(step) > 80 else step
-                    print(f"  Step {j}: {step_preview}")
-                if len(steps) > 5:
-                    print(f"  ... and {len(steps) - 5} more steps")
+    print(f"  Status: {data.get('status')}")
+    print(f"  Answer: {problem.answer[:80]}...")
 
-            # Step 3: Also try Matrix of Thought for comparison
-            print("\n--- Step 3: Matrix of Thought (for comparison) ---")
-            mot_result = await client.call_tool(
-                "matrix_of_thought_reasoning",
-                {
-                    "question": problem.problem,
-                    "context": f"Problem type: {problem.problem_type}. Solve step by step.",
-                    "matrix_rows": 3,
-                    "matrix_cols": 3,
-                },
-            )
-            mot_content = mot_result.content[0]
-            mot_text = mot_content.text if isinstance(mot_content, TextContent) else "{}"
-            mot_data = json.loads(mot_text)
-
-            if "error" not in mot_data:
-                print(f"MoT Answer: {mot_data.get('answer', 'N/A')[:100]}...")
-                print(f"MoT Confidence: {mot_data.get('confidence', 0):.1%}")
-
-            print("\n--- Comparison Summary ---")
-            print(f"Long Chain: {lc_data.get('confidence', 0):.1%} confidence")
-            if "error" not in mot_data:
-                print(f"Matrix of Thought: {mot_data.get('confidence', 0):.1%} confidence")
-            print("Expected: Long Chain should perform better on serial constraint problems")
-
-            print("\n" + "-" * 70)
-
-    print("\n" + "=" * 70)
-    print("Constraint Solving Examples Completed!")
-    print("=" * 70)
+    return data
 
 
-async def run_comparison_benchmark() -> None:
-    """Run a simple benchmark comparing strategies."""
-    try:
-        from fastmcp import Client
-    except ImportError:
-        print("Please install fastmcp: pip install fastmcp")
-        sys.exit(1)
+async def solve_with_matrix(client, problem: ConstraintProblem) -> dict:
+    """Solve using Matrix of Thought for comparison."""
+    print("\n► Matrix of Thought (comparison)...")
 
-    print("\n" + "=" * 70)
-    print("Strategy Comparison Benchmark")
-    print("=" * 70)
+    # Start matrix
+    result = await client.call_tool(
+        "matrix_start",
+        {"question": problem.problem, "rows": 2, "cols": 2},
+    )
+    data = parse_response(result)
 
-    # Simple test problems for quick comparison
-    test_problems = [
-        (
-            "Serial",
-            (
-                "Calculate: Start with 2, multiply by 3, add 5, "
-                "divide by 11, multiply by 4. What is the result?"
-            ),
-        ),
-        ("Multi-path", "What are three different ways to travel from New York to Los Angeles?"),
-        ("Constraint", "I have 3 coins totaling 25 cents. What are they?"),
+    if data.get("error"):
+        print(f"  Error: {data['error']}")
+        return {"error": data["error"]}
+
+    session_id = data["session_id"]
+
+    # Fill with condensed reasoning
+    thoughts = [
+        (0, 0, "Identify constraints and variables"),
+        (0, 1, "Apply elimination based on constraints"),
+        (1, 0, "Check remaining possibilities"),
+        (1, 1, "Verify solution satisfies all constraints"),
     ]
 
-    async with Client("src/server.py") as client:
-        print("\n{:<12} {:<15} {:<15} {:<15}".format("Type", "Long Chain", "MoT", "Recommended"))
-        print("-" * 60)
+    for row, col, thought in thoughts:
+        await client.call_tool(
+            "matrix_set_cell",
+            {"session_id": session_id, "row": row, "col": col, "thought": thought},
+        )
 
-        for problem_type, problem in test_problems:
-            # Get recommendation
-            rec_result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {"problem": problem, "token_budget": 2000},
-            )
-            rec_content = rec_result.content[0]
-            rec_text = rec_content.text if isinstance(rec_content, TextContent) else "{}"
-            rec_data = json.loads(rec_text)
-            recommended = rec_data.get("recommended_strategy", "?")
+    # Synthesize
+    await client.call_tool(
+        "matrix_synthesize",
+        {"session_id": session_id, "col": 0, "synthesis": "Constraint analysis complete"},
+    )
+    await client.call_tool(
+        "matrix_synthesize",
+        {"session_id": session_id, "col": 1, "synthesis": "Solution verified"},
+    )
 
-            # Try Long Chain
-            lc_result = await client.call_tool(
-                "long_chain_of_thought",
-                {"problem": problem, "num_steps": 5, "verify_intermediate": False},
-            )
-            lc_content = lc_result.content[0]
-            lc_text = lc_content.text if isinstance(lc_content, TextContent) else "{}"
-            lc_data = json.loads(lc_text)
-            lc_conf = lc_data.get("confidence", 0) if "error" not in lc_data else 0
+    # Finalize
+    result = await client.call_tool(
+        "matrix_finalize",
+        {"session_id": session_id, "answer": problem.answer},
+    )
+    data = parse_response(result)
 
-            # Try MoT
-            mot_result = await client.call_tool(
-                "matrix_of_thought_reasoning",
-                {
-                    "question": problem,
-                    "context": "Solve this problem.",
-                    "matrix_rows": 2,
-                    "matrix_cols": 2,
-                },
-            )
-            mot_content = mot_result.content[0]
-            mot_text = mot_content.text if isinstance(mot_content, TextContent) else "{}"
-            mot_data = json.loads(mot_text)
-            mot_conf = mot_data.get("confidence", 0) if "error" not in mot_data else 0
+    print(f"  Matrix status: {data.get('status')}")
+    return data
 
-            print(
-                "{:<12} {:<15} {:<15} {:<15}".format(
-                    problem_type,
-                    f"{lc_conf:.1%}",
-                    f"{mot_conf:.1%}",
-                    recommended,
-                )
-            )
+
+async def run_comparison_benchmark(client) -> None:
+    """Compare Chain vs Matrix on different problem types."""
+    print("\n" + "=" * 60)
+    print("Strategy Comparison")
+    print("=" * 60)
+
+    test_cases = [
+        ("Serial calculation", "Calculate: 2 × 3 + 4 × 5 - 6 ÷ 2"),
+        ("Multi-path", "List 3 ways to get from NYC to LA"),
+        ("Constraint", "Arrange A, B, C where A < B and B < C"),
+    ]
+
+    print("\n{:<20} {:<20}".format("Problem Type", "Recommended Strategy"))
+    print("─" * 40)
+
+    for problem_type, problem in test_cases:
+        result = await client.call_tool(
+            "recommend_reasoning_strategy",
+            {"problem": problem, "token_budget": 2000},
+        )
+        data = parse_response(result)
+        strategy = data.get("recommended_strategy", "error")
+        print(f"{problem_type:<20} {strategy:<20}")
 
 
 async def main() -> None:
-    """Run all constraint solving demonstrations."""
-    await run_constraint_solving()
-    await run_comparison_benchmark()
+    """Run constraint solving demonstrations."""
+    try:
+        from fastmcp import Client
+    except ImportError:
+        print("Please install fastmcp: pip install fastmcp")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("MatrixMind MCP - Constraint Solving Examples")
+    print("Long Chain of Thought for Serial Reasoning")
+    print("=" * 60)
+
+    async with Client("src/server.py") as client:
+        # Solve each problem
+        for problem in PROBLEMS:
+            await solve_with_chain(client, problem)
+            await solve_with_matrix(client, problem)
+
+        # Run comparison
+        await run_comparison_benchmark(client)
+
+    print("\n" + "=" * 60)
+    print("Constraint Solving Examples Completed!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

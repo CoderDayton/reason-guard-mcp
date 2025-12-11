@@ -1,13 +1,7 @@
 """Multi-hop Question Answering example for MatrixMind MCP Server.
 
-Demonstrates how to use the Matrix of Thought and Long Chain reasoning
-tools for complex multi-hop QA tasks that require connecting multiple
-pieces of information.
-
-Example questions:
-- "Who wrote the paper that introduced the concept used in X?"
-- "What is the capital of the country where Y was born?"
-- "When did the founder of company Z receive their degree?"
+Demonstrates Matrix of Thought and verification for complex multi-hop QA
+tasks that require connecting multiple pieces of information.
 
 Run after starting the server:
     fastmcp run src/server.py
@@ -29,18 +23,25 @@ from mcp.types import TextContent
 load_dotenv()
 
 
+def parse_response(result) -> dict:
+    """Parse MCP tool result to dict."""
+    content = result.content[0]
+    return json.loads(content.text if isinstance(content, TextContent) else "{}")
+
+
 @dataclass
 class MultiHopExample:
-    """A multi-hop QA example with context and question."""
+    """A multi-hop QA example."""
 
     name: str
     context: str
     question: str
     expected_hops: int
-    hint: str = ""
+    matrix_thoughts: dict[tuple[int, int], str]  # Pre-defined thoughts for demo
+    claims: list[tuple[str, str, str]]  # (claim, status, evidence)
+    answer: str
 
 
-# Example multi-hop questions with their contexts
 EXAMPLES = [
     MultiHopExample(
         name="Scientific Discovery Chain",
@@ -48,269 +49,242 @@ EXAMPLES = [
         Marie Curie was a physicist and chemist who conducted pioneering
         research on radioactivity. She was born in Warsaw, Poland in 1867.
         Marie Curie discovered two elements: polonium and radium.
-        Polonium was named after her native country, Poland. She won the
-        Nobel Prize in Physics in 1903, shared with her husband Pierre Curie
-        and Henri Becquerel. In 1911, she won a second Nobel Prize,
-        this time in Chemistry, for her discovery of radium and polonium. She was the first woman to
-        win a Nobel Prize and the first person to win Nobel Prizes in two different sciences.
-        The Pierre and Marie Curie University in Paris was named in honor of both scientists.
-        Marie Curie died in 1934 from aplastic anemia, likely caused by
-        her long-term exposure to radiation.
+        Polonium was named after her native country, Poland.
+        She won the Nobel Prize in Physics in 1903, shared with her husband
+        Pierre Curie and Henri Becquerel. In 1911, she won a second Nobel
+        Prize in Chemistry. She was the first woman to win a Nobel Prize.
         """,
         question="What element did the first female Nobel laureate name after her birth country?",
         expected_hops=3,
-        hint=(
-            "Requires: (1) identify first female Nobel laureate, "
-            "(2) find her birth country, (3) find element named after it"
-        ),
+        matrix_thoughts={
+            (0, 0): "Hop 1: First female Nobel laureate? Marie Curie, 1903.",
+            (0, 1): "Confirming: Marie Curie was the first woman to win a Nobel Prize.",
+            (1, 0): "Hop 2: Where was Marie Curie born? Warsaw, Poland.",
+            (1, 1): "Confirming: Her birth country was Poland.",
+            (2, 0): "Hop 3: Element named after Poland? Polonium.",
+            (2, 1): "Confirming: Polonium was named after her native country.",
+        },
+        claims=[
+            (
+                "Marie Curie was the first female Nobel laureate",
+                "supported",
+                "first woman to win a Nobel Prize",
+            ),
+            ("Marie Curie was born in Poland", "supported", "born in Warsaw, Poland"),
+            (
+                "Polonium was named after Poland",
+                "supported",
+                "named after her native country, Poland",
+            ),
+        ],
+        answer="Polonium",
     ),
     MultiHopExample(
         name="Historical Figure Chain",
         context="""
-        Albert Einstein was born in Ulm, Germany in 1879. He developed the
-        theory of special relativity in 1905 while working at the Swiss
-        Patent Office in Bern. His famous equation E=mc² emerged
-        from this work. In 1915, he published his theory of general relativity. Einstein received
-        the Nobel Prize in Physics in 1921, but not for relativity - it was for his explanation of
-        the photoelectric effect. He emigrated to the United States in 1933 due to the rise of
-        Nazi Germany. Einstein worked at the Institute for Advanced Study in Princeton, New Jersey
-        until his death in 1955. The element einsteinium (Es, atomic number 99) was named after him.
-        Princeton University, where the Institute is located, was founded in 1746.
+        Albert Einstein was born in Ulm, Germany in 1879. He developed
+        the theory of special relativity in 1905 while working at the
+        Swiss Patent Office in Bern. In 1915, he published general relativity.
+        Einstein received the Nobel Prize in Physics in 1921 for the
+        photoelectric effect. He emigrated to the United States in 1933.
+        Einstein worked at the Institute for Advanced Study in Princeton,
+        New Jersey until his death in 1955. Princeton University was
+        founded in 1746.
         """,
-        question=(
-            "In what year was the university founded where Einstein worked after leaving Germany?"
-        ),
+        question="When was the university founded where Einstein worked after leaving Germany?",
         expected_hops=3,
-        hint=(
-            "Requires: (1) where Einstein went after Germany, "
-            "(2) which university, (3) when founded"
-        ),
-    ),
-    MultiHopExample(
-        name="Technology Chain",
-        context="""
-        Tim Berners-Lee invented the World Wide Web in 1989 while working at CERN in Switzerland.
-        He wrote the first web browser called WorldWideWeb (later renamed Nexus). CERN, the
-        European Organization for Nuclear Research, was established in 1954. The organization
-        is located near Geneva on the Franco-Swiss border. Berners-Lee also created HTML
-        (HyperText Markup Language) and HTTP (HyperText Transfer Protocol). He founded the
-        World Wide Web Consortium (W3C) in 1994 at MIT. The W3C develops web standards and
-        guidelines. Berners-Lee was knighted by Queen Elizabeth II in 2004 for his services
-        to the development of the Internet. He currently holds the 3Com Founders Chair at MIT.
-        """,
-        question=(
-            "What organization did the inventor of the World Wide Web establish at MIT, and when?"
-        ),
-        expected_hops=2,
-        hint="Requires: (1) identify WWW inventor, (2) find organization founded at MIT",
-    ),
-    MultiHopExample(
-        name="Geographic Chain",
-        context="""
-        The Amazon River is the largest river by discharge volume of water in the world.
-        It flows through several countries including Brazil, Peru, and Colombia. The river
-        is approximately 6,400 kilometers long. The Amazon rainforest, which the river
-        flows through, is the world's largest tropical rainforest. Brazil is the largest
-        country in South America and the fifth largest in the world. The capital of Brazil
-        is Brasília, which was founded in 1960. Before Brasília, Rio de Janeiro was the
-        capital from 1763 to 1960. São Paulo is the largest city in Brazil and South America.
-        The Amazon basin covers about 40% of South America's landmass.
-        """,
-        question=(
-            "What was the capital before the current capital of the country "
-            "the Amazon mostly flows through?"
-        ),
-        expected_hops=3,
-        hint="Requires: (1) main country of Amazon, (2) current capital, (3) previous capital",
+        matrix_thoughts={
+            (0, 0): "Hop 1: When did Einstein leave Germany? Emigrated to US in 1933.",
+            (0, 1): "Confirming: Einstein left Germany in 1933 due to Nazi rise.",
+            (1, 0): "Hop 2: Where did Einstein work? Institute for Advanced Study, Princeton.",
+            (1, 1): "Confirming: Princeton, New Jersey was his workplace.",
+            (2, 0): "Hop 3: When was Princeton University founded? 1746.",
+            (2, 1): "Confirming: The text states Princeton University was founded in 1746.",
+        },
+        claims=[
+            (
+                "Einstein emigrated to the US in 1933",
+                "supported",
+                "emigrated to the United States in 1933",
+            ),
+            (
+                "Einstein worked at Princeton",
+                "supported",
+                "Institute for Advanced Study in Princeton",
+            ),
+            ("Princeton University was founded in 1746", "supported", "founded in 1746"),
+        ],
+        answer="1746",
     ),
 ]
 
 
-async def run_multi_hop_qa() -> None:
-    """Run multi-hop QA examples using the MCP server."""
-    try:
-        from fastmcp import Client
-    except ImportError:
-        print("Please install fastmcp: pip install fastmcp")
-        sys.exit(1)
+async def solve_multi_hop(client, example: MultiHopExample) -> None:
+    """Solve a multi-hop question using Matrix of Thought + Verification."""
+    print(f"\n{'=' * 60}")
+    print(f"Example: {example.name}")
+    print(f"{'=' * 60}")
+    print(f"\nQuestion: {example.question}")
+    print(f"Expected hops: {example.expected_hops}")
 
-    print("=" * 70)
-    print("Enhanced Chain-of-Thought MCP - Multi-Hop QA Examples")
-    print("=" * 70)
+    # Step 1: Compress context
+    print("\n► Step 1: Compressing context...")
+    result = await client.call_tool(
+        "compress_prompt",
+        {
+            "context": example.context,
+            "question": example.question,
+            "compression_ratio": 0.7,
+        },
+    )
+    data = parse_response(result)
+    compressed = data.get("compressed_context", example.context)
+    print(f"  Tokens: {data.get('original_tokens')} → {data.get('compressed_tokens')}")
 
-    async with Client("src/server.py") as client:
-        for i, example in enumerate(EXAMPLES, 1):
-            print(f"\n{'=' * 70}")
-            print(f"Example {i}: {example.name}")
-            print(f"{'=' * 70}")
-            print(f"\nQuestion: {example.question}")
-            print(f"Expected reasoning hops: {example.expected_hops}")
-            print(f"Hint: {example.hint}")
+    # Step 2: Matrix of Thought reasoning
+    print("\n► Step 2: Matrix of Thought reasoning...")
+    rows = example.expected_hops
+    cols = 2  # Initial thought + confirmation
 
-            # Step 1: Compress context to focus on relevant information
-            print("\n--- Step 1: Compress Context ---")
-            compress_result = await client.call_tool(
-                "compress_prompt",
-                {
-                    "context": example.context,
-                    "question": example.question,
-                    "compression_ratio": 0.6,  # Keep 60% for multi-hop
-                },
+    result = await client.call_tool(
+        "matrix_start",
+        {"question": example.question, "context": compressed, "rows": rows, "cols": cols},
+    )
+    data = parse_response(result)
+
+    if data.get("error"):
+        print(f"  Error: {data['error']}")
+        return
+
+    session_id = data["session_id"]
+    print(f"  Session: {session_id[:8]}... ({rows}x{cols} matrix)")
+
+    # Fill matrix with hop-by-hop reasoning
+    print("\n  Filling matrix cells:")
+    for (row, col), thought in example.matrix_thoughts.items():
+        if row < rows and col < cols:
+            await client.call_tool(
+                "matrix_set_cell",
+                {"session_id": session_id, "row": row, "col": col, "thought": thought},
             )
-            compress_content = compress_result.content[0]
-            compress_text = (
-                compress_content.text if isinstance(compress_content, TextContent) else "{}"
-            )
-            compress_data = json.loads(compress_text)
+            hop_label = f"Hop {row + 1}" if col == 0 else "Confirm"
+            print(f"    [{row},{col}] {hop_label}: {thought[:45]}...")
 
-            if "error" in compress_data:
-                print(f"Compression error: {compress_data['error']}")
-                continue
+    # Synthesize columns
+    print("\n  Synthesizing columns:")
+    await client.call_tool(
+        "matrix_synthesize",
+        {"session_id": session_id, "col": 0, "synthesis": "Initial reasoning chain established"},
+    )
+    await client.call_tool(
+        "matrix_synthesize",
+        {"session_id": session_id, "col": 1, "synthesis": "All hops confirmed from context"},
+    )
+    print("    Col 0: Initial reasoning")
+    print("    Col 1: Confirmations")
 
-            print(
-                f"Compression: {compress_data.get('original_tokens', '?')} -> "
-                f"{compress_data.get('compressed_tokens', '?')} tokens"
-            )
-            print(f"Tokens saved: {compress_data.get('tokens_saved', '?')}")
+    # Finalize matrix
+    result = await client.call_tool(
+        "matrix_finalize",
+        {"session_id": session_id, "answer": example.answer},
+    )
+    data = parse_response(result)
+    print(f"\n  Matrix finalized: {data.get('status')}")
+    print(f"  Answer: {example.answer}")
 
-            compressed_context = compress_data.get("compressed_context", example.context)
+    # Step 3: Verify answer
+    print("\n► Step 3: Verifying answer...")
+    result = await client.call_tool(
+        "verify_start",
+        {"answer": f"The answer is {example.answer}", "context": example.context},
+    )
+    data = parse_response(result)
+    verify_session = data["session_id"]
 
-            # Step 2: Use Matrix of Thought for multi-perspective reasoning
-            print("\n--- Step 2: Matrix of Thought Reasoning ---")
-            mot_result = await client.call_tool(
-                "matrix_of_thought_reasoning",
-                {
-                    "question": example.question,
-                    "context": compressed_context,
-                    "matrix_rows": min(example.expected_hops, 4),  # Match expected hops
-                    "matrix_cols": 4,  # 4 iterations for refinement
-                },
-            )
-            mot_content = mot_result.content[0]
-            mot_data = json.loads(
-                mot_content.text if isinstance(mot_content, TextContent) else "{}"
-            )
+    # Add and verify claims
+    print("\n  Verifying claims:")
+    for claim_text, status, evidence in example.claims:
+        # Add claim
+        result = await client.call_tool(
+            "verify_add_claim",
+            {"session_id": verify_session, "claim": claim_text},
+        )
+        claim_data = parse_response(result)
+        claim_id = claim_data["claim_id"]
 
-            if "error" in mot_data:
-                print(f"MoT error: {mot_data['error']}")
-                continue
+        # Verify claim
+        await client.call_tool(
+            "verify_claim",
+            {
+                "session_id": verify_session,
+                "claim_id": claim_id,
+                "status": status,
+                "evidence": evidence,
+            },
+        )
+        print(f"    ✓ {claim_text[:50]}...")
 
-            print(f"Answer: {mot_data.get('answer', 'N/A')}")
-            print(f"Confidence: {mot_data.get('confidence', 0):.1%}")
-            print(f"Reasoning steps: {mot_data.get('num_reasoning_steps', 0)}")
-
-            # Show first few reasoning steps
-            steps = mot_data.get("reasoning_steps", [])
-            if steps:
-                print("\nKey reasoning steps:")
-                for j, step in enumerate(steps[:3], 1):
-                    print(f"  {j}. {step[:100]}...")
-
-            # Step 3: Verify the answer against context
-            print("\n--- Step 3: Verify Answer ---")
-            verify_result = await client.call_tool(
-                "verify_fact_consistency",
-                {
-                    "answer": mot_data.get("answer", ""),
-                    "context": example.context,  # Use full context for verification
-                    "max_claims": 5,
-                },
-            )
-            verify_content = verify_result.content[0]
-            verify_text = verify_content.text if isinstance(verify_content, TextContent) else "{}"
-            verify_data = json.loads(verify_text)
-
-            if "error" in verify_data:
-                print(f"Verification error: {verify_data['error']}")
-                continue
-
-            print(f"Verified: {verify_data.get('verified', False)}")
-            claims_verified = verify_data.get("claims_verified", 0)
-            claims_total = verify_data.get("claims_total", 0)
-            print(f"Claims verified: {claims_verified}/{claims_total}")
-            print(f"Recommendation: {verify_data.get('recommendation', 'N/A')}")
-
-            # Step 4: For complex questions, also try Long Chain reasoning
-            if example.expected_hops >= 3:
-                print("\n--- Step 4: Long Chain Reasoning (for comparison) ---")
-                long_chain_result = await client.call_tool(
-                    "long_chain_of_thought",
-                    {
-                        "problem": f"Context: {compressed_context}\n\nQuestion: {example.question}",
-                        "num_steps": example.expected_hops * 3,  # More steps for complex chains
-                        "verify_intermediate": True,
-                    },
-                )
-                lc_content = long_chain_result.content[0]
-                lc_data = json.loads(
-                    lc_content.text if isinstance(lc_content, TextContent) else "{}"
-                )
-
-                if "error" not in lc_data:
-                    print(f"Long Chain Answer: {lc_data.get('answer', 'N/A')}")
-                    print(f"Confidence: {lc_data.get('confidence', 0):.1%}")
-                    verif = lc_data.get("verification_results", {})
-                    passed = verif.get("passed", 0)
-                    total = verif.get("total_verifications", 0)
-                    print(f"Intermediate verifications passed: {passed}/{total}")
-
-            print("\n" + "-" * 70)
-
-    print("\n" + "=" * 70)
-    print("Multi-Hop QA Examples Completed!")
-    print("=" * 70)
+    # Finalize verification
+    result = await client.call_tool("verify_finalize", {"session_id": verify_session})
+    data = parse_response(result)
+    summary = data.get("summary", {})
+    print(f"\n  Verification: {'✓ PASSED' if data.get('verified') else '✗ FAILED'}")
+    supported = summary.get("supported", 0)
+    contradicted = summary.get("contradicted", 0)
+    print(f"  Claims: {supported} supported, {contradicted} contradicted")
 
 
-async def run_strategy_recommendation() -> None:
-    """Demonstrate strategy recommendation for different problem types."""
-    try:
-        from fastmcp import Client
-    except ImportError:
-        print("Please install fastmcp: pip install fastmcp")
-        sys.exit(1)
+async def demo_strategy_selection(client) -> None:
+    """Show strategy recommendations for different question types."""
+    print("\n" + "=" * 60)
+    print("Strategy Recommendations for Multi-Hop QA")
+    print("=" * 60)
 
-    print("\n" + "=" * 70)
-    print("Strategy Recommendation Examples")
-    print("=" * 70)
-
-    problems = [
-        ("Multi-hop: Who is the author of the paper that introduced transformers?", 4000),
-        ("Serial: Calculate 2^10 step by step", 2000),
-        ("Creative: Generate multiple ideas for a sustainable energy solution", 5000),
-        ("Constraint: Find a path from A to D in a directed graph", 3000),
+    questions = [
+        ("Single hop", "What year was Einstein born?"),
+        ("Multi-hop (2)", "Where did the person who invented relativity work?"),
+        ("Multi-hop (3)", "When was the university founded where the Nobel laureate worked?"),
+        ("Comparison", "Compare Einstein and Curie's Nobel achievements"),
     ]
 
-    async with Client("src/server.py") as client:
-        for problem, budget in problems:
-            print(f"\nProblem: {problem}")
-            print(f"Token budget: {budget}")
+    print("\n{:<15} {:<20} {:<15}".format("Type", "Strategy", "Confidence"))
+    print("─" * 50)
 
-            result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {
-                    "problem": problem,
-                    "token_budget": budget,
-                },
-            )
-            result_content = result.content[0]
-            data = json.loads(
-                result_content.text if isinstance(result_content, TextContent) else "{}"
-            )
-
-            if "error" in data:
-                print(f"Error: {data['error']}")
-                continue
-
-            print(f"  Recommended: {data.get('recommended_strategy', 'N/A')}")
-            print(f"  Estimated steps: {data.get('estimated_depth_steps', 'N/A')}")
-            print(f"  Confidence: {data.get('strategy_confidence', 0):.1%}")
-            print(f"  Explanation: {data.get('explanation', 'N/A')}")
+    for q_type, question in questions:
+        result = await client.call_tool(
+            "recommend_reasoning_strategy",
+            {"problem": question, "token_budget": 3000},
+        )
+        data = parse_response(result)
+        strategy = data.get("recommended_strategy", "error")
+        confidence = data.get("strategy_confidence", 0)
+        print(f"{q_type:<15} {strategy:<20} {confidence:.0%}")
 
 
 async def main() -> None:
-    """Run all multi-hop QA demonstrations."""
-    await run_multi_hop_qa()
-    await run_strategy_recommendation()
+    """Run multi-hop QA demonstrations."""
+    try:
+        from fastmcp import Client
+    except ImportError:
+        print("Please install fastmcp: pip install fastmcp")
+        sys.exit(1)
+
+    print("=" * 60)
+    print("MatrixMind MCP - Multi-Hop Question Answering")
+    print("Matrix of Thought + Verification Pipeline")
+    print("=" * 60)
+
+    async with Client("src/server.py") as client:
+        # Run each example
+        for example in EXAMPLES:
+            await solve_multi_hop(client, example)
+
+        # Show strategy recommendations
+        await demo_strategy_selection(client)
+
+    print("\n" + "=" * 60)
+    print("Multi-Hop QA Examples Completed!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
