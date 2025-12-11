@@ -1,7 +1,6 @@
-"""End-to-end tests for MCP protocol compliance.
+"""End-to-end tests for MCP protocol integration.
 
-Tests the actual MCP server through the protocol layer using FastMCP's Client.
-This verifies that tools are properly exposed and callable via MCP.
+These tests verify the full MCP protocol flow using FastMCP Client.
 """
 
 from __future__ import annotations
@@ -12,11 +11,11 @@ import pytest
 
 
 class TestMCPProtocol:
-    """Test MCP protocol compliance through actual server communication."""
+    """Test MCP protocol compliance and tool registration."""
 
     @pytest.mark.asyncio
-    async def test_server_lists_all_tools(self) -> None:
-        """Test that server exposes all expected tools via MCP protocol."""
+    async def test_tools_registered(self) -> None:
+        """Test that all expected tools are registered."""
         from fastmcp import Client
 
         from src.server import mcp
@@ -26,28 +25,10 @@ class TestMCPProtocol:
 
             tool_names = {tool.name for tool in tools}
             expected_tools = {
-                # Compression
-                "compress_prompt",
-                # Long Chain (multi-call)
-                "chain_start",
-                "chain_add_step",
-                "chain_finalize",
-                "chain_get",
-                # Matrix of Thought (multi-call)
-                "matrix_start",
-                "matrix_set_cell",
-                "matrix_synthesize",
-                "matrix_finalize",
-                "matrix_get",
-                # Verification (multi-call)
-                "verify_start",
-                "verify_add_claim",
-                "verify_claim",
-                "verify_finalize",
-                "verify_get",
-                # Utilities
-                "recommend_reasoning_strategy",
-                "check_status",
+                # Consolidated tools (3 total)
+                "think",
+                "compress",
+                "status",
             }
 
             missing = expected_tools - tool_names
@@ -55,103 +36,77 @@ class TestMCPProtocol:
             assert tool_names == expected_tools, f"Missing: {missing}, Extra: {extra}"
 
     @pytest.mark.asyncio
-    async def test_tool_schemas_are_valid(self) -> None:
-        """Test that all tools have valid JSON schemas for their parameters."""
+    async def test_status_tool(self) -> None:
+        """Test status tool returns server info via MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
         async with Client(mcp) as client:
-            tools = await client.list_tools()
-
-            for tool in tools:
-                # Each tool should have an inputSchema
-                assert tool.inputSchema is not None, f"Tool {tool.name} missing inputSchema"
-                assert "type" in tool.inputSchema, f"Tool {tool.name} schema missing type"
-                assert tool.inputSchema["type"] == "object"
-
-                # Verify required fields are defined
-                if "required" in tool.inputSchema:
-                    assert isinstance(tool.inputSchema["required"], list)
-
-    @pytest.mark.asyncio
-    async def test_recommend_strategy_tool_callable(self) -> None:
-        """Test recommend_reasoning_strategy tool via MCP protocol.
-
-        This tool doesn't require session state, so it's a good E2E test target.
-        """
-        from fastmcp import Client
-
-        from src.server import mcp
-
-        async with Client(mcp) as client:
-            result = await client.call_tool(
-                "recommend_reasoning_strategy",
-                {"problem": "What is 2 + 2?", "token_budget": 2000},
-            )
-
-            # CallToolResult has .content, .data, .is_error
+            result = await client.call_tool("status", {})
             assert not result.is_error, f"Tool returned error: {result.data}"
-            assert len(result.content) == 1
 
-            # Parse the JSON response
             response = json.loads(result.data)
-
-            # Verify response structure
-            assert "recommended_strategy" in response
-            assert "explanation" in response
-            assert response["recommended_strategy"] in [
-                "long_chain",
-                "matrix",
-                "parallel_voting",
-            ]
+            assert "server" in response
+            assert "active_sessions" in response
 
     @pytest.mark.asyncio
-    async def test_chain_workflow_via_mcp(self) -> None:
-        """Test complete chain workflow through MCP protocol."""
+    async def test_think_chain_workflow_via_mcp(self) -> None:
+        """Test complete chain workflow through MCP protocol using think tool."""
         from fastmcp import Client
 
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # Step 1: Start chain (parameter is 'expected_steps', not 'planned_steps')
+            # Step 1: Start chain
             result = await client.call_tool(
-                "chain_start",
-                {"problem": "What is 2 + 2?", "expected_steps": 3},
+                "think",
+                {
+                    "action": "start",
+                    "mode": "chain",
+                    "problem": "What is 2 + 2?",
+                    "expected_steps": 3,
+                },
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "started"
+            assert response["mode"] == "chain"
             session_id = response["session_id"]
 
-            # Step 2: Add steps (parameter is 'thought', not 'step_content')
+            # Step 2: Add steps with continue action
             result = await client.call_tool(
-                "chain_add_step",
-                {"session_id": session_id, "thought": "First, identify the operands: 2 and 2"},
-            )
-            assert not result.is_error
-            response = json.loads(result.data)
-            assert "current_step" in response or "instruction" in response  # Verify valid response
-
-            result = await client.call_tool(
-                "chain_add_step",
-                {"session_id": session_id, "thought": "Apply addition: 2 + 2 = 4"},
+                "think",
+                {
+                    "action": "continue",
+                    "session_id": session_id,
+                    "thought": "First, identify the operands: 2 and 2",
+                },
             )
             assert not result.is_error
 
-            # Step 3: Finalize (parameter is 'answer', not 'final_answer')
             result = await client.call_tool(
-                "chain_finalize",
-                {"session_id": session_id, "answer": "The answer is 4"},
+                "think",
+                {
+                    "action": "continue",
+                    "session_id": session_id,
+                    "thought": "Apply addition: 2 + 2 = 4",
+                },
+            )
+            assert not result.is_error
+
+            # Step 3: Finish
+            result = await client.call_tool(
+                "think",
+                {"action": "finish", "session_id": session_id, "thought": "The answer is 4"},
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "completed"
-            assert "chain" in response  # Chain contains the reasoning steps
 
     @pytest.mark.asyncio
-    async def test_matrix_workflow_via_mcp(self) -> None:
-        """Test complete matrix workflow through MCP protocol."""
+    async def test_think_matrix_workflow_via_mcp(self) -> None:
+        """Test complete matrix workflow through MCP protocol using think tool."""
         from fastmcp import Client
 
         from src.server import mcp
@@ -159,20 +114,28 @@ class TestMCPProtocol:
         async with Client(mcp) as client:
             # Step 1: Start matrix
             result = await client.call_tool(
-                "matrix_start",
-                {"question": "What is AI?", "rows": 2, "cols": 2},
+                "think",
+                {
+                    "action": "start",
+                    "mode": "matrix",
+                    "problem": "What is AI?",
+                    "rows": 2,
+                    "cols": 2,
+                },
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "started"
+            assert response["mode"] == "matrix"
             session_id = response["session_id"]
 
-            # Step 2: Set cells (parameter is 'thought', not 'content')
+            # Step 2: Set cells with continue action
             for row in range(2):
                 for col in range(2):
                     result = await client.call_tool(
-                        "matrix_set_cell",
+                        "think",
                         {
+                            "action": "continue",
                             "session_id": session_id,
                             "row": row,
                             "col": col,
@@ -181,31 +144,45 @@ class TestMCPProtocol:
                     )
                     assert not result.is_error
 
-            # Step 3: Synthesize (requires col parameter)
+            # Step 3: Synthesize columns
             result = await client.call_tool(
-                "matrix_synthesize",
-                {"session_id": session_id, "col": 0, "synthesis": "Column 0 synthesis"},
+                "think",
+                {
+                    "action": "synthesize",
+                    "session_id": session_id,
+                    "col": 0,
+                    "thought": "Column 0 synthesis",
+                },
             )
             assert not result.is_error
 
             result = await client.call_tool(
-                "matrix_synthesize",
-                {"session_id": session_id, "col": 1, "synthesis": "Column 1 synthesis"},
+                "think",
+                {
+                    "action": "synthesize",
+                    "session_id": session_id,
+                    "col": 1,
+                    "thought": "Column 1 synthesis",
+                },
             )
             assert not result.is_error
 
-            # Step 4: Finalize (parameter is 'answer', not 'final_answer')
+            # Step 4: Finish
             result = await client.call_tool(
-                "matrix_finalize",
-                {"session_id": session_id, "answer": "AI is the simulation of human intelligence"},
+                "think",
+                {
+                    "action": "finish",
+                    "session_id": session_id,
+                    "thought": "AI is the simulation of human intelligence",
+                },
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "completed"
 
     @pytest.mark.asyncio
-    async def test_verify_workflow_via_mcp(self) -> None:
-        """Test complete verification workflow through MCP protocol."""
+    async def test_think_verify_workflow_via_mcp(self) -> None:
+        """Test complete verification workflow through MCP protocol using think tool."""
         from fastmcp import Client
 
         from src.server import mcp
@@ -213,21 +190,28 @@ class TestMCPProtocol:
         async with Client(mcp) as client:
             # Step 1: Start verification
             result = await client.call_tool(
-                "verify_start",
+                "think",
                 {
-                    "answer": "Einstein was a physicist",
+                    "action": "start",
+                    "mode": "verify",
+                    "problem": "Einstein was a physicist",
                     "context": "Albert Einstein was a theoretical physicist.",
                 },
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "started"
+            assert response["mode"] == "verify"
             session_id = response["session_id"]
 
-            # Step 2: Add claim
+            # Step 2: Add claim with continue action
             result = await client.call_tool(
-                "verify_add_claim",
-                {"session_id": session_id, "claim": "Einstein was a physicist"},
+                "think",
+                {
+                    "action": "continue",
+                    "session_id": session_id,
+                    "thought": "Einstein was a physicist",
+                },
             )
             assert not result.is_error
             response = json.loads(result.data)
@@ -235,64 +219,62 @@ class TestMCPProtocol:
 
             # Step 3: Verify claim
             result = await client.call_tool(
-                "verify_claim",
+                "think",
                 {
+                    "action": "verify",
                     "session_id": session_id,
                     "claim_id": claim_id,
-                    "status": "supported",
+                    "verdict": "supported",
                     "evidence": "Context confirms this",
                 },
             )
             assert not result.is_error
 
-            # Step 4: Finalize verification session
+            # Step 4: Finish verification
             result = await client.call_tool(
-                "verify_finalize",
-                {"session_id": session_id},
+                "think",
+                {"action": "finish", "session_id": session_id},
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["verified"] is True
 
     @pytest.mark.asyncio
-    async def test_tool_error_handling(self) -> None:
-        """Test that tool errors are properly propagated through MCP protocol."""
+    async def test_think_error_handling(self) -> None:
+        """Test that think tool errors are properly propagated through MCP protocol."""
         from fastmcp import Client
 
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # Call with invalid session_id (use 'thought' param)
+            # Call with invalid session_id
             result = await client.call_tool(
-                "chain_add_step",
-                {"session_id": "invalid-session-id", "thought": "Test step"},
+                "think",
+                {"action": "continue", "session_id": "invalid-session-id", "thought": "Test step"},
             )
 
-            # Should return error
+            # Should return error in response
             response = json.loads(result.data)
             assert "error" in response
 
     @pytest.mark.asyncio
-    async def test_check_status_tool(self) -> None:
-        """Test check_status tool via MCP protocol."""
+    async def test_think_invalid_action(self) -> None:
+        """Test that invalid action is rejected by FastMCP validation."""
         from fastmcp import Client
 
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # check_status returns general server status with active_sessions
-            result = await client.call_tool(
-                "check_status",
-                {},
-            )
-            assert not result.is_error
-            response = json.loads(result.data)
-            assert "active_sessions" in response
-            assert "server_info" in response
+            # FastMCP validates Literal types at call time and raises an exception
+            with pytest.raises(Exception):  # noqa: B017 - ValidationError wrapped by FastMCP
+                await client.call_tool(
+                    "think",
+                    {"action": "invalid_action"},
+                )
 
     @pytest.mark.asyncio
-    async def test_chain_get_session_status(self) -> None:
-        """Test chain_get tool to check session status via MCP protocol."""
+    async def test_status_with_session(self) -> None:
+        """Test status tool with session_id returns session status."""
         from fastmcp import Client
 
         from src.server import mcp
@@ -300,20 +282,39 @@ class TestMCPProtocol:
         async with Client(mcp) as client:
             # Start a chain session
             result = await client.call_tool(
-                "chain_start",
-                {"problem": "Test problem"},
+                "think",
+                {"action": "start", "mode": "chain", "problem": "Test problem"},
             )
             response = json.loads(result.data)
             session_id = response["session_id"]
 
-            # Check session status via chain_get
+            # Check session status
             result = await client.call_tool(
-                "chain_get",
+                "status",
                 {"session_id": session_id},
             )
             assert not result.is_error
             response = json.loads(result.data)
             assert response["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_compress_tool(self) -> None:
+        """Test compress tool via MCP protocol."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            long_text = "This is important information about the topic. " * 30
+
+            result = await client.call_tool(
+                "compress",
+                {"context": long_text, "query": "What is important?", "ratio": 0.3},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "compressed" in response
+            assert response["compression_ratio"] <= 0.5  # Should be compressed
 
 
 class TestMCPServerInitialization:
@@ -326,7 +327,7 @@ class TestMCPServerInitialization:
 
         # FastMCP stores instructions in the server
         assert mcp.instructions is not None
-        assert "chain" in mcp.instructions.lower() or "matrix" in mcp.instructions.lower()
+        assert "think" in mcp.instructions.lower()
 
     @pytest.mark.asyncio
     async def test_server_name_configured(self) -> None:

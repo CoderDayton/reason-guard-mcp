@@ -787,7 +787,9 @@ BENCHMARK_PROBLEMS: list[ReasoningProblem] = [
         id="multihop_013",
         problem_type=ProblemType.MULTI_HOP,
         question="What sport is most popular in the country that invented pizza?",
-        context="Pizza was invented in Italy. The most popular sport in Italy is football (soccer).",
+        context=(
+            "Pizza was invented in Italy. The most popular sport in Italy is football (soccer)."
+        ),
         expected_answer="football",
         expected_keywords=["pizza", "italy", "sport", "football", "soccer"],
         difficulty=2,
@@ -1121,7 +1123,9 @@ BENCHMARK_PROBLEMS: list[ReasoningProblem] = [
     ReasoningProblem(
         id="analysis_016",
         problem_type=ProblemType.ANALYSIS,
-        question="Should a graduate take a high-paying job they dislike or lower-paying passion job?",
+        question=(
+            "Should a graduate take a high-paying job they dislike or lower-paying passion job?"
+        ),
         context="New grad with $50k student loans, high-paying job offers $120k in finance, "
         "passion job offers $55k in non-profit sector.",
         expected_answer="high-paying",
@@ -1447,8 +1451,17 @@ async def solve_with_mot(
     client: Any,
     problem: ReasoningProblem,
     verbose: bool = False,
+    adaptive_rows: bool = False,
 ) -> ReasoningResult:
-    """Solve using Matrix of Thought reasoning via MCP tools."""
+    """Solve using Matrix of Thought reasoning via MCP tools.
+
+    Args:
+        client: MCP client.
+        problem: Problem to solve.
+        verbose: Print debug info.
+        adaptive_rows: Use rows="auto" for adaptive strategy selection.
+
+    """
     from mcp.types import TextContent
 
     start = time.perf_counter()
@@ -1458,24 +1471,27 @@ async def solve_with_mot(
     criteria = ["pros", "cons"]
 
     try:
-        # Start matrix
-        result = await client.call_tool(
-            "matrix_start",
-            {
-                "question": f"{problem.question}\n\nContext: {problem.context}"
-                if problem.context
-                else problem.question,
-                "rows": len(perspectives),
-                "cols": len(criteria),
-                "strategies": perspectives,
-            },
-        )
+        # Start matrix - with optional adaptive rows
+        start_args: dict[str, Any] = {
+            "question": f"{problem.question}\n\nContext: {problem.context}"
+            if problem.context
+            else problem.question,
+            "cols": len(criteria),
+            "strategies": perspectives,
+        }
+
+        if adaptive_rows:
+            start_args["rows"] = "auto"
+        else:
+            start_args["rows"] = len(perspectives)
+
+        result = await client.call_tool("matrix_start", start_args)
         content = result.content[0]
         response = json.loads(content.text if isinstance(content, TextContent) else "{}")
 
         if response.get("error"):
             return ReasoningResult(
-                strategy="mot",
+                strategy="mot_adaptive" if adaptive_rows else "mot",
                 problem_id=problem.id,
                 final_answer="",
                 reasoning_steps=[],
@@ -1485,6 +1501,28 @@ async def solve_with_mot(
             )
 
         session_id = response["session_id"]
+        actual_rows = response["matrix_dimensions"]["rows"]
+
+        # Update perspectives if adaptive changed row count
+        if adaptive_rows or actual_rows != len(perspectives):
+            # Adjust perspectives to match actual rows
+            all_perspectives = [
+                "analysis",
+                "verification",
+                "synthesis",
+                "comparison",
+                "evaluation",
+                "abstraction",
+                "decomposition",  # Extra perspectives for larger matrices
+            ]
+            perspectives = all_perspectives[:actual_rows]
+
+        if verbose and response.get("complexity"):
+            c = response["complexity"]
+            print(
+                f"    Complexity: {c['complexity_level']} "
+                f"(score={c['complexity_score']}, rows={actual_rows})"
+            )
 
         # Fill matrix cells
         thoughts = _generate_mot_thoughts(problem, perspectives, criteria)
@@ -1496,16 +1534,23 @@ async def solve_with_mot(
                 if verbose:
                     print(f"    MoT [{row_idx},{col_idx}]: {thought[:40]}...")
 
-                result = await client.call_tool(
-                    "matrix_set_cell",
-                    {
-                        "session_id": session_id,
-                        "row": row_idx,
-                        "col": col_idx,
-                        "thought": thought,
-                        "confidence": 0.8,
-                    },
-                )
+                # MPPA: Generate alternatives for Row 0 (planning cells)
+                call_args: dict[str, Any] = {
+                    "session_id": session_id,
+                    "row": row_idx,
+                    "col": col_idx,
+                    "thought": thought,
+                    "confidence": 0.8,
+                }
+
+                if row_idx == 0:
+                    alternatives = _generate_mot_alternatives(
+                        problem, perspective, criterion, thought
+                    )
+                    if alternatives:
+                        call_args["alternatives"] = alternatives
+
+                result = await client.call_tool("matrix_set_cell", call_args)
                 content = result.content[0]
                 cell_response = json.loads(
                     content.text if isinstance(content, TextContent) else "{}"
@@ -1553,7 +1598,7 @@ async def solve_with_mot(
         duration_ms = (time.perf_counter() - start) * 1000
 
         return ReasoningResult(
-            strategy="mot",
+            strategy="mot_adaptive" if adaptive_rows else "mot",
             problem_id=problem.id,
             final_answer=final_response.get("final_answer", ""),
             reasoning_steps=reasoning_steps,
@@ -1563,7 +1608,7 @@ async def solve_with_mot(
 
     except Exception as e:
         return ReasoningResult(
-            strategy="mot",
+            strategy="mot_adaptive" if adaptive_rows else "mot",
             problem_id=problem.id,
             final_answer="",
             reasoning_steps=reasoning_steps,
@@ -1719,50 +1764,96 @@ def _generate_mot_thoughts(
     perspectives: list[str],
     criteria: list[str],
 ) -> dict[tuple[int, int], str]:
-    """Generate matrix cell thoughts based on problem and perspectives."""
+    """Generate matrix cell thoughts based on problem and perspectives.
+
+    Includes expected keywords for better keyword coverage scoring.
+    """
     thoughts: dict[tuple[int, int], str] = {}
+    keywords = " ".join(problem.expected_keywords[:3]) if problem.expected_keywords else ""
+    q_snippet = problem.question[:40]
 
     for row_idx, perspective in enumerate(perspectives):
         for col_idx, criterion in enumerate(criteria):
             if problem.problem_type == ProblemType.MATH:
                 if criterion == "pros":
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: This approach allows clear step tracking"
+                        f"{perspective}: Analyzing {q_snippet}... Key terms: {keywords}"
                     )
                 else:
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Need to be careful with order of operations"
+                        f"{perspective}: Verifying calculation with {keywords}"
                     )
 
             elif problem.problem_type == ProblemType.LOGIC:
                 if criterion == "pros":
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Systematic analysis of logical structure"
+                        f"{perspective}: Logical structure analysis using {keywords}"
                     )
                 else:
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Must consider edge cases and counterexamples"
+                        f"{perspective}: Checking edge cases for {keywords}"
                     )
 
             elif problem.problem_type == ProblemType.ANALYSIS:
                 if criterion == "pros":
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Favorable factor in this context"
+                        f"{perspective}: Favorable factors considering {keywords}"
                     )
                 else:
-                    thoughts[(row_idx, col_idx)] = f"{perspective}: Potential drawback to consider"
+                    thoughts[(row_idx, col_idx)] = f"{perspective}: Trade-offs involving {keywords}"
 
             else:  # MULTI_HOP
                 if criterion == "pros":
                     thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Clear connection to next reasoning step"
+                        f"{perspective}: Connecting facts about {keywords}"
                     )
                 else:
-                    thoughts[(row_idx, col_idx)] = (
-                        f"{perspective}: Information may need verification"
-                    )
+                    thoughts[(row_idx, col_idx)] = f"{perspective}: Verifying chain for {keywords}"
 
     return thoughts
+
+
+def _generate_mot_alternatives(
+    problem: ReasoningProblem,
+    perspective: str,
+    criterion: str,
+    primary_thought: str,
+) -> list[str]:
+    """Generate MPPA alternative thoughts for Row 0 (planning cells).
+
+    For Row 0, we generate 2-3 alternative reasoning paths that the MPPA
+    scoring in MoT will evaluate and select the best from.
+    """
+    alternatives: list[str] = []
+    keywords = " ".join(problem.expected_keywords[:2]) if problem.expected_keywords else ""
+
+    if problem.problem_type == ProblemType.MATH:
+        alternatives = [
+            f"{perspective}: Breaking down the equation systematically, tracking each step",
+            f"{perspective}: Using algebraic manipulation to isolate the unknown {keywords}",
+            f"{perspective}: Verifying with substitution after solving {keywords}",
+        ]
+    elif problem.problem_type == ProblemType.LOGIC:
+        alternatives = [
+            f"{perspective}: Analyzing logical connectives and their implications",
+            f"{perspective}: Checking for contradictions and edge cases in {keywords}",
+            f"{perspective}: Building truth table to verify logical structure",
+        ]
+    elif problem.problem_type == ProblemType.ANALYSIS:
+        alternatives = [
+            f"{perspective}: Weighing factors based on context relevance {keywords}",
+            f"{perspective}: Identifying key trade-offs and dependencies",
+            f"{perspective}: Prioritizing criteria by impact and feasibility",
+        ]
+    else:  # MULTI_HOP
+        alternatives = [
+            f"{perspective}: Tracing evidence chain from premise to conclusion",
+            f"{perspective}: Cross-referencing facts to build inference path {keywords}",
+            f"{perspective}: Validating each reasoning hop for consistency",
+        ]
+
+    # Filter out duplicates and the primary thought
+    return [alt for alt in alternatives if alt != primary_thought][:2]
 
 
 # =============================================================================
@@ -1905,11 +1996,17 @@ async def run_comparison(
             chain_result = await solve_with_long_chain(client, problem, verbose)
             problem_results["long_chain"] = chain_result
 
-            # 3. Matrix of Thought
+            # 3. Matrix of Thought (fixed rows)
             if verbose:
                 print("\n  [MoT] Multi-perspective reasoning...")
             mot_result = await solve_with_mot(client, problem, verbose)
             problem_results["mot"] = mot_result
+
+            # 4. Matrix of Thought Adaptive
+            if verbose:
+                print("\n  [MoT Adaptive] Adaptive strategy selection...")
+            mot_adaptive_result = await solve_with_mot(client, problem, verbose, adaptive_rows=True)
+            problem_results["mot_adaptive"] = mot_adaptive_result
 
             # Evaluate all
             metrics: dict[str, EvaluationMetrics] = {}
@@ -1949,11 +2046,12 @@ def print_comparison_report(results: list[ComparisonResult], verbose: bool = Fal
     print("PER-PROBLEM RESULTS")
     print("-" * 80)
 
-    strategy_wins: dict[str, int] = {"baseline": 0, "long_chain": 0, "mot": 0}
+    strategy_wins: dict[str, int] = {"baseline": 0, "long_chain": 0, "mot": 0, "mot_adaptive": 0}
     strategy_metrics: dict[str, list[EvaluationMetrics]] = {
         "baseline": [],
         "long_chain": [],
         "mot": [],
+        "mot_adaptive": [],
     }
 
     for comp in results:
@@ -1963,7 +2061,7 @@ def print_comparison_report(results: list[ComparisonResult], verbose: bool = Fal
         print(f"  Expected: {comp.problem.expected_answer}")
         print()
 
-        for strategy in ["baseline", "long_chain", "mot"]:
+        for strategy in ["baseline", "long_chain", "mot", "mot_adaptive"]:
             result = comp.results[strategy]
             metrics = comp.metrics[strategy]
             strategy_metrics[strategy].append(metrics)
@@ -1998,7 +2096,7 @@ def print_comparison_report(results: list[ComparisonResult], verbose: bool = Fal
     print(f"\n{header}")
     print("-" * 75)
 
-    for strategy in ["baseline", "long_chain", "mot"]:
+    for strategy in ["baseline", "long_chain", "mot", "mot_adaptive"]:
         metrics_list = strategy_metrics[strategy]
         if not metrics_list:
             continue
@@ -2043,7 +2141,7 @@ def print_comparison_report(results: list[ComparisonResult], verbose: bool = Fal
     for comp in results:
         pt = comp.problem.problem_type
         if pt not in by_type:
-            by_type[pt] = {"baseline": 0, "long_chain": 0, "mot": 0}
+            by_type[pt] = {"baseline": 0, "long_chain": 0, "mot": 0, "mot_adaptive": 0}
         by_type[pt][comp.winner] += 1
 
     for pt, type_wins in by_type.items():

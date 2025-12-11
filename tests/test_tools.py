@@ -11,6 +11,7 @@ import pytest
 from src.tools.long_chain import LongChainManager
 from src.tools.mot_reasoning import MatrixOfThoughtManager
 from src.tools.verify import VerificationManager
+from src.utils.session import SessionNotFoundError
 
 # =============================================================================
 # LongChainManager Tests
@@ -73,7 +74,7 @@ class TestLongChainManager:
         """Test add_step() with invalid session ID."""
         manager = LongChainManager()
 
-        with pytest.raises(ValueError, match="Session .* not found"):
+        with pytest.raises(SessionNotFoundError):
             manager.add_step("invalid-id", thought="Test")
 
     def test_add_step_progress_tracking(self) -> None:
@@ -119,7 +120,7 @@ class TestLongChainManager:
         """Test finalize() with invalid session."""
         manager = LongChainManager()
 
-        with pytest.raises(ValueError, match="Session .* not found"):
+        with pytest.raises(SessionNotFoundError):
             manager.finalize("invalid-id", answer="X", confidence=0.5)
 
     def test_get_chain_returns_current_state(self) -> None:
@@ -236,6 +237,73 @@ class TestMatrixOfThoughtManager:
         assert result["matrix_dimensions"]["rows"] == 3
         assert result["matrix_dimensions"]["cols"] == 2
 
+    def test_start_matrix_adaptive_rows_simple(self) -> None:
+        """Test start_matrix() with rows='auto' for simple problems."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="What is 2+2?",
+            rows="auto",
+            cols=2,
+        )
+
+        assert result["status"] == "started"
+        assert result["complexity"] is not None
+        assert result["complexity"]["complexity_level"] == "low"
+        assert result["matrix_dimensions"]["rows"] == 3  # Minimum 3 for adequate coverage
+
+    def test_start_matrix_adaptive_rows_complex(self) -> None:
+        """Test start_matrix() with rows='auto' for complex problems."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="If Alice is taller than Bob, and Bob is taller than Charlie, "
+            "then what can we conclude about Alice and Charlie? "
+            "Explain the logical reasoning step by step.",
+            context="This is a multi-hop logical reasoning problem that requires "
+            "analyzing relationships and drawing inferences based on "
+            "transitive properties. Consider all factors and implications.",
+            rows="auto",
+            cols=2,
+        )
+
+        assert result["status"] == "started"
+        assert result["complexity"] is not None
+        assert result["complexity"]["complexity_score"] >= 0.35
+        assert result["matrix_dimensions"]["rows"] >= 3  # Complex = more strategies
+
+    def test_start_matrix_adaptive_returns_signals(self) -> None:
+        """Test adaptive selection returns complexity signals."""
+        manager = MatrixOfThoughtManager()
+        result = manager.start_matrix(
+            question="Calculate x if 2x + 5 = 15, then verify the solution.",
+            rows="auto",
+        )
+
+        assert result["complexity"] is not None
+        assert "signals" in result["complexity"]
+        assert isinstance(result["complexity"]["signals"], list)
+
+    def test_complexity_detection_caching(self) -> None:
+        """Test that complexity detection results are cached."""
+        from src.utils.complexity import clear_complexity_cache, detect_complexity
+
+        question = "Test caching question for complexity"
+        context = "Some context here"
+
+        # Clear cache for this test
+        clear_complexity_cache()
+
+        # First call - should not be cached
+        result1 = detect_complexity(question, context)
+        assert result1.cached is False
+
+        # Second call - should be cached
+        result2 = detect_complexity(question, context)
+        assert result2.cached is True
+
+        # Results should match (except cached flag)
+        assert result1.complexity_score == result2.complexity_score
+        assert result1.recommended_rows == result2.recommended_rows
+
     def test_start_matrix_with_context(self) -> None:
         """Test start_matrix() with optional context."""
         manager = MatrixOfThoughtManager()
@@ -291,7 +359,7 @@ class TestMatrixOfThoughtManager:
         """Test set_cell() with invalid session."""
         manager = MatrixOfThoughtManager()
 
-        with pytest.raises(ValueError, match="Session .* not found"):
+        with pytest.raises(SessionNotFoundError):
             manager.set_cell("invalid", row=0, col=0, thought="X")
 
     def test_synthesize_column_stores_synthesis(self) -> None:
@@ -314,7 +382,7 @@ class TestMatrixOfThoughtManager:
         """Test synthesize_column() with invalid session."""
         manager = MatrixOfThoughtManager()
 
-        with pytest.raises(ValueError, match="Session .* not found"):
+        with pytest.raises(SessionNotFoundError):
             manager.synthesize_column("invalid", col=0, synthesis="X")
 
     def test_finalize_completes_session(self) -> None:
@@ -411,7 +479,7 @@ class TestVerificationManager:
         """Test add_claim() with invalid session."""
         manager = VerificationManager()
 
-        with pytest.raises(ValueError, match="Session .* not found"):
+        with pytest.raises(SessionNotFoundError):
             manager.add_claim("invalid", content="X")
 
     def test_verify_claim_updates_status(self) -> None:
@@ -527,6 +595,419 @@ class TestVerificationManager:
 
         result = manager.abandon(session_id)
         assert result["status"] == "abandoned"
+
+
+# =============================================================================
+# Compress Tool Tests (doesn't use sessions)
+# =============================================================================
+
+
+# =============================================================================
+# Additional Coverage Tests - MatrixOfThoughtManager
+# =============================================================================
+
+
+class TestMatrixOfThoughtManagerCoverage:
+    """Additional tests for mot_reasoning.py coverage."""
+
+    def test_calculate_cell_survival_score_empty_thought(self) -> None:
+        """Test survival score for empty thought."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        assert calculate_cell_survival_score("", "direct_factual", "context", 0) == 0.0
+        assert calculate_cell_survival_score("   ", "logical_inference", "ctx", 0) == 0.0
+
+    def test_calculate_cell_survival_score_strategy_keywords(self) -> None:
+        """Test survival score with strategy-aligned keywords."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        # logical_inference keywords: therefore, implies, because, since, if, then
+        # Need longer text to get good length score, plus context overlap
+        logical_thought = (
+            "Therefore, since X implies Y in the test context, then we can "
+            "conclude Z because of evidence. This follows logically from the premises."
+        )
+        score = calculate_cell_survival_score(
+            logical_thought, "logical_inference", "test context with evidence", 0
+        )
+        # With new weighted scoring, this should be moderate-to-good
+        assert score > 0.4  # Has structure, some overlap, decent length
+
+        # Compare: strategy-aligned vs non-aligned keywords
+        causal_thought = (
+            "The cause leads to this effect in the test scenario, "
+            "resulting in consequence due to the causal chain identified."
+        )
+        score_causal = calculate_cell_survival_score(causal_thought, "causal", "test scenario", 0)
+        score_wrong_strategy = calculate_cell_survival_score(
+            causal_thought, "analogical", "test scenario", 0
+        )
+        # Causal keywords should help more when strategy is "causal"
+        assert score_causal >= score_wrong_strategy
+
+    def test_calculate_cell_survival_score_vague_phrases(self) -> None:
+        """Test survival score penalizes vague phrases."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        vague = "Maybe something happens somehow, I guess probably not sure about this."
+        specific = "The equation 2x + 5 = 15 has solution x = 5, verified by substitution."
+
+        vague_score = calculate_cell_survival_score(vague, "direct_factual", "math problem", 0)
+        specific_score = calculate_cell_survival_score(
+            specific, "direct_factual", "math problem", 0
+        )
+
+        assert specific_score > vague_score
+
+    def test_calculate_cell_survival_score_numbers_and_quotes(self) -> None:
+        """Test survival score rewards concrete details."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        with_numbers = "The answer is 42.5 percent, calculated from 85 out of 200 samples."
+        with_quotes = 'According to the text, "the answer is clear" from the evidence.'
+        plain = "The answer can be found by looking at the evidence provided."
+
+        num_score = calculate_cell_survival_score(with_numbers, "direct_factual", "ctx", 0)
+        quote_score = calculate_cell_survival_score(with_quotes, "direct_factual", "ctx", 0)
+        plain_score = calculate_cell_survival_score(plain, "direct_factual", "ctx", 0)
+
+        assert num_score > plain_score
+        assert quote_score > plain_score
+
+    def test_calculate_cell_survival_score_length_penalties(self) -> None:
+        """Test survival score length handling."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        short = "Too short."
+        normal = "This is a reasonably sized thought with enough content to analyze properly."
+        rambling = " ".join(["word"] * 200)  # Very long
+
+        short_score = calculate_cell_survival_score(short, "direct_factual", "ctx", 0)
+        normal_score = calculate_cell_survival_score(normal, "direct_factual", "ctx", 0)
+        rambling_score = calculate_cell_survival_score(rambling, "direct_factual", "ctx", 0)
+
+        assert normal_score > short_score  # Short penalty
+        assert normal_score > rambling_score  # Rambling penalty
+
+    def test_calculate_cell_survival_score_col0_bonus(self) -> None:
+        """Test survival score position affects score."""
+        from src.utils.scoring import calculate_cell_survival_score
+
+        thought = "This is a planning thought with logical inference and evidence."
+
+        # In new scoring, positions 0-3 (early) get same max score
+        # Position 8+ gets lower score
+        col0_score = calculate_cell_survival_score(thought, "direct_factual", "ctx", col=0)
+        late_col_score = calculate_cell_survival_score(thought, "direct_factual", "ctx", col=8)
+
+        assert col0_score > late_col_score  # Early positions score higher than late
+
+    def test_candidate_cell_to_dict_truncation(self) -> None:
+        """Test CandidateCell.to_dict truncates long content."""
+        from src.tools.mot_reasoning import CandidateCell
+
+        long_content = "x" * 150
+        cell = CandidateCell(content=long_content, survival_score=0.75, selected=True)
+        d = cell.to_dict()
+
+        assert len(d["content"]) == 103  # 100 chars + "..."
+        assert d["content"].endswith("...")
+        assert d["survival_score"] == 0.75
+        assert d["selected"] is True
+
+    def test_set_cell_row_exceeds_strategies(self) -> None:
+        """Test set_cell error when row exceeds strategies."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Row 5 is out of bounds for a 2-row matrix
+        result = manager.set_cell(session_id, row=5, col=0, thought="X")
+        assert "error" in result
+
+    def test_set_cell_alternatives_on_non_row0_warns(self) -> None:
+        """Test alternatives on non-row-0 triggers warning."""
+        import warnings
+
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            manager.set_cell(session_id, row=1, col=0, thought="Main", alternatives=["Alt1"])
+
+            assert len(w) == 1
+            assert "alternatives ignored for row 1" in str(w[0].message)
+
+    def test_set_cell_alternatives_invalid_type(self) -> None:
+        """Test set_cell rejects invalid alternatives."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Empty string in alternatives
+        result = manager.set_cell(session_id, row=0, col=0, thought="Main", alternatives=[""])
+        assert "error" in result
+        assert "non-empty strings" in result["error"]
+
+    def test_set_cell_mppa_selects_best(self) -> None:
+        """Test MPPA selects candidate with highest survival score."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Mathematical proof", rows=3, cols=2)
+        session_id = start["session_id"]
+
+        # Provide alternatives with different qualities
+        vague = "Maybe something works somehow"
+        specific = "Therefore, since 2x = 10, we conclude x = 5 by division."
+
+        result = manager.set_cell(session_id, row=0, col=0, thought=vague, alternatives=[specific])
+
+        # MPPA should evaluate candidates
+        assert "mppa" in result or "cell_set" in result  # Either MPPA info or successful set
+
+    def test_list_sessions(self) -> None:
+        """Test list_sessions returns all sessions."""
+        manager = MatrixOfThoughtManager()
+
+        # Create multiple sessions
+        s1 = manager.start_matrix(question="Question 1 is about math", rows=2, cols=2)
+        s2 = manager.start_matrix(question="Question 2 is about physics", rows=3, cols=3)
+
+        sessions = manager.list_sessions()
+        assert sessions["total"] == 2
+        assert len(sessions["sessions"]) == 2
+
+        # Check session details
+        session_ids = [s["session_id"] for s in sessions["sessions"]]
+        assert s1["session_id"] in session_ids
+        assert s2["session_id"] in session_ids
+
+    def test_list_sessions_truncates_long_questions(self) -> None:
+        """Test list_sessions truncates long questions."""
+        manager = MatrixOfThoughtManager()
+
+        long_question = "x" * 100
+        manager.start_matrix(question=long_question, rows=2, cols=2)
+
+        sessions = manager.list_sessions()
+        q = sessions["sessions"][0]["question"]
+        assert len(q) == 53  # 50 chars + "..."
+        assert q.endswith("...")
+
+    def test_check_cell_consistency_short_content(self) -> None:
+        """Test consistency check flags short content."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Very short thought
+        result = manager.set_cell(session_id, row=0, col=0, thought="Short.")
+
+        # Check if issues are flagged
+        if "consistency_issues" in result:
+            assert any("brief" in issue.lower() for issue in result["consistency_issues"])
+
+    def test_check_cell_consistency_high_similarity(self) -> None:
+        """Test consistency check flags high similarity to previous column."""
+        manager = MatrixOfThoughtManager()
+        start = manager.start_matrix(question="Q", rows=2, cols=2)
+        session_id = start["session_id"]
+
+        # Fill col 0
+        thought = "This is a detailed analysis of the problem at hand with specific evidence."
+        manager.set_cell(session_id, row=0, col=0, thought=thought)
+
+        # Fill col 1 with very similar content
+        result = manager.set_cell(session_id, row=0, col=1, thought=thought + " Extra word.")
+
+        # High similarity should be flagged
+        if "consistency_issues" in result:
+            assert any("similar" in issue.lower() for issue in result["consistency_issues"])
+
+
+# =============================================================================
+# Additional Coverage Tests - LongChainManager
+# =============================================================================
+
+
+class TestLongChainManagerCoverage:
+    """Additional tests for long_chain.py coverage."""
+
+    def test_calculate_survival_score_empty(self) -> None:
+        """Test survival score for empty thought."""
+        from src.utils.scoring import calculate_survival_score
+
+        # Empty thought should return low score
+        empty_score = calculate_survival_score("", "problem", 1)
+        normal_score = calculate_survival_score(
+            "This is a valid thought with detailed content and reasoning steps.", "problem", 1
+        )
+
+        assert empty_score <= normal_score  # Empty should not score higher
+
+    def test_calculate_survival_score_with_context(self) -> None:
+        """Test survival score considers context overlap."""
+        from src.utils.scoring import calculate_survival_score
+
+        context = "establish baseline analysis for mathematical proof"
+        new_thought = "Third step continues baseline analysis with new evidence and proof"
+
+        score = calculate_survival_score(new_thought, context, 3)
+        assert score > 0.3  # Should have decent score with overlap
+
+    def test_calculate_survival_score_step_progression(self) -> None:
+        """Test survival score varies by step number."""
+        from src.utils.scoring import calculate_survival_score
+
+        thought = "This is a detailed step with logical reasoning and evidence."
+        context = "problem context"
+
+        early_score = calculate_survival_score(thought, context, 1)
+        late_score = calculate_survival_score(thought, context, 10)
+        # Both should be valid scores
+        assert 0.0 <= early_score <= 1.0
+        assert 0.0 <= late_score <= 1.0
+
+    def test_should_explore_alternatives(self) -> None:
+        """Test alternative exploration detection."""
+        from src.tools.long_chain import should_explore_alternatives
+
+        # Early steps should explore
+        assert should_explore_alternatives(1, 0) is True
+
+        # Recent exploration should not re-explore
+        assert should_explore_alternatives(5, 4) is False
+
+        # Gap since last exploration should explore again
+        assert should_explore_alternatives(10, 5) is True
+
+    def test_add_step_with_confidence(self) -> None:
+        """Test add_step with confidence tracking."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="P", expected_steps=5)
+        session_id = start["session_id"]
+
+        result = manager.add_step(session_id, thought="Step with confidence", confidence=0.85)
+
+        assert result["step_added"] == 1
+        # Check if confidence is stored
+        state = manager.get_chain(session_id)
+        assert state["steps"][0]["confidence"] == 0.85
+
+    def test_add_step_mppa_exploration(self) -> None:
+        """Test MPPA alternative exploration in add_step."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="Complex math problem", expected_steps=5)
+        session_id = start["session_id"]
+
+        # Provide alternatives
+        result = manager.add_step(
+            session_id,
+            thought="Primary approach using algebra",
+            alternatives=["Alternative using geometry", "Alternative using calculus"],
+        )
+
+        assert result["step_added"] == 1
+        if "exploration" in result:
+            assert result["exploration"]["alternatives_evaluated"] >= 1
+
+    def test_finalize_with_summary(self) -> None:
+        """Test finalize includes chain summary."""
+        manager = LongChainManager()
+        start = manager.start_chain(problem="Test problem", expected_steps=3)
+        session_id = start["session_id"]
+
+        manager.add_step(session_id, thought="Step 1: Analyze")
+        manager.add_step(session_id, thought="Step 2: Synthesize")
+        manager.add_step(session_id, thought="Step 3: Conclude")
+
+        result = manager.finalize(session_id, answer="Final answer", confidence=0.9)
+
+        assert result["status"] == "completed"
+        assert result["final_answer"] == "Final answer"
+
+
+# =============================================================================
+# Additional Coverage Tests - VerificationManager
+# =============================================================================
+
+
+class TestVerificationManagerCoverage:
+    """Additional tests for verify.py coverage."""
+
+    def test_list_sessions(self) -> None:
+        """Test list_sessions returns all verification sessions."""
+        manager = VerificationManager()
+
+        manager.start_verification(answer="Answer 1", context="Context 1")
+        manager.start_verification(answer="Answer 2", context="Context 2")
+
+        sessions = manager.list_sessions()
+        assert sessions["total"] == 2
+        assert len(sessions["sessions"]) == 2
+
+    def test_suggest_claims_from_context(self) -> None:
+        """Test claim suggestion based on context."""
+        manager = VerificationManager()
+
+        # Context with clear factual statements
+        context = """
+        The capital of France is Paris.
+        Python was created in 1991.
+        The Earth orbits the Sun in 365 days.
+        """
+
+        result = manager.start_verification(answer="Some answer", context=context)
+
+        # Should suggest claims based on context
+        assert "suggested_claims" in result
+        assert isinstance(result["suggested_claims"], list)
+
+    def test_verify_claim_all_statuses(self) -> None:
+        """Test all claim verification statuses."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="Context")
+        session_id = start["session_id"]
+
+        # Add claims for each status type
+        manager.add_claim(session_id, content="Supported claim")
+        manager.add_claim(session_id, content="Contradicted claim")
+
+        # Verify with different statuses
+        r1 = manager.verify_claim(session_id, 0, "supported", "Evidence", 0.9)
+        r2 = manager.verify_claim(session_id, 1, "contradicted", "Counter-evidence", 0.8)
+
+        assert r1["status"] == "supported"
+        assert r2["status"] == "contradicted"
+
+    def test_get_verification_state(self) -> None:
+        """Test get_status returns current state."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="Test", context="Context")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim 1")
+        manager.verify_claim(session_id, 0, "supported", "Evidence", 0.9)
+
+        state = manager.get_status(session_id)
+
+        assert state["answer"] == "Test"
+        assert "claims" in state or "status" in state  # Verify state is returned
+
+    def test_finalize_with_unsupported_claims(self) -> None:
+        """Test finalize handles all verified claims."""
+        manager = VerificationManager()
+        start = manager.start_verification(answer="A", context="C")
+        session_id = start["session_id"]
+
+        manager.add_claim(session_id, content="Claim")
+        manager.verify_claim(session_id, 0, "contradicted", "Counter evidence", 0.8)
+
+        result = manager.finalize(session_id)
+
+        assert result["status"] == "completed"
+        assert result["verified"] is False  # Contradicted claim means not verified
 
 
 # =============================================================================

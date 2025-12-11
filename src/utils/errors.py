@@ -53,6 +53,18 @@ class ModelNotReadyException(MatrixMindException):
     pass
 
 
+class InvalidActionError(MatrixMindException):
+    """Raised when an invalid action is provided to a tool."""
+
+    pass
+
+
+class SessionNotFoundError(MatrixMindException):
+    """Raised when a session ID is not found."""
+
+    pass
+
+
 class ToolExecutionError(Exception):
     """Raised when tool execution fails in MCP context.
 

@@ -349,6 +349,86 @@ class TestKnowledgeGraph:
         kg = KnowledgeGraph()
         assert kg.get_entity("nonexistent") is None
 
+    def test_has_entity_exists(self) -> None:
+        """Test has_entity returns True for existing entity."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        assert kg.has_entity("Einstein") is True
+        assert kg.has_entity("einstein") is True  # Case insensitive
+        assert kg.has_entity("  Einstein  ") is True  # Strips whitespace
+
+    def test_has_entity_not_exists(self) -> None:
+        """Test has_entity returns False for non-existent entity."""
+        kg = KnowledgeGraph()
+        assert kg.has_entity("Einstein") is False
+        kg.add_entity("Newton", EntityType.PERSON)
+        assert kg.has_entity("Einstein") is False
+
+    def test_get_supporting_facts_empty_text(self) -> None:
+        """Test get_supporting_facts with empty text returns empty list."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        assert kg.get_supporting_facts("") == []
+        assert kg.get_supporting_facts(None) == []  # type: ignore[arg-type]
+
+    def test_get_supporting_facts_no_matches(self) -> None:
+        """Test get_supporting_facts with no matching entities."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        kg.add_entity("Relativity", EntityType.CONCEPT)
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+
+        facts = kg.get_supporting_facts("Newton discovered gravity")
+        assert facts == []
+
+    def test_get_supporting_facts_finds_relations(self) -> None:
+        """Test get_supporting_facts finds relations for mentioned entities."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        kg.add_entity("Relativity", EntityType.CONCEPT)
+        kg.add_entity("Princeton", EntityType.ORGANIZATION)
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity", confidence=0.9)
+        kg.add_relation("Einstein", RelationType.WORKS_FOR, "Princeton", confidence=0.8)
+
+        facts = kg.get_supporting_facts("Tell me about Einstein")
+        assert len(facts) == 2
+        # Should be sorted by confidence (highest first)
+        assert facts[0].confidence >= facts[1].confidence
+
+    def test_get_supporting_facts_includes_incoming_relations(self) -> None:
+        """Test get_supporting_facts includes both outgoing and incoming relations."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        kg.add_entity("Relativity", EntityType.CONCEPT)
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+
+        # Query by object entity (Relativity) - should find incoming relation
+        facts = kg.get_supporting_facts("What is Relativity?")
+        assert len(facts) == 1
+        assert facts[0].object_entity.name == "Relativity"
+
+    def test_get_supporting_facts_matches_aliases(self) -> None:
+        """Test get_supporting_facts matches entity aliases."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Albert Einstein", EntityType.PERSON, aliases=["Einstein", "A. Einstein"])
+        kg.add_entity("Relativity", EntityType.CONCEPT)
+        kg.add_relation("Albert Einstein", RelationType.AUTHORED, "Relativity")
+
+        # Query using alias
+        facts = kg.get_supporting_facts("Einstein developed this theory")
+        assert len(facts) == 1
+
+    def test_get_supporting_facts_no_duplicates(self) -> None:
+        """Test get_supporting_facts doesn't return duplicate relations."""
+        kg = KnowledgeGraph()
+        kg.add_entity("Einstein", EntityType.PERSON)
+        kg.add_entity("Relativity", EntityType.CONCEPT)
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+
+        # Text mentions both subject and object - relation should appear once
+        facts = kg.get_supporting_facts("Einstein authored Relativity")
+        assert len(facts) == 1
+
     def test_add_relation_with_entity_objects(self) -> None:
         """Test adding relation with Entity objects."""
         kg = KnowledgeGraph()

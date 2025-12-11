@@ -18,13 +18,11 @@ Architecture:
     - Tool receives reasoning steps FROM the calling LLM
     - Tracks chain state, branches, revisions
     - Detects planning vs execution steps
-    - Supports multi-path exploration at planning points
-    - Provides heuristic verification (no internal LLM)
-    - Returns state for next iteration
 """
 
 from __future__ import annotations
 
+import random
 import re
 import uuid
 from dataclasses import dataclass, field
@@ -33,6 +31,10 @@ from enum import Enum
 from typing import Any
 
 from loguru import logger
+
+from src.models.knowledge_graph import KnowledgeGraphExtractor
+from src.utils.scoring import calculate_survival_score
+from src.utils.session import SessionManager
 
 
 class ChainStatus(Enum):
@@ -100,73 +102,6 @@ def is_planning_step(thought: str) -> bool:
     """
     thought_lower = thought.lower().strip()
     return any(thought_lower.startswith(indicator) for indicator in PLANNING_INDICATORS)
-
-
-def calculate_survival_score(thought: str, context: str, step_number: int) -> float:
-    """Estimate survival probability for a candidate thought.
-
-    Heuristic scoring based on:
-    - Coherence with problem context
-    - Specificity (not too vague)
-    - Logical connectors (building on previous reasoning)
-    - Step position (early steps need more exploration)
-
-    Args:
-        thought: Candidate reasoning step.
-        context: Problem context and previous steps.
-        step_number: Current position in the chain.
-
-    Returns:
-        Score between 0.0 and 1.0 (higher = more likely to succeed).
-
-    """
-    score = 0.5  # Base score
-
-    thought_lower = thought.lower()
-    context_lower = context.lower()
-
-    # 1. Context relevance: Does it reference key terms from the problem?
-    context_words = set(context_lower.split())
-    thought_words = set(thought_lower.split())
-    # Filter common words
-    stopwords = {"the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "in", "for"}
-    context_words -= stopwords
-    thought_words -= stopwords
-
-    if context_words:
-        overlap = len(context_words & thought_words) / len(context_words)
-        score += overlap * 0.2  # Up to +0.2
-
-    # 2. Specificity: Penalize vague thoughts
-    vague_phrases = ["something", "somehow", "maybe", "probably", "i guess", "not sure"]
-    vague_count = sum(1 for phrase in vague_phrases if phrase in thought_lower)
-    score -= vague_count * 0.1  # -0.1 per vague phrase
-
-    # 3. Logical connectors: Reward building on previous reasoning
-    connectors = ["therefore", "because", "since", "thus", "so", "given that", "based on"]
-    connector_count = sum(1 for conn in connectors if conn in thought_lower)
-    score += min(connector_count * 0.1, 0.2)  # Up to +0.2
-
-    # 4. Concrete details: Reward specifics (numbers, names, formulas)
-    has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", thought))
-    has_quotes = '"' in thought or "'" in thought
-    if has_numbers:
-        score += 0.1
-    if has_quotes:
-        score += 0.05
-
-    # 5. Length penalty: Too short = probably incomplete
-    word_count = len(thought.split())
-    if word_count < 10:
-        score -= 0.15
-    elif word_count > 100:
-        score -= 0.05  # Slight penalty for rambling
-
-    # 6. Early step bonus: More aggressive exploration early
-    if step_number <= 3:
-        score *= 1.1  # Boost differentiation for early steps
-
-    return max(0.0, min(1.0, score))
 
 
 def should_explore_alternatives(step_number: int, last_explore_step: int) -> bool:
@@ -289,7 +224,7 @@ class ChainState:
         }
 
 
-class LongChainManager:
+class LongChainManager(SessionManager[ChainState]):
     """Manages long chain-of-thought reasoning sessions.
 
     This is a STATE MANAGER, not a reasoner. The calling LLM provides
@@ -305,9 +240,21 @@ class LongChainManager:
 
     """
 
-    def __init__(self) -> None:
-        """Initialize the chain manager."""
-        self._sessions: dict[str, ChainState] = {}
+    def __init__(
+        self,
+        encoder: Any | None = None,
+        kg: Any | None = None,
+    ) -> None:
+        """Initialize the chain manager.
+
+        Args:
+            encoder: Optional ContextEncoder for semantic scoring.
+            kg: Optional KnowledgeGraph for fact alignment scoring.
+
+        """
+        super().__init__()
+        self._encoder = encoder
+        self._kg = kg
 
     def start_chain(
         self,
@@ -333,7 +280,20 @@ class LongChainManager:
             expected_steps=expected_steps,
             metadata=metadata or {},
         )
-        self._sessions[session_id] = state
+        self._register_session(session_id, state)
+
+        # Auto-extract entities from problem into shared KG
+        if self._kg is not None:
+            try:
+                extractor = KnowledgeGraphExtractor()
+                extractor.extract(problem, existing_graph=self._kg)
+                # Also extract from context if provided in metadata
+                context = (metadata or {}).get("context", "")
+                if context:
+                    extractor.extract(context, existing_graph=self._kg)
+                logger.debug(f"Extracted {self._kg.stats()['entity_count']} entities from problem")
+            except Exception as e:
+                logger.warning(f"KG extraction failed (non-fatal): {e}")
 
         logger.debug(f"Started chain session {session_id} for problem: {problem[:50]}...")
 
@@ -383,14 +343,14 @@ class LongChainManager:
             Updated state and guidance for next step.
 
         """
-        state = self._get_session(session_id)
-        if state.status != ChainStatus.ACTIVE:
-            return {
-                "error": f"Session {session_id} is {state.status.value}",
-                "status": state.status.value,
-            }
+        with self.session(session_id) as state:
+            if state.status != ChainStatus.ACTIVE:
+                return {
+                    "error": f"Session {session_id} is {state.status.value}",
+                    "status": state.status.value,
+                }
 
-        step_num = len(state.steps) + 1
+            step_num = len(state.steps) + 1
 
         # MPPA: Detect if this is a planning step
         detected_planning = is_planning_step(thought)
@@ -415,11 +375,16 @@ class LongChainManager:
             all_thoughts = [thought] + alternatives
 
             for t in all_thoughts:
-                score = calculate_survival_score(t, context, step_num)
+                score = calculate_survival_score(
+                    t, context, step_num, encoder=self._encoder, kg=self._kg
+                )
                 candidates.append(CandidateThought(content=t, survival_score=score))
 
             # Select the best candidate
-            candidates.sort(key=lambda c: c.survival_score, reverse=True)
+            candidates.sort(
+                key=lambda c: (c.survival_score, random.random()),  # nosec B311
+                reverse=True,
+            )
             best = candidates[0]
             best.selected = True
             selected_thought = best.content
@@ -436,7 +401,9 @@ class LongChainManager:
             )
         elif detected_planning and should_explore_alternatives(step_num, state.last_explore_step):
             # Planning step detected but no alternatives provided - suggest exploration
-            survival_score = calculate_survival_score(thought, context, step_num)
+            survival_score = calculate_survival_score(
+                thought, context, step_num, encoder=self._encoder, kg=self._kg
+            )
 
         # Determine step number and type
         if branch_from is not None:
@@ -541,8 +508,8 @@ class LongChainManager:
             Full chain state including all steps.
 
         """
-        state = self._get_session(session_id)
-        return state.to_dict()
+        with self.session(session_id) as state:
+            return state.to_dict()
 
     def finalize(
         self,
@@ -561,21 +528,20 @@ class LongChainManager:
             Final chain state with summary.
 
         """
-        state = self._get_session(session_id)
+        with self.session(session_id) as state:
+            # Add final step
+            final_step = ReasoningStep(
+                step_number=len(state.steps) + 1,
+                content=answer,
+                step_type=StepType.FINAL,
+                confidence=confidence,
+            )
+            state.steps.append(final_step)
+            state.final_answer = answer
+            state.status = ChainStatus.COMPLETED
+            state.updated_at = datetime.now()
 
-        # Add final step
-        final_step = ReasoningStep(
-            step_number=len(state.steps) + 1,
-            content=answer,
-            step_type=StepType.FINAL,
-            confidence=confidence,
-        )
-        state.steps.append(final_step)
-        state.final_answer = answer
-        state.status = ChainStatus.COMPLETED
-        state.updated_at = datetime.now()
-
-        # Generate summary
+        # Generate summary (read-only, outside lock)
         summary = self._generate_summary(state)
 
         logger.info(f"Finalized session {session_id} with {len(state.steps)} steps")
@@ -606,18 +572,18 @@ class LongChainManager:
             Updated state.
 
         """
-        state = self._get_session(session_id)
-        old_expected = state.expected_steps
-        state.expected_steps = new_expected
-        state.updated_at = datetime.now()
+        with self.session(session_id) as state:
+            old_expected = state.expected_steps
+            state.expected_steps = new_expected
+            state.updated_at = datetime.now()
 
-        return {
-            "session_id": session_id,
-            "old_expected": old_expected,
-            "new_expected": new_expected,
-            "current_steps": len(state.steps),
-            "progress": round(len(state.steps) / max(new_expected, 1), 2),
-        }
+            return {
+                "session_id": session_id,
+                "old_expected": old_expected,
+                "new_expected": new_expected,
+                "current_steps": len(state.steps),
+                "progress": round(len(state.steps) / max(new_expected, 1), 2),
+            }
 
     def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
         """Abandon a reasoning chain.
@@ -630,17 +596,17 @@ class LongChainManager:
             Final state.
 
         """
-        state = self._get_session(session_id)
-        state.status = ChainStatus.ABANDONED
-        state.metadata["abandon_reason"] = reason
-        state.updated_at = datetime.now()
+        with self.session(session_id) as state:
+            state.status = ChainStatus.ABANDONED
+            state.metadata["abandon_reason"] = reason
+            state.updated_at = datetime.now()
 
-        return {
-            "session_id": session_id,
-            "status": "abandoned",
-            "reason": reason,
-            "steps_completed": len(state.steps),
-        }
+            return {
+                "session_id": session_id,
+                "status": "abandoned",
+                "reason": reason,
+                "steps_completed": len(state.steps),
+            }
 
     def list_sessions(self) -> dict[str, Any]:
         """List all active sessions.
@@ -649,27 +615,22 @@ class LongChainManager:
             List of session summaries.
 
         """
-        sessions = []
-        for sid, state in self._sessions.items():
-            sessions.append(
-                {
-                    "session_id": sid,
-                    "problem": state.problem[:50] + "..."
-                    if len(state.problem) > 50
-                    else state.problem,
-                    "status": state.status.value,
-                    "steps": len(state.steps),
-                    "expected": state.expected_steps,
-                    "created": state.created_at.isoformat(),
-                }
-            )
-        return {"sessions": sessions, "total": len(sessions)}
-
-    def _get_session(self, session_id: str) -> ChainState:
-        """Get session or raise error."""
-        if session_id not in self._sessions:
-            raise ValueError(f"Session {session_id} not found")
-        return self._sessions[session_id]
+        with self.locked() as sessions:
+            result = []
+            for sid, state in sessions.items():
+                result.append(
+                    {
+                        "session_id": sid,
+                        "problem": state.problem[:50] + "..."
+                        if len(state.problem) > 50
+                        else state.problem,
+                        "status": state.status.value,
+                        "steps": len(state.steps),
+                        "expected": state.expected_steps,
+                        "created": state.created_at.isoformat(),
+                    }
+                )
+            return {"sessions": result, "total": len(result)}
 
     def _check_step_consistency(
         self,

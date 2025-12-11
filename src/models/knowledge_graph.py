@@ -255,6 +255,70 @@ class KnowledgeGraph:
         """
         return self._entities.get(name.lower().strip())
 
+    def has_entity(self, name: str) -> bool:
+        """Check if entity exists in the graph.
+
+        Args:
+            name: Entity name to check.
+
+        Returns:
+            True if entity exists, False otherwise.
+
+        """
+        return name.lower().strip() in self._entities
+
+    def get_supporting_facts(self, text: str) -> list[Relation]:
+        """Find relations involving entities mentioned in text.
+
+        Extracts entity names from the text and returns all relations
+        where those entities appear as subject or object.
+
+        Args:
+            text: Text to extract entity mentions from.
+
+        Returns:
+            List of relations involving mentioned entities.
+
+        """
+        if not text:
+            return []
+
+        # Find entities mentioned in the text
+        mentioned_entities: set[str] = set()
+
+        # Check each known entity against the text (case-insensitive)
+        text_lower = text.lower()
+        for key, entity in self._entities.items():
+            if key in text_lower or entity.name.lower() in text_lower:
+                mentioned_entities.add(key)
+            # Also check aliases
+            for alias in entity.aliases:
+                if alias.lower() in text_lower:
+                    mentioned_entities.add(key)
+
+        # Collect all relations involving these entities
+        supporting: list[Relation] = []
+        seen: set[int] = set()  # Avoid duplicates via hash
+
+        for entity_key in mentioned_entities:
+            # Outgoing relations
+            for rel in self._adjacency.get(entity_key, []):
+                rel_hash = hash(rel)
+                if rel_hash not in seen:
+                    supporting.append(rel)
+                    seen.add(rel_hash)
+            # Incoming relations
+            for rel in self._reverse_adjacency.get(entity_key, []):
+                rel_hash = hash(rel)
+                if rel_hash not in seen:
+                    supporting.append(rel)
+                    seen.add(rel_hash)
+
+        # Sort by confidence (highest first)
+        supporting.sort(key=lambda r: r.confidence, reverse=True)
+
+        return supporting
+
     def add_relation(
         self,
         subject: Entity | str,

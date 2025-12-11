@@ -22,6 +22,8 @@ from typing import Any
 
 from loguru import logger
 
+from src.utils.session import SessionManager
+
 
 class ClaimStatus(Enum):
     """Status of a claim verification."""
@@ -100,7 +102,7 @@ class VerificationState:
         }
 
 
-class VerificationManager:
+class VerificationManager(SessionManager[VerificationState]):
     """Manages fact verification sessions.
 
     This is a STATE MANAGER, not a verifier. The calling LLM extracts
@@ -116,7 +118,7 @@ class VerificationManager:
 
     def __init__(self) -> None:
         """Initialize the verification manager."""
-        self._sessions: dict[str, VerificationState] = {}
+        super().__init__()
 
     def start_verification(
         self,
@@ -142,7 +144,7 @@ class VerificationManager:
             context=context,
             metadata=metadata or {},
         )
-        self._sessions[session_id] = state
+        self._register_session(session_id, state)
 
         # Provide heuristic claim suggestions
         suggested_claims = self._suggest_claims(answer)
@@ -177,38 +179,41 @@ class VerificationManager:
             Updated state with claim ID.
 
         """
-        state = self._get_session(session_id)
-        if state.status != SessionStatus.ACTIVE:
-            return {"error": f"Session is {state.status.value}"}
+        with self.session(session_id) as state:
+            if state.status != SessionStatus.ACTIVE:
+                return {"error": f"Session is {state.status.value}"}
 
-        claim_id = len(state.claims)
-        claim = Claim(claim_id=claim_id, content=content)
-        state.claims.append(claim)
-        state.updated_at = datetime.now()
+            claim_id = len(state.claims)
+            claim = Claim(claim_id=claim_id, content=content)
+            state.claims.append(claim)
+            state.updated_at = datetime.now()
 
-        # Check for potential issues
-        issues = self._check_claim(state, claim)
+            # Check for potential issues
+            issues = self._check_claim(state, claim)
 
-        response = {
-            "session_id": session_id,
-            "claim_id": claim_id,
-            "claim": content,
-            "total_claims": len(state.claims),
-            "pending_verification": sum(1 for c in state.claims if c.status == ClaimStatus.PENDING),
-        }
+            response = {
+                "session_id": session_id,
+                "claim_id": claim_id,
+                "claim": content,
+                "total_claims": len(state.claims),
+                "pending_verification": sum(
+                    1 for c in state.claims if c.status == ClaimStatus.PENDING
+                ),
+            }
 
-        if issues:
-            response["warnings"] = issues
+            if issues:
+                response["warnings"] = issues
 
-        response["instruction"] = (
-            f"Verify claim {claim_id} against the context. "
-            f"Call verify_claim(claim_id={claim_id}, status='supported'|'contradicted'|'unclear', "
-            f"evidence='relevant text from context')."
-        )
+            response["instruction"] = (
+                f"Verify claim {claim_id} against the context. "
+                f"Call verify_claim(claim_id={claim_id}, "
+                "status='supported'|'contradicted'|'unclear', "
+                "evidence='relevant text from context')."
+            )
 
-        logger.debug(f"Added claim {claim_id} to session {session_id}")
+            logger.debug(f"Added claim {claim_id} to session {session_id}")
 
-        return response
+            return response
 
     def verify_claim(
         self,
@@ -231,73 +236,80 @@ class VerificationManager:
             Updated verification state.
 
         """
-        state = self._get_session(session_id)
-        if state.status != SessionStatus.ACTIVE:
-            return {"error": f"Session is {state.status.value}"}
+        with self.session(session_id) as state:
+            if state.status != SessionStatus.ACTIVE:
+                return {"error": f"Session is {state.status.value}"}
 
-        if claim_id < 0 or claim_id >= len(state.claims):
-            return {"error": f"Invalid claim_id {claim_id}"}
+            if claim_id < 0 or claim_id >= len(state.claims):
+                return {"error": f"Invalid claim_id {claim_id}"}
 
-        # Update claim
-        try:
-            claim_status = ClaimStatus(status.lower())
-        except ValueError:
-            return {"error": f"Invalid status '{status}'. Use: supported, contradicted, unclear"}
+            # Update claim
+            try:
+                claim_status = ClaimStatus(status.lower())
+            except ValueError:
+                return {
+                    "error": f"Invalid status '{status}'. Use: supported, contradicted, unclear"
+                }
 
-        claim = state.claims[claim_id]
-        claim.status = claim_status
-        claim.evidence = evidence
-        claim.confidence = confidence
-        claim.timestamp = datetime.now()
-        state.updated_at = datetime.now()
+            claim = state.claims[claim_id]
+            claim.status = claim_status
+            claim.evidence = evidence
+            claim.confidence = confidence
+            claim.timestamp = datetime.now()
+            state.updated_at = datetime.now()
 
-        # Check evidence quality
-        issues = []
-        if (
-            evidence
-            and claim_status == ClaimStatus.SUPPORTED
-            and evidence.lower() not in state.context.lower()
-        ):
-            issues.append(
-                "Evidence text not found verbatim in context. "
-                "Ensure you're quoting directly from the provided context."
+            # Check evidence quality
+            issues = []
+            if (
+                evidence
+                and claim_status == ClaimStatus.SUPPORTED
+                and evidence.lower() not in state.context.lower()
+            ):
+                issues.append(
+                    "Evidence text not found verbatim in context. "
+                    "Ensure you're quoting directly from the provided context."
+                )
+
+            # Summary
+            pending = sum(1 for c in state.claims if c.status == ClaimStatus.PENDING)
+            supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
+            contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
+
+            response = {
+                "session_id": session_id,
+                "claim_id": claim_id,
+                "status": claim_status.value,
+                "summary": {
+                    "total": len(state.claims),
+                    "supported": supported,
+                    "contradicted": contradicted,
+                    "pending": pending,
+                },
+            }
+
+            if issues:
+                response["warnings"] = issues
+
+            if pending > 0:
+                next_pending = next(c for c in state.claims if c.status == ClaimStatus.PENDING)
+                response["instruction"] = (
+                    f"{pending} claims still pending. "
+                    f"Verify claim {next_pending.claim_id}: '{next_pending.content[:50]}...'"
+                )
+                response["next_claim"] = {
+                    "id": next_pending.claim_id,
+                    "content": next_pending.content,
+                }
+            else:
+                response["instruction"] = (
+                    "All claims verified. Call finalize() to complete verification."
+                )
+
+            logger.debug(
+                f"Verified claim {claim_id} as {claim_status.value} in session {session_id}"
             )
 
-        # Summary
-        pending = sum(1 for c in state.claims if c.status == ClaimStatus.PENDING)
-        supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
-        contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
-
-        response = {
-            "session_id": session_id,
-            "claim_id": claim_id,
-            "status": claim_status.value,
-            "summary": {
-                "total": len(state.claims),
-                "supported": supported,
-                "contradicted": contradicted,
-                "pending": pending,
-            },
-        }
-
-        if issues:
-            response["warnings"] = issues
-
-        if pending > 0:
-            next_pending = next(c for c in state.claims if c.status == ClaimStatus.PENDING)
-            response["instruction"] = (
-                f"{pending} claims still pending. "
-                f"Verify claim {next_pending.claim_id}: '{next_pending.content[:50]}...'"
-            )
-            response["next_claim"] = {"id": next_pending.claim_id, "content": next_pending.content}
-        else:
-            response["instruction"] = (
-                "All claims verified. Call finalize() to complete verification."
-            )
-
-        logger.debug(f"Verified claim {claim_id} as {claim_status.value} in session {session_id}")
-
-        return response
+            return response
 
     def get_status(self, session_id: str) -> dict[str, Any]:
         """Get verification status.
@@ -309,8 +321,8 @@ class VerificationManager:
             Full verification state.
 
         """
-        state = self._get_session(session_id)
-        return state.to_dict()
+        with self.session(session_id) as state:
+            return state.to_dict()
 
     def finalize(self, session_id: str) -> dict[str, Any]:
         """Finalize the verification.
@@ -322,30 +334,31 @@ class VerificationManager:
             Final verification result.
 
         """
-        state = self._get_session(session_id)
+        with self.session(session_id) as state:
+            # Check for pending claims
+            pending = [c for c in state.claims if c.status == ClaimStatus.PENDING]
+            if pending:
+                return {
+                    "error": f"{len(pending)} claims still pending verification",
+                    "pending_claims": [{"id": c.claim_id, "content": c.content} for c in pending],
+                }
 
-        # Check for pending claims
-        pending = [c for c in state.claims if c.status == ClaimStatus.PENDING]
-        if pending:
-            return {
-                "error": f"{len(pending)} claims still pending verification",
-                "pending_claims": [{"id": c.claim_id, "content": c.content} for c in pending],
-            }
+            state.status = SessionStatus.COMPLETED
+            state.updated_at = datetime.now()
 
-        state.status = SessionStatus.COMPLETED
-        state.updated_at = datetime.now()
+            # Calculate overall result
+            supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
+            contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
+            total = len(state.claims)
 
-        # Calculate overall result
-        supported = sum(1 for c in state.claims if c.status == ClaimStatus.SUPPORTED)
-        contradicted = sum(1 for c in state.claims if c.status == ClaimStatus.CONTRADICTED)
-        total = len(state.claims)
+            if total == 0:
+                overall_confidence = 1.0
+                verified = True
+            else:
+                overall_confidence = supported / total if total > 0 else 0.0
+                verified = contradicted == 0 and overall_confidence >= 0.5
 
-        if total == 0:
-            overall_confidence = 1.0
-            verified = True
-        else:
-            overall_confidence = supported / total if total > 0 else 0.0
-            verified = contradicted == 0 and overall_confidence >= 0.5
+            claims_dict = [c.to_dict() for c in state.claims]
 
         logger.info(f"Finalized verification session {session_id}: {supported}/{total} supported")
 
@@ -360,7 +373,7 @@ class VerificationManager:
                 "contradicted": contradicted,
                 "unclear": total - supported - contradicted,
             },
-            "claims": [c.to_dict() for c in state.claims],
+            "claims": claims_dict,
             "recommendation": (
                 "Answer appears factually consistent with context."
                 if verified
@@ -370,37 +383,33 @@ class VerificationManager:
 
     def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
         """Abandon a verification session."""
-        state = self._get_session(session_id)
-        state.status = SessionStatus.ABANDONED
-        state.metadata["abandon_reason"] = reason
-        state.updated_at = datetime.now()
+        with self.session(session_id) as state:
+            state.status = SessionStatus.ABANDONED
+            state.metadata["abandon_reason"] = reason
+            state.updated_at = datetime.now()
+            claims_count = len(state.claims)
 
         return {
             "session_id": session_id,
             "status": "abandoned",
             "reason": reason,
-            "claims_added": len(state.claims),
+            "claims_added": claims_count,
         }
 
     def list_sessions(self) -> dict[str, Any]:
         """List all verification sessions."""
-        sessions = []
-        for sid, state in self._sessions.items():
-            sessions.append(
-                {
-                    "session_id": sid,
-                    "status": state.status.value,
-                    "claims": len(state.claims),
-                    "created": state.created_at.isoformat(),
-                }
-            )
-        return {"sessions": sessions, "total": len(sessions)}
-
-    def _get_session(self, session_id: str) -> VerificationState:
-        """Get session or raise error."""
-        if session_id not in self._sessions:
-            raise ValueError(f"Session {session_id} not found")
-        return self._sessions[session_id]
+        with self.locked() as sessions:
+            result = []
+            for sid, state in sessions.items():
+                result.append(
+                    {
+                        "session_id": sid,
+                        "status": state.status.value,
+                        "claims": len(state.claims),
+                        "created": state.created_at.isoformat(),
+                    }
+                )
+            return {"sessions": result, "total": len(result)}
 
     def _suggest_claims(self, answer: str) -> list[str]:
         """Suggest potential claims to extract (heuristic)."""

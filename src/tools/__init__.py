@@ -1,5 +1,8 @@
 """MatrixMind reasoning tools - State managers for structured reasoning."""
 
+# Re-export scoring from utils for backward compatibility
+from src.utils.scoring import calculate_survival_score
+
 from .compress import ContextAwareCompressionTool
 from .long_chain import (
     CandidateThought,
@@ -8,7 +11,6 @@ from .long_chain import (
     LongChainManager,
     ReasoningStep,
     StepType,
-    calculate_survival_score,
     get_chain_manager,
     is_planning_step,
     should_explore_alternatives,

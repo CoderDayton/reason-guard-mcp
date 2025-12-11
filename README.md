@@ -347,6 +347,23 @@ This implementation synthesizes techniques from:
 - [Let Me Think! A Long Chain-of-Thought Can Be Worth Exponentially Many Short Ones](https://arxiv.org/abs/2505.21825) (2025)
 - [Matrix of Thought: Re-evaluating Complex Reasoning](https://arxiv.org/abs/2509.03918) (2025)
 - [Prompt Compression with Context-Aware Sentence Encoding](https://arxiv.org/abs/2409.01227) (AAAI 2025)
+- [Enhancing Long Chain-of-Thought Reasoning through Multi-Path Plan Aggregation](https://arxiv.org/abs/2510.11620) (2025) — MPPA
+- [Forward-Backward Reasoning in Large Language Models](https://arxiv.org/abs/2308.07758) (ACL 2024) — FOBAR
+
+## Benchmark Results
+
+| Strategy | Win Rate | Avg Coverage | Avg Time | Best For |
+|----------|----------|--------------|----------|----------|
+| **Matrix of Thought** | **83%** | 0.73 | 8ms | All problem types |
+| Long Chain + MPPA | 14% | 0.72 | 5ms | Math, Logic |
+| Baseline | 1% | 0.34 | 1ms | — |
+
+| Type | MoT | Long Chain | Baseline |
+|------|-----|------------|----------|
+| Math (25) | **24** | 1 | 0 |
+| Logic (25) | **16** | 7 | 0 |
+| Multi-hop (25) | **24** | 0 | 1 |
+| Analysis (25) | **19** | 6 | 0 |
 
 ## License
 

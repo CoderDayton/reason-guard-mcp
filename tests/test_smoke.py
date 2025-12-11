@@ -178,134 +178,50 @@ class TestErrorHandling:
 class TestServerTools:
     """Test server tool endpoints are properly registered."""
 
-    async def test_compress_prompt_registered(self) -> None:
-        """Test compress_prompt tool is properly registered."""
+    async def test_think_tool_registered(self) -> None:
+        """Test think tool is properly registered."""
         from fastmcp.tools.tool import FunctionTool
 
-        from src.server import compress_prompt
+        from src.server import think
 
-        assert isinstance(compress_prompt, FunctionTool)
-        tool: FunctionTool = compress_prompt
+        assert isinstance(think, FunctionTool)
+        tool: FunctionTool = think
         assert callable(tool.fn)
-        assert tool.name == "compress_prompt"
+        assert tool.name == "think"
 
-    async def test_chain_start_registered(self) -> None:
-        """Test chain_start tool is registered."""
+    async def test_compress_tool_registered(self) -> None:
+        """Test compress tool is properly registered."""
         from fastmcp.tools.tool import FunctionTool
 
-        from src.server import chain_start
+        from src.server import compress
 
-        assert isinstance(chain_start, FunctionTool)
-        tool: FunctionTool = chain_start
+        assert isinstance(compress, FunctionTool)
+        tool: FunctionTool = compress
         assert callable(tool.fn)
-        assert tool.name == "chain_start"
+        assert tool.name == "compress"
 
-    async def test_chain_add_step_registered(self) -> None:
-        """Test chain_add_step tool is registered."""
+    async def test_status_tool_registered(self) -> None:
+        """Test status tool is properly registered."""
         from fastmcp.tools.tool import FunctionTool
 
-        from src.server import chain_add_step
+        from src.server import status
 
-        assert isinstance(chain_add_step, FunctionTool)
-        assert chain_add_step.name == "chain_add_step"
-
-    async def test_chain_finalize_registered(self) -> None:
-        """Test chain_finalize tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import chain_finalize
-
-        assert isinstance(chain_finalize, FunctionTool)
-        assert chain_finalize.name == "chain_finalize"
-
-    async def test_matrix_start_registered(self) -> None:
-        """Test matrix_start tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import matrix_start
-
-        assert isinstance(matrix_start, FunctionTool)
-        assert matrix_start.name == "matrix_start"
-
-    async def test_matrix_set_cell_registered(self) -> None:
-        """Test matrix_set_cell tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import matrix_set_cell
-
-        assert isinstance(matrix_set_cell, FunctionTool)
-        assert matrix_set_cell.name == "matrix_set_cell"
-
-    async def test_matrix_synthesize_registered(self) -> None:
-        """Test matrix_synthesize tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import matrix_synthesize
-
-        assert isinstance(matrix_synthesize, FunctionTool)
-        assert matrix_synthesize.name == "matrix_synthesize"
-
-    async def test_matrix_finalize_registered(self) -> None:
-        """Test matrix_finalize tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import matrix_finalize
-
-        assert isinstance(matrix_finalize, FunctionTool)
-        assert matrix_finalize.name == "matrix_finalize"
-
-    async def test_verify_start_registered(self) -> None:
-        """Test verify_start tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import verify_start
-
-        assert isinstance(verify_start, FunctionTool)
-        assert verify_start.name == "verify_start"
-
-    async def test_verify_add_claim_registered(self) -> None:
-        """Test verify_add_claim tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import verify_add_claim
-
-        assert isinstance(verify_add_claim, FunctionTool)
-        assert verify_add_claim.name == "verify_add_claim"
-
-    async def test_verify_claim_registered(self) -> None:
-        """Test verify_claim tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import verify_claim
-
-        assert isinstance(verify_claim, FunctionTool)
-        assert verify_claim.name == "verify_claim"
-
-    async def test_verify_finalize_registered(self) -> None:
-        """Test verify_finalize tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import verify_finalize
-
-        assert isinstance(verify_finalize, FunctionTool)
-        assert verify_finalize.name == "verify_finalize"
-
-    async def test_recommend_strategy_registered(self) -> None:
-        """Test recommend_reasoning_strategy tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
-
-        from src.server import recommend_reasoning_strategy
-
-        assert isinstance(recommend_reasoning_strategy, FunctionTool)
-        tool: FunctionTool = recommend_reasoning_strategy
+        assert isinstance(status, FunctionTool)
+        tool: FunctionTool = status
         assert callable(tool.fn)
-        assert tool.name == "recommend_reasoning_strategy"
+        assert tool.name == "status"
 
-    async def test_check_status_registered(self) -> None:
-        """Test check_status tool is registered."""
-        from fastmcp.tools.tool import FunctionTool
+    async def test_all_tools_count(self) -> None:
+        """Test that exactly 3 tools are registered."""
+        from src.server import mcp
 
-        from src.server import check_status
+        tools = list(mcp._tool_manager._tools.values())
+        assert len(tools) == 3, f"Expected 3 tools, got {len(tools)}: {[t.name for t in tools]}"
 
-        assert isinstance(check_status, FunctionTool)
-        assert check_status.name == "check_status"
+    async def test_tool_names(self) -> None:
+        """Test that all expected tool names are present."""
+        from src.server import mcp
+
+        tool_names = set(mcp._tool_manager._tools.keys())
+        expected = {"think", "compress", "status"}
+        assert tool_names == expected, f"Expected {expected}, got {tool_names}"

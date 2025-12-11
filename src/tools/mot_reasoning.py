@@ -6,6 +6,11 @@ manages cell filling, and provides synthesis guidance.
 
 Based on paper 2509.03918v2 - Matrix of Thought framework.
 
+Enhancements:
+    - Column-Cell Communication: Guides divergent thinking across strategies
+    - MPPA integration: Multi-path exploration at planning cells (Row 0)
+    - FOBAR verification: Backward verification at finalization
+
 Architecture:
     - Tool receives reasoning FROM the calling LLM
     - Tracks matrix cells (rows=strategies, cols=iterations)
@@ -15,6 +20,7 @@ Architecture:
 
 from __future__ import annotations
 
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -22,6 +28,32 @@ from enum import Enum
 from typing import Any
 
 from loguru import logger
+
+from src.models.knowledge_graph import KnowledgeGraphExtractor
+from src.utils.complexity import ComplexityResult, detect_complexity
+from src.utils.scoring import calculate_cell_survival_score
+from src.utils.session import SessionManager
+
+# =============================================================================
+# MPPA: Multi-Path Plan Aggregation for Row 0 (Planning Cells)
+# =============================================================================
+
+
+@dataclass
+class CandidateCell:
+    """A candidate reasoning path for multi-path exploration in Row 0."""
+
+    content: str
+    survival_score: float
+    selected: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "content": self.content[:100] + "..." if len(self.content) > 100 else self.content,
+            "survival_score": round(self.survival_score, 3),
+            "selected": self.selected,
+        }
 
 
 class MatrixStatus(Enum):
@@ -58,10 +90,13 @@ class MatrixCell:
     content: str
     timestamp: datetime = field(default_factory=datetime.now)
     confidence: float | None = None
+    # MPPA fields for Row 0 planning cells
+    alternatives_considered: list[CandidateCell] = field(default_factory=list)
+    survival_score: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "row": self.row,
             "col": self.col,
             "strategy": self.strategy,
@@ -69,6 +104,11 @@ class MatrixCell:
             "timestamp": self.timestamp.isoformat(),
             "confidence": self.confidence,
         }
+        if self.alternatives_considered:
+            result["alternatives_considered"] = len(self.alternatives_considered)
+        if self.survival_score is not None:
+            result["survival_score"] = round(self.survival_score, 3)
+        return result
 
 
 @dataclass
@@ -138,17 +178,13 @@ class MatrixState:
         }
 
 
-class MatrixOfThoughtManager:
-    """Manages Matrix of Thought reasoning sessions.
+class MatrixOfThoughtManager(SessionManager[MatrixState]):
+    """Manager for Matrix of Thought reasoning sessions.
 
-    This is a STATE MANAGER, not a reasoner. The calling LLM provides
-    reasoning content; this tool tracks and organizes the matrix.
-
-    Example usage flow:
-        1. Agent calls: start_matrix(question="...", context="...")
-        2. Agent fills cells: set_cell(row=0, col=0, thought="...")
-        3. After each column: synthesize_column(col=0, synthesis="...")
-        4. Agent finalizes: finalize(answer="...")
+    Implements advanced MoT with:
+        - Column-Cell Communication: Horizontal thought propagation
+        - MPPA: Multi-Path Plan Aggregation for Row 0 planning
+        - FOBAR: Forward-Backward Reasoning verification
 
     Matrix structure:
         - Rows represent different reasoning strategies
@@ -157,16 +193,28 @@ class MatrixOfThoughtManager:
 
     """
 
-    def __init__(self) -> None:
-        """Initialize the matrix manager."""
-        self._sessions: dict[str, MatrixState] = {}
+    def __init__(
+        self,
+        encoder: Any | None = None,
+        kg: Any | None = None,
+    ) -> None:
+        """Initialize the matrix manager.
+
+        Args:
+            encoder: Optional ContextEncoder for semantic scoring.
+            kg: Optional KnowledgeGraph for fact alignment scoring.
+
+        """
+        super().__init__()
+        self._encoder = encoder
+        self._kg = kg
 
     def start_matrix(
         self,
         question: str,
         context: str = "",
-        rows: int = 3,
-        cols: int = 4,
+        rows: int | str = 3,
+        cols: int | str = 4,
         strategies: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -175,8 +223,8 @@ class MatrixOfThoughtManager:
         Args:
             question: The question to reason about.
             context: Background context for reasoning.
-            rows: Number of strategies (2-5).
-            cols: Number of refinement iterations (2-6).
+            rows: Number of strategies (2-5), or "auto" for adaptive selection.
+            cols: Number of refinement iterations (2-6), or "auto" for adaptive.
             strategies: Custom strategy names (default: standard 3 strategies).
             metadata: Optional metadata.
 
@@ -184,9 +232,25 @@ class MatrixOfThoughtManager:
             Session info with matrix structure.
 
         """
+        # Adaptive complexity detection
+        complexity_info: ComplexityResult | None = None
+        if rows == "auto" or cols == "auto":
+            complexity_info = detect_complexity(question, context)
+            if rows == "auto":
+                rows = complexity_info.recommended_rows
+            if cols == "auto":
+                cols = complexity_info.recommended_cols
+            logger.debug(
+                f"Adaptive dimensions: {rows}x{cols} "
+                f"(complexity: {complexity_info.complexity_level})"
+            )
+
         # Validate dimensions
-        rows = max(2, min(5, rows))
-        cols = max(2, min(6, cols))
+        try:
+            rows = max(2, min(5, int(rows)))
+            cols = max(2, min(6, int(cols)))
+        except (ValueError, TypeError):
+            return {"error": "Invalid dimensions: rows and cols must be integers 2-5/2-6 or 'auto'"}
 
         # Set up strategies
         if strategies:
@@ -208,7 +272,20 @@ class MatrixOfThoughtManager:
             strategies=strategies,
             metadata=metadata or {},
         )
-        self._sessions[session_id] = state
+        self._register_session(session_id, state)
+
+        # Auto-extract entities from question and context into shared KG
+        if self._kg is not None:
+            try:
+                extractor = KnowledgeGraphExtractor()
+                extractor.extract(question, existing_graph=self._kg)
+                if context:
+                    extractor.extract(context, existing_graph=self._kg)
+                logger.debug(
+                    f"Extracted {self._kg.stats()['entity_count']} entities from question/context"
+                )
+            except Exception as e:
+                logger.warning(f"KG extraction failed (non-fatal): {e}")
 
         logger.debug(f"Started matrix session {session_id}: {rows}x{cols}")
 
@@ -227,6 +304,7 @@ class MatrixOfThoughtManager:
             "strategies": strategies,
             "strategy_guide": strategy_guide,
             "total_cells": rows * cols,
+            "complexity": complexity_info.to_dict() if complexity_info else None,
             "instruction": (
                 f"Fill the {rows}x{cols} reasoning matrix. "
                 f"Start with cell (0,0) using '{strategies[0]}' strategy. "
@@ -243,37 +321,101 @@ class MatrixOfThoughtManager:
         col: int,
         thought: str,
         confidence: float | None = None,
+        alternatives: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Fill a cell in the matrix.
+        """Fill a cell in the matrix with Column-Cell Communication and MPPA.
+
+        For Row 0 (planning cells), supports MPPA multi-path exploration:
+        provide multiple alternative thoughts and the best one is selected
+        based on survival probability scoring.
 
         Args:
             session_id: Session to update.
             row: Row index (0-based).
             col: Column index (0-based).
-            thought: Reasoning content for this cell.
+            thought: Reasoning content for this cell (primary candidate).
             confidence: Optional confidence score.
+            alternatives: Additional candidate thoughts for Row 0 MPPA exploration.
+                         Only used for row=0 cells. The best candidate is selected.
 
         Returns:
             Updated state and guidance for next cell.
 
         """
-        state = self._get_session(session_id)
-        if state.status != MatrixStatus.ACTIVE:
-            return {"error": f"Session is {state.status.value}"}
+        with self.session(session_id) as state:
+            if state.status != MatrixStatus.ACTIVE:
+                return {"error": f"Session is {state.status.value}"}
 
-        # Validate position
-        if not (0 <= row < state.rows and 0 <= col < state.cols):
-            return {
-                "error": f"Invalid position ({row}, {col}) for {state.rows}x{state.cols} matrix"
-            }
+            # Validate position
+            if not (0 <= row < state.rows and 0 <= col < state.cols):
+                return {
+                    "error": f"Invalid position ({row}, {col}) for {state.rows}x{state.cols} matrix"
+                }
+
+            # Validate row is within strategies bounds
+            if row >= len(state.strategies):
+                return {
+                    "error": f"Row {row} exceeds available strategies ({len(state.strategies)})"
+                }
+
+        # MPPA: Multi-path exploration for Row 0 (planning cells)
+        selected_thought = thought
+        candidates: list[CandidateCell] = []
+        selected_score: float | None = None
+
+        if alternatives and row != 0:
+            # R13: Warn when alternatives provided for non-planning rows
+            import warnings
+
+            warnings.warn(
+                f"alternatives ignored for row {row} (only used for row 0 MPPA planning)",
+                stacklevel=2,
+            )
+
+        if row == 0 and alternatives:
+            # Validate alternatives list
+            if not all(isinstance(alt, str) and alt for alt in alternatives):
+                return {"error": "All alternatives must be non-empty strings"}
+
+            # Build candidate list: primary + alternatives
+            all_thoughts = [thought] + alternatives
+            strategy = state.strategies[row]
+
+            for t in all_thoughts:
+                score = calculate_cell_survival_score(
+                    thought=t,
+                    strategy=strategy,
+                    context=state.context + " " + state.question,
+                    col=col,
+                    encoder=self._encoder,
+                    kg=self._kg,
+                )
+                candidates.append(CandidateCell(content=t, survival_score=score))
+
+            # Select best candidate (with random tiebreaker for equal scores)
+            candidates.sort(
+                key=lambda c: (c.survival_score, random.random()),  # nosec B311
+                reverse=True,
+            )
+            best = candidates[0]
+            best.selected = True
+            selected_thought = best.content
+            selected_score = best.survival_score
+
+            logger.debug(
+                f"MPPA: Evaluated {len(candidates)} candidates for cell (0, {col}), "
+                f"selected with score {selected_score:.3f}"
+            )
 
         # Create cell
         cell = MatrixCell(
             row=row,
             col=col,
             strategy=state.strategies[row],
-            content=thought,
+            content=selected_thought,
             confidence=confidence,
+            alternatives_considered=candidates if candidates else [],
+            survival_score=selected_score,
         )
         state.cells[(row, col)] = cell
         state.updated_at = datetime.now()
@@ -285,7 +427,7 @@ class MatrixOfThoughtManager:
         next_cell = self._get_next_cell(state)
         col_complete = all((r, col) in state.cells for r in range(state.rows))
 
-        response = {
+        response: dict[str, Any] = {
             "session_id": session_id,
             "cell_set": {"row": row, "col": col, "strategy": state.strategies[row]},
             "cells_filled": len(state.cells),
@@ -293,6 +435,18 @@ class MatrixOfThoughtManager:
             "progress": round(len(state.cells) / (state.rows * state.cols), 2),
             "column_complete": col_complete,
         }
+
+        # MPPA: Include exploration results for Row 0
+        if candidates:
+            response["mppa"] = {
+                "candidates_evaluated": len(candidates),
+                "selected_score": round(selected_score, 3) if selected_score else None,
+                "all_scores": [round(c.survival_score, 3) for c in candidates],
+                "exploration_benefit": (
+                    "Multiple reasoning paths evaluated; best candidate selected "
+                    "based on strategy alignment and context relevance."
+                ),
+            }
 
         if issues:
             response["consistency_warnings"] = issues
@@ -305,6 +459,12 @@ class MatrixOfThoughtManager:
             response["pending_synthesis"] = col
         elif next_cell:
             response["next_cell"] = next_cell
+
+            # Column-Cell Communication: provide anti-pattern guidance
+            communication = self._get_cell_communication(state, next_cell["row"], next_cell["col"])
+            if communication:
+                response["communication"] = communication
+
             response["instruction"] = (
                 f"Continue with cell ({next_cell['row']}, {next_cell['col']}) "
                 f"using '{next_cell['strategy']}' strategy."
@@ -317,6 +477,65 @@ class MatrixOfThoughtManager:
         logger.debug(f"Set cell ({row}, {col}) in session {session_id}")
 
         return response
+
+    def _get_cell_communication(
+        self,
+        state: MatrixState,
+        row: int,
+        col: int,
+    ) -> dict[str, Any] | None:
+        """Get Column-Cell Communication guidance for divergent thinking.
+
+        Based on MTQA paper: provides explicit guidance to avoid patterns
+        from previous cells in the same column, forcing strategy divergence.
+
+        Args:
+            state: Current matrix state.
+            row: Target row for next cell.
+            col: Target column for next cell.
+
+        Returns:
+            Communication dict with avoid_patterns and build_on guidance.
+
+        """
+        communication: dict[str, Any] = {}
+
+        # Collect patterns to avoid from previous rows in same column
+        avoid_patterns = []
+        for prev_row in range(row):
+            prev_cell = state.cells.get((prev_row, col))
+            if prev_cell:
+                # Extract key phrases (first 80 chars as summary)
+                summary = prev_cell.content[:80].strip()
+                if len(prev_cell.content) > 80:
+                    summary += "..."
+                avoid_patterns.append(
+                    {
+                        "strategy": state.strategies[prev_row],
+                        "approach": summary,
+                    }
+                )
+
+        if avoid_patterns:
+            communication["avoid_patterns"] = avoid_patterns
+            num_patterns = len(avoid_patterns)
+            communication["divergence_guidance"] = (
+                f"Previous {num_patterns} strateg{'ies' if num_patterns > 1 else 'y'} "
+                f"in this column already covered certain angles. "
+                f"Use '{state.strategies[row]}' to explore a DIFFERENT perspective."
+            )
+
+        # Build on previous column's synthesis if available
+        if col > 0 and (col - 1) in state.syntheses:
+            prev_synthesis = state.syntheses[col - 1]
+            communication["build_on"] = {
+                "previous_synthesis": prev_synthesis.content[:150] + "..."
+                if len(prev_synthesis.content) > 150
+                else prev_synthesis.content,
+                "guidance": "Build on this synthesis while applying your unique strategy.",
+            }
+
+        return communication if communication else None
 
     def synthesize_column(
         self,
@@ -335,9 +554,9 @@ class MatrixOfThoughtManager:
             Updated state.
 
         """
-        state = self._get_session(session_id)
-        if state.status != MatrixStatus.ACTIVE:
-            return {"error": f"Session is {state.status.value}"}
+        with self.session(session_id) as state:
+            if state.status != MatrixStatus.ACTIVE:
+                return {"error": f"Session is {state.status.value}"}
 
         # Check column is complete
         missing = [r for r in range(state.rows) if (r, col) not in state.cells]
@@ -399,8 +618,8 @@ class MatrixOfThoughtManager:
             Full matrix state.
 
         """
-        state = self._get_session(session_id)
-        return state.to_dict()
+        with self.session(session_id) as state:
+            return state.to_dict()
 
     def finalize(
         self,
@@ -408,7 +627,12 @@ class MatrixOfThoughtManager:
         answer: str,
         confidence: float | None = None,
     ) -> dict[str, Any]:
-        """Finalize the matrix reasoning with an answer.
+        """Finalize the matrix reasoning with FOBAR backward verification.
+
+        FOBAR (Forward-Backward Reasoning) verifies the answer by:
+        1. Checking answer consistency with column syntheses
+        2. Tracing backward through reasoning to verify support
+        3. Identifying any contradictions or gaps
 
         Args:
             session_id: Session to finalize.
@@ -416,21 +640,23 @@ class MatrixOfThoughtManager:
             confidence: Optional confidence score.
 
         Returns:
-            Final matrix state with summary.
+            Final matrix state with summary and FOBAR verification results.
 
         """
-        state = self._get_session(session_id)
+        with self.session(session_id) as state:
+            # FOBAR backward verification
+            fobar_result = self._fobar_verify(state, answer)
 
-        state.final_answer = answer
-        state.status = MatrixStatus.COMPLETED
-        state.updated_at = datetime.now()
+            state.final_answer = answer
+            state.status = MatrixStatus.COMPLETED
+            state.updated_at = datetime.now()
 
-        # Generate summary
+        # Generate summary (read-only, can be outside lock)
         summary = self._generate_summary(state)
 
         logger.info(f"Finalized matrix session {session_id}")
 
-        return {
+        result = {
             "session_id": session_id,
             "status": "completed",
             "final_answer": answer,
@@ -438,6 +664,163 @@ class MatrixOfThoughtManager:
             "summary": summary,
             "matrix": state.to_dict(),
         }
+
+        # Include FOBAR verification results
+        if fobar_result:
+            result["fobar_verification"] = fobar_result
+            # Adjust confidence based on verification
+            if confidence and fobar_result.get("verification_score"):
+                result["adjusted_confidence"] = round(
+                    confidence * fobar_result["verification_score"], 2
+                )
+
+        return result
+
+    def _fobar_verify(
+        self,
+        state: MatrixState,
+        answer: str,
+    ) -> dict[str, Any]:
+        """FOBAR backward verification of the proposed answer.
+
+        Traces backward from the answer through syntheses and cells
+        to verify reasoning chain consistency.
+
+        Args:
+            state: Current matrix state.
+            answer: Proposed final answer.
+
+        Returns:
+            Verification results with score and any issues found.
+
+        """
+        # Handle empty answer
+        if not answer or not answer.strip():
+            return {
+                "verification_score": 0.0,
+                "verification_status": "FAILED",
+                "reason": "Empty answer cannot be verified",
+            }
+
+        issues: list[str] = []
+        supports: list[str] = []
+        answer_lower = answer.lower()
+
+        # Extract key terms from answer for matching
+        stopwords = {
+            "the",
+            "a",
+            "an",
+            "is",
+            "are",
+            "was",
+            "were",
+            "to",
+            "of",
+            "and",
+            "in",
+            "for",
+            "it",
+            "this",
+            "that",
+        }
+        answer_terms = set(answer_lower.split()) - stopwords
+
+        # 1. Check consistency with column syntheses (backward from final)
+        synthesis_support = 0
+        for col in sorted(state.syntheses.keys(), reverse=True):
+            synth = state.syntheses[col]
+            synth_lower = synth.content.lower()
+            synth_terms = set(synth_lower.split()) - stopwords
+
+            # Check term overlap
+            overlap = answer_terms & synth_terms
+            if overlap:
+                synthesis_support += 1
+                supports.append(
+                    f"Column {col} synthesis supports answer "
+                    f"(shared: {', '.join(list(overlap)[:3])})"
+                )
+            else:
+                # Check for direct mention
+                if any(term in synth_lower for term in answer_terms if len(term) > 3):
+                    synthesis_support += 0.5  # type: ignore[assignment]
+                    supports.append(f"Column {col} synthesis partially supports answer")
+
+        # 2. Check cell-level support (trace reasoning chain)
+        cell_support = 0
+        contradictions = []
+
+        for (row, col), cell in state.cells.items():
+            cell_lower = cell.content.lower()
+
+            # Look for direct support
+            if any(term in cell_lower for term in answer_terms if len(term) > 3):
+                cell_support += 1
+
+            # Look for contradiction indicators
+            contradiction_phrases = [
+                "however",
+                "but",
+                "contrary",
+                "opposite",
+                "instead",
+                "not",
+                "never",
+                "false",
+                "incorrect",
+                "wrong",
+            ]
+            has_contradiction = any(phrase in cell_lower for phrase in contradiction_phrases)
+
+            # If cell has contradiction language AND mentions answer terms, flag it
+            if has_contradiction and any(
+                term in cell_lower for term in answer_terms if len(term) > 3
+            ):
+                contradictions.append(
+                    f"Cell ({row},{col}) [{state.strategies[row]}] "
+                    "may contain contradicting reasoning"
+                )
+
+        if contradictions:
+            issues.extend(contradictions[:2])  # Limit to top 2
+
+        # 3. Calculate verification score
+        total_syntheses = max(len(state.syntheses), 1)
+        total_cells = max(len(state.cells), 1)
+
+        synthesis_ratio = synthesis_support / total_syntheses
+        cell_ratio = min(cell_support / total_cells, 1.0)  # Cap at 1.0
+        contradiction_penalty = len(contradictions) * 0.1
+
+        verification_score = (
+            0.6 * synthesis_ratio  # Syntheses are more important
+            + 0.4 * cell_ratio  # Cell support
+            - contradiction_penalty  # Penalty for contradictions
+        )
+        verification_score = max(0.0, min(1.0, verification_score))
+
+        # 4. Build result
+        result: dict[str, Any] = {
+            "verification_score": round(verification_score, 3),
+            "synthesis_support": f"{synthesis_support}/{total_syntheses}",
+            "cell_support": f"{cell_support}/{total_cells}",
+        }
+
+        if supports:
+            result["supporting_evidence"] = supports[:3]  # Top 3
+
+        if issues:
+            result["potential_issues"] = issues
+            result["recommendation"] = (
+                "Review the flagged cells for potential contradictions. "
+                "Consider whether the reasoning chain fully supports the answer."
+            )
+        else:
+            result["verification_status"] = "PASSED"
+            result["note"] = "Backward verification found consistent reasoning chain."
+
+        return result
 
     def abandon(self, session_id: str, reason: str = "") -> dict[str, Any]:
         """Abandon a matrix session.
@@ -450,10 +833,10 @@ class MatrixOfThoughtManager:
             Final state.
 
         """
-        state = self._get_session(session_id)
-        state.status = MatrixStatus.ABANDONED
-        state.metadata["abandon_reason"] = reason
-        state.updated_at = datetime.now()
+        with self.session(session_id) as state:
+            state.status = MatrixStatus.ABANDONED
+            state.metadata["abandon_reason"] = reason
+            state.updated_at = datetime.now()
 
         return {
             "session_id": session_id,
@@ -478,12 +861,6 @@ class MatrixOfThoughtManager:
                 }
             )
         return {"sessions": sessions, "total": len(sessions)}
-
-    def _get_session(self, session_id: str) -> MatrixState:
-        """Get session or raise error."""
-        if session_id not in self._sessions:
-            raise ValueError(f"Session {session_id} not found")
-        return self._sessions[session_id]
 
     def _get_next_cell(self, state: MatrixState) -> dict[str, Any] | None:
         """Get the next cell to fill."""
