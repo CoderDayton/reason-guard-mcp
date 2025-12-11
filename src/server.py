@@ -274,11 +274,15 @@ async def chain_add_step(
     branch_from: int | None = None,
     revises: int | None = None,
     confidence: float | None = None,
+    alternatives: list[str] | None = None,
     ctx: Context | None = None,
 ) -> str:
-    """Add a reasoning step to an active chain.
+    """Add a reasoning step to an active chain with optional multi-path exploration.
 
     Call this after YOU have reasoned about the next step.
+
+    MPPA Enhancement: Provide 'alternatives' at planning steps (e.g., "Let me...",
+    "First, I'll...") for automatic best-path selection based on survival scoring.
 
     Args:
         session_id: Session from chain_start (required)
@@ -287,14 +291,20 @@ async def chain_add_step(
         branch_from: If branching, which step number to branch from
         revises: If revising, which step number this revises
         confidence: Your confidence in this step (0-1)
+        alternatives: Alternative reasoning paths to consider (MPPA multi-path)
 
     Returns:
         JSON with step_added, progress, needs_more_steps, instruction
+        If alternatives provided: mppa_exploration with selected_score
 
     Example:
         chain_add_step(
             session_id="abc123",
-            thought="Step 1: First, I'll multiply 15 * 10 = 150"
+            thought="Let me multiply 15 * 10 = 150 first",
+            alternatives=[
+                "Let me break this into (15 * 17) = (15 * 10) + (15 * 7)",
+                "Let me use the formula (a)(b) = (a)(10 + 7)"
+            ]
         )
 
     """
@@ -307,12 +317,16 @@ async def chain_add_step(
             branch_from=branch_from,
             revises=revises,
             confidence=confidence,
+            alternatives=alternatives,
         )
 
         if ctx and "step_added" in result:
-            await ctx.info(
-                f"Added step {result['step_added']}, progress: {result.get('progress', 0):.0%}"
-            )
+            msg = f"Added step {result['step_added']}, progress: {result.get('progress', 0):.0%}"
+            if result.get("mppa_exploration"):
+                msg += (
+                    f" (MPPA: selected from {result['mppa_exploration']['candidates_evaluated']})"
+                )
+            await ctx.info(msg)
 
         return json.dumps(result, indent=2)
     except ValueError as e:

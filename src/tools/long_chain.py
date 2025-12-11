@@ -1,14 +1,24 @@
-"""Long Chain-of-Thought state manager.
+"""Long Chain-of-Thought state manager with Multi-Path Plan Aggregation (MPPA).
 
 Implements a state management tool for tracking sequential reasoning chains.
 The calling LLM does all reasoning; this tool tracks steps, validates structure,
 supports branching/revision, and provides heuristic consistency checks.
 
-Based on: "The Surprising Effectiveness of Sequential Thinking" (arXiv:2505.21825)
+Enhanced with MPPA concepts from:
+"Enhancing Long Chain-of-Thought Reasoning through Multi-Path Plan Aggregation"
+(arXiv:2510.11620v2)
+
+Key MPPA Features:
+    - Planning step detection: Identifies decision points using indicator phrases
+    - Multi-path exploration: At planning steps, evaluates multiple candidate paths
+    - Survival probability estimation: Scores candidates by likely success
+    - Variable interval scheduling: Explores more frequently early, less later
 
 Architecture:
     - Tool receives reasoning steps FROM the calling LLM
     - Tracks chain state, branches, revisions
+    - Detects planning vs execution steps
+    - Supports multi-path exploration at planning points
     - Provides heuristic verification (no internal LLM)
     - Returns state for next iteration
 """
@@ -42,6 +52,163 @@ class StepType(Enum):
     BRANCH = "branch"
     SYNTHESIS = "synthesis"
     FINAL = "final"
+    PLANNING = "planning"  # MPPA: Decision point step
+    EXECUTION = "execution"  # MPPA: Following a chosen plan
+
+
+# =============================================================================
+# MPPA: Planning Step Detection
+# =============================================================================
+
+# Indicator phrases that signal a planning/decision step (from MPPA paper)
+PLANNING_INDICATORS: tuple[str, ...] = (
+    "let me",
+    "let's",
+    "i'll",
+    "i will",
+    "i should",
+    "i need to",
+    "first,",
+    "wait,",
+    "alternatively",
+    "maybe",
+    "perhaps",
+    "one approach",
+    "another way",
+    "we could",
+    "we can",
+    "the strategy",
+    "my plan",
+    "to solve this",
+    "i think",
+    "considering",
+)
+
+
+def is_planning_step(thought: str) -> bool:
+    """Detect if a thought is a planning step (decision point).
+
+    Planning steps are where errors compound most severely.
+    MPPA focuses multi-path exploration on these critical junctures.
+
+    Args:
+        thought: The reasoning content to analyze.
+
+    Returns:
+        True if this appears to be a planning/decision step.
+
+    """
+    thought_lower = thought.lower().strip()
+    return any(thought_lower.startswith(indicator) for indicator in PLANNING_INDICATORS)
+
+
+def calculate_survival_score(thought: str, context: str, step_number: int) -> float:
+    """Estimate survival probability for a candidate thought.
+
+    Heuristic scoring based on:
+    - Coherence with problem context
+    - Specificity (not too vague)
+    - Logical connectors (building on previous reasoning)
+    - Step position (early steps need more exploration)
+
+    Args:
+        thought: Candidate reasoning step.
+        context: Problem context and previous steps.
+        step_number: Current position in the chain.
+
+    Returns:
+        Score between 0.0 and 1.0 (higher = more likely to succeed).
+
+    """
+    score = 0.5  # Base score
+
+    thought_lower = thought.lower()
+    context_lower = context.lower()
+
+    # 1. Context relevance: Does it reference key terms from the problem?
+    context_words = set(context_lower.split())
+    thought_words = set(thought_lower.split())
+    # Filter common words
+    stopwords = {"the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "in", "for"}
+    context_words -= stopwords
+    thought_words -= stopwords
+
+    if context_words:
+        overlap = len(context_words & thought_words) / len(context_words)
+        score += overlap * 0.2  # Up to +0.2
+
+    # 2. Specificity: Penalize vague thoughts
+    vague_phrases = ["something", "somehow", "maybe", "probably", "i guess", "not sure"]
+    vague_count = sum(1 for phrase in vague_phrases if phrase in thought_lower)
+    score -= vague_count * 0.1  # -0.1 per vague phrase
+
+    # 3. Logical connectors: Reward building on previous reasoning
+    connectors = ["therefore", "because", "since", "thus", "so", "given that", "based on"]
+    connector_count = sum(1 for conn in connectors if conn in thought_lower)
+    score += min(connector_count * 0.1, 0.2)  # Up to +0.2
+
+    # 4. Concrete details: Reward specifics (numbers, names, formulas)
+    has_numbers = bool(re.search(r"\b\d+(?:\.\d+)?\b", thought))
+    has_quotes = '"' in thought or "'" in thought
+    if has_numbers:
+        score += 0.1
+    if has_quotes:
+        score += 0.05
+
+    # 5. Length penalty: Too short = probably incomplete
+    word_count = len(thought.split())
+    if word_count < 10:
+        score -= 0.15
+    elif word_count > 100:
+        score -= 0.05  # Slight penalty for rambling
+
+    # 6. Early step bonus: More aggressive exploration early
+    if step_number <= 3:
+        score *= 1.1  # Boost differentiation for early steps
+
+    return max(0.0, min(1.0, score))
+
+
+def should_explore_alternatives(step_number: int, last_explore_step: int) -> bool:
+    """Determine if we should explore alternatives at this step.
+
+    Uses variable interval scheduling from MPPA paper:
+    - Explore more frequently in early steps (where errors compound most)
+    - Reduce frequency as chain progresses
+
+    Args:
+        step_number: Current step position.
+        last_explore_step: Step number of last exploration.
+
+    Returns:
+        True if alternatives should be explored.
+
+    """
+    if step_number <= 3:
+        interval = 1  # Explore every step early on
+    elif step_number <= 7:
+        interval = 2  # Every other step mid-chain
+    else:
+        interval = 3  # Less frequent late-chain
+
+    return (step_number - last_explore_step) >= interval
+
+
+@dataclass
+class CandidateThought:
+    """A candidate reasoning path for multi-path exploration."""
+
+    content: str
+    survival_score: float
+    selected: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "content": self.content[:100] + "..." if len(self.content) > 100 else self.content,
+            "survival_score": round(self.survival_score, 3),
+            "selected": self.selected,
+        }
 
 
 @dataclass
@@ -56,10 +223,13 @@ class ReasoningStep:
     revises_step: int | None = None
     confidence: float | None = None
     tags: list[str] = field(default_factory=list)
+    is_planning: bool = False  # MPPA: Was this detected as a planning step?
+    alternatives_considered: list[CandidateThought] = field(default_factory=list)  # MPPA
+    survival_score: float | None = None  # MPPA: Score if selected from alternatives
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "step_number": self.step_number,
             "content": self.content,
             "step_type": self.step_type.value,
@@ -68,7 +238,13 @@ class ReasoningStep:
             "revises_step": self.revises_step,
             "confidence": self.confidence,
             "tags": self.tags,
+            "is_planning": self.is_planning,
         }
+        if self.alternatives_considered:
+            result["alternatives_considered"] = len(self.alternatives_considered)
+        if self.survival_score is not None:
+            result["survival_score"] = round(self.survival_score, 3)
+        return result
 
 
 @dataclass
@@ -85,6 +261,10 @@ class ChainState:
     expected_steps: int = 10
     final_answer: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # MPPA fields
+    last_explore_step: int = 0  # Last step where alternatives were explored
+    total_explorations: int = 0  # Count of multi-path explorations
+    planning_steps_detected: int = 0  # Count of planning steps found
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
@@ -100,6 +280,12 @@ class ChainState:
             "final_answer": self.final_answer,
             "current_step": len(self.steps),
             "progress": len(self.steps) / max(self.expected_steps, 1),
+            # MPPA stats
+            "mppa_stats": {
+                "planning_steps_detected": self.planning_steps_detected,
+                "total_explorations": self.total_explorations,
+                "last_explore_step": self.last_explore_step,
+            },
         }
 
 
@@ -173,8 +359,15 @@ class LongChainManager:
         revises: int | None = None,
         confidence: float | None = None,
         tags: list[str] | None = None,
+        alternatives: list[str] | None = None,  # MPPA: Alternative candidate thoughts
     ) -> dict[str, Any]:
-        """Add a reasoning step to the chain.
+        """Add a reasoning step to the chain with optional multi-path exploration.
+
+        MPPA Enhancement: When `alternatives` are provided, this method:
+        1. Detects if current step is a planning step
+        2. Scores all candidates (thought + alternatives) by survival probability
+        3. Selects the highest-scoring candidate
+        4. Records the exploration for analysis
 
         Args:
             session_id: Session to add step to.
@@ -184,6 +377,7 @@ class LongChainManager:
             revises: If revising, which step this revises.
             confidence: Optional confidence score for this step.
             tags: Optional tags for categorization.
+            alternatives: MPPA - Alternative reasoning paths to consider.
 
         Returns:
             Updated state and guidance for next step.
@@ -196,32 +390,81 @@ class LongChainManager:
                 "status": state.status.value,
             }
 
-        # Determine step number
+        step_num = len(state.steps) + 1
+
+        # MPPA: Detect if this is a planning step
+        detected_planning = is_planning_step(thought)
+        if detected_planning:
+            state.planning_steps_detected += 1
+
+        # MPPA: Multi-path exploration
+        selected_thought = thought
+        survival_score: float | None = None
+        candidates: list[CandidateThought] = []
+        exploration_performed = False
+
+        # Build context for scoring
+        context = state.problem
+        if state.steps:
+            context += "\n\nPrevious steps:\n" + "\n".join(
+                f"Step {s.step_number}: {s.content[:200]}" for s in state.steps[-3:]
+            )
+
+        if alternatives and len(alternatives) > 0:
+            # Score all candidates including the primary thought
+            all_thoughts = [thought] + alternatives
+
+            for t in all_thoughts:
+                score = calculate_survival_score(t, context, step_num)
+                candidates.append(CandidateThought(content=t, survival_score=score))
+
+            # Select the best candidate
+            candidates.sort(key=lambda c: c.survival_score, reverse=True)
+            best = candidates[0]
+            best.selected = True
+            selected_thought = best.content
+            survival_score = best.survival_score
+
+            # Track exploration
+            state.total_explorations += 1
+            state.last_explore_step = step_num
+            exploration_performed = True
+
+            logger.debug(
+                f"MPPA exploration at step {step_num}: "
+                f"selected score={survival_score:.3f} from {len(candidates)} candidates"
+            )
+        elif detected_planning and should_explore_alternatives(step_num, state.last_explore_step):
+            # Planning step detected but no alternatives provided - suggest exploration
+            survival_score = calculate_survival_score(thought, context, step_num)
+
+        # Determine step number and type
         if branch_from is not None:
             branch_id = f"branch_{len(state.branches) + 1}"
             step_num = 1
             stype = StepType.BRANCH
         elif revises is not None:
-            step_num = len(state.steps) + 1
             stype = StepType.REVISION
             branch_id = None
         else:
-            step_num = len(state.steps) + 1
             try:
                 stype = StepType(step_type)
             except ValueError:
-                stype = StepType.CONTINUATION
+                stype = StepType.PLANNING if detected_planning else StepType.CONTINUATION
             branch_id = None
 
         # Create step
         step = ReasoningStep(
             step_number=step_num,
-            content=thought,
+            content=selected_thought,
             step_type=stype,
             branch_id=branch_id,
             revises_step=revises,
             confidence=confidence,
             tags=tags or [],
+            is_planning=detected_planning,
+            alternatives_considered=candidates if exploration_performed else [],
+            survival_score=survival_score,
         )
 
         # Add to appropriate location
@@ -239,7 +482,7 @@ class LongChainManager:
         progress = len(state.steps) / max(state.expected_steps, 1)
         needs_more = len(state.steps) < state.expected_steps
 
-        response = {
+        response: dict[str, Any] = {
             "session_id": session_id,
             "step_added": step_num,
             "step_type": stype.value,
@@ -249,6 +492,26 @@ class LongChainManager:
             "branches": list(state.branches.keys()),
             "needs_more_steps": needs_more,
         }
+
+        # MPPA info
+        if detected_planning:
+            response["is_planning_step"] = True
+        if exploration_performed:
+            response["mppa_exploration"] = {
+                "candidates_evaluated": len(candidates),
+                "selected_score": round(survival_score, 3) if survival_score else None,
+                "alternatives_scores": [
+                    round(c.survival_score, 3) for c in candidates if not c.selected
+                ],
+            }
+        elif detected_planning and alternatives is None:
+            # Suggest providing alternatives for planning steps
+            response["mppa_suggestion"] = (
+                "Planning step detected. Consider providing 'alternatives' parameter "
+                "with 1-3 alternative reasoning paths for better exploration."
+            )
+            if survival_score is not None:
+                response["current_survival_score"] = round(survival_score, 3)
 
         if issues:
             response["consistency_warnings"] = issues
