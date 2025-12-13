@@ -22,6 +22,8 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   # Validate the release
@@ -31,7 +33,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Determine version
         id: version
@@ -68,10 +70,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: validate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
@@ -98,11 +100,13 @@ jobs:
     name: Build Package
     runs-on: ubuntu-latest
     needs: [validate, test]
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@v4
         with:
           enable-cache: true
 
@@ -112,25 +116,85 @@ jobs:
       - name: Build package
         run: uv build
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          artifact-name: sbom-python.spdx.json
+          output-file: ./sbom-python.spdx.json
+          format: spdx-json
+
+      - name: Generate hashes for SLSA provenance
+        id: hash
+        run: |
+          cd dist
+          HASHES=$(sha256sum * | base64 -w0)
+          echo "hashes=${HASHES}" >> $GITHUB_OUTPUT
+
       - name: Verify package
         run: |
-          # Check that the built package can be inspected
           uv run python -m zipfile -l dist/*.whl | head -20
           echo "---"
           ls -la dist/
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+          retention-days: 30
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom-python.spdx.json
+          retention-days: 30
+
+  # Sign artifacts with cosign
+  sign:
+    name: Sign Artifacts
+    runs-on: ubuntu-latest
+    needs: [validate, build]
+    if: ${{ !inputs.dry_run }}
+    permissions:
+      id-token: write  # For cosign keyless signing
+      contents: read
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign artifacts with cosign
+        run: |
+          for file in dist/*; do
+            echo "Signing $file"
+            cosign sign-blob --yes "$file" --output-signature "${file}.sig" --output-certificate "${file}.pem"
+          done
+
+      - name: Upload signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: signatures
+          path: dist/*.sig
+          retention-days: 30
+
+      - name: Upload certificates
+        uses: actions/upload-artifact@v4
+        with:
+          name: certificates
+          path: dist/*.pem
           retention-days: 30
 
   # Publish to PyPI
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-latest
-    needs: [validate, build]
+    needs: [validate, build, sign]
     if: ${{ !inputs.dry_run }}
     environment:
       name: pypi
@@ -140,7 +204,7 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
@@ -151,26 +215,87 @@ jobs:
           verbose: true
           print-hash: true
 
+  # Build and publish Docker image
+  docker:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [validate, test]
+    if: ${{ !inputs.dry_run }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # For cosign signing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}},value=v${{ needs.validate.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=v${{ needs.validate.outputs.version }}
+            type=raw,value=latest,enable=${{ !contains(needs.validate.outputs.version, '-') }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign Docker image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
   # Create GitHub Release with dated changelog
   github-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [validate, build, publish-pypi]
+    needs: [validate, build, sign, publish-pypi, docker]
     if: ${{ !inputs.dry_run }}
     permissions:
       contents: write
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0  # Full history for changelog generation
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Download artifacts
-        uses: actions/download-artifact@v6
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist/
+          path: artifacts/
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp artifacts/dist/* release-assets/
+          cp artifacts/signatures/* release-assets/ 2>/dev/null || true
+          cp artifacts/certificates/* release-assets/ 2>/dev/null || true
+          cp artifacts/sbom/* release-assets/ 2>/dev/null || true
 
       - name: Generate categorized changelog
         id: changelog
@@ -194,6 +319,7 @@ jobs:
           REFACTOR=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^refactor" 2>/dev/null || true)
           PERF=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^perf" 2>/dev/null || true)
           CHORE=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^chore" 2>/dev/null || true)
+          SECURITY=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^security" 2>/dev/null || true)
 
           # Build release notes
           cat << EOF > RELEASE_NOTES.md
@@ -202,6 +328,12 @@ jobs:
           EOF
 
           # Add sections only if they have content
+          if [ -n "$SECURITY" ]; then
+            echo "### 🔒 Security" >> RELEASE_NOTES.md
+            echo "$SECURITY" >> RELEASE_NOTES.md
+            echo "" >> RELEASE_NOTES.md
+          fi
+
           if [ -n "$FEATURES" ]; then
             echo "### ✨ Features" >> RELEASE_NOTES.md
             echo "$FEATURES" >> RELEASE_NOTES.md
@@ -244,8 +376,32 @@ jobs:
             echo "" >> RELEASE_NOTES.md
           fi
 
-          # Add installation section
+          # Add verification section
           cat << 'EOF' >> RELEASE_NOTES.md
+          ## Verification
+
+          All release artifacts are signed with [Sigstore cosign](https://www.sigstore.dev/).
+
+          To verify a release artifact:
+          ```bash
+          # Install cosign
+          brew install cosign  # or see https://docs.sigstore.dev/cosign/installation
+
+          # Verify wheel
+          cosign verify-blob \
+            --signature matrixmind_mcp-VERSION-py3-none-any.whl.sig \
+            --certificate matrixmind_mcp-VERSION-py3-none-any.whl.pem \
+            --certificate-identity-regexp "https://github.com/CoderDayton/matrixmind-mcp/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            matrixmind_mcp-VERSION-py3-none-any.whl
+
+          # Verify Docker image
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/CoderDayton/matrixmind-mcp/" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ghcr.io/coderdayton/matrixmind-mcp:VERSION
+          ```
+
           ## Installation
 
           ```bash
@@ -259,9 +415,13 @@ jobs:
           ## Docker
 
           ```bash
-          docker pull ghcr.io/coderdayton/matrixmind-mcp:latest
+          docker pull ghcr.io/coderdayton/matrixmind-mcp:VERSION
+          docker run -p 8000:8000 -e SERVER_TRANSPORT=http ghcr.io/coderdayton/matrixmind-mcp:VERSION
           ```
           EOF
+
+          # Replace VERSION placeholder
+          sed -i "s/VERSION/${VERSION}/g" RELEASE_NOTES.md
 
           # Export for changelog update
           echo "release_date=${RELEASE_DATE}" >> $GITHUB_OUTPUT
@@ -290,7 +450,11 @@ jobs:
           REFACTOR=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^refactor" 2>/dev/null || true)
           PERF=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^perf" 2>/dev/null || true)
           CHORE=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^chore" 2>/dev/null || true)
+          SECURITY=$(git log ${COMMIT_RANGE} --pretty=format:"- %s" --grep="^security" 2>/dev/null || true)
 
+          if [ -n "$SECURITY" ]; then
+            CHANGELOG_ENTRY+="### Security"$'\n'"${SECURITY}"$'\n\n'
+          fi
           if [ -n "$FEATURES" ]; then
             CHANGELOG_ENTRY+="### Added"$'\n'"${FEATURES}"$'\n\n'
           fi
@@ -317,7 +481,6 @@ jobs:
 
           # Insert after the marker line in CHANGELOG.md
           if [ -f "CHANGELOG.md" ]; then
-            # Find the marker and insert after it
             sed -i "/<!-- Releases will be auto-appended below this line -->/a\\
           \\
           ${CHANGELOG_ENTRY}" CHANGELOG.md
@@ -349,7 +512,7 @@ jobs:
           draft: false
           prerelease: ${{ contains(needs.validate.outputs.version, '-') }}
           files: |
-            dist/*
+            release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -357,11 +520,11 @@ jobs:
   notify-failure:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [validate, test, build, publish-pypi, github-release]
+    needs: [validate, test, build, sign, publish-pypi, docker, github-release]
     if: failure()
     steps:
       - name: Create failure issue
-        uses: actions/github-script@v8
+        uses: actions/github-script@v7
         with:
           script: |
             const version = '${{ needs.validate.outputs.version }}';
