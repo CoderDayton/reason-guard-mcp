@@ -248,6 +248,7 @@ class ContextEncoder:
         try:
             self.model, self.tokenizer = manager.get_model()
             self.device = manager.device
+            self._inference_lock = manager.inference_lock()
             logger.debug(f"ContextEncoder using shared model on {self.device}")
         except ModelNotReadyException:
             # Re-raise as-is for caller to handle
@@ -350,33 +351,35 @@ class ContextEncoder:
                     batch_texts = [t for _, t in batch]
                     batch_indices = [i for i, _ in batch]
 
-                    # Tokenize
-                    inputs = self.tokenizer(
-                        batch_texts,
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=self.config.max_length,
-                    ).to(self.device)
+                    # Use inference lock to protect tokenizer (not thread-safe)
+                    with self._inference_lock:
+                        # Tokenize
+                        inputs = self.tokenizer(
+                            batch_texts,
+                            return_tensors="pt",
+                            padding=True,
+                            truncation=True,
+                            max_length=self.config.max_length,
+                        ).to(self.device)
 
-                    # Get token counts
-                    for _i, text in enumerate(batch_texts):
-                        tokens_per_text.append(
-                            len(self.tokenizer.encode(text, add_special_tokens=False))
+                        # Get token counts
+                        for _i, text in enumerate(batch_texts):
+                            tokens_per_text.append(
+                                len(self.tokenizer.encode(text, add_special_tokens=False))
+                            )
+
+                        # Forward pass
+                        with torch.no_grad():
+                            outputs = self.model(**inputs)
+
+                        # Pool embeddings
+                        embeddings = self._pool_embeddings(
+                            outputs.last_hidden_state,
+                            inputs["attention_mask"],
+                            pooling,
                         )
 
-                    # Forward pass
-                    with torch.no_grad():
-                        outputs = self.model(**inputs)
-
-                    # Pool embeddings
-                    embeddings = self._pool_embeddings(
-                        outputs.last_hidden_state,
-                        inputs["attention_mask"],
-                        pooling,
-                    )
-
-                    # Normalize if configured
+                    # Normalize if configured (outside lock - pure tensor ops)
                     if self.config.normalize:
                         embeddings = F.normalize(embeddings, p=2, dim=1)
 

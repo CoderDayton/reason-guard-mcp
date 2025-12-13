@@ -132,14 +132,15 @@ class TestThinkStartProperties:
     @pytest.mark.asyncio
     @given(problem=text_strategy)
     @settings(max_examples=10, deadline=10000)
-    async def test_start_without_mode_returns_error(self, problem: str) -> None:
-        """Property: start action without mode always returns error."""
+    async def test_start_without_mode_uses_auto(self, problem: str) -> None:
+        """Property: start action without mode uses auto-mode selection."""
         from src.server import think
 
         result = parse_result(await think.fn(action="start", problem=problem))
 
-        assert is_error_response(result)
-        assert "mode" in result["error"].lower()
+        # Auto-mode selection should succeed, not error
+        assert "session_id" in result
+        assert "actual_mode" in result  # Shows auto-selected mode
 
 
 # =============================================================================

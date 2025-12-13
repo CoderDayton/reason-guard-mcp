@@ -19,10 +19,8 @@ classifiers = [
 
 dependencies = [
     "fastmcp>=2.0.0",
-    "torch>=2.2.0",
-    "transformers>=4.36.0",
+    "simplevecdb>=1.3.0",
     "sentence-transformers>=2.2.2",
-    "faiss-cpu>=1.7.4",
     "pydantic>=2.5.0",
     "python-dotenv>=1.0.0",
     "loguru>=0.7.2",
@@ -86,12 +84,24 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "D", "UP", "B", "C4", "SIM"]
 ignore = [
-    "D100", "D104", "D107", "D203", "D213",
+    "D100", "D104", "D105", "D107", "D203", "D213",
     "D401",  # First line imperative mood - too strict for decorators
     "D417",  # Missing ctx arg in docstring - FastMCP injects it
     "N812",  # Lowercase import as non-lowercase - torch.nn.functional as F is standard
     "N818",  # Exception suffix - MatrixMindException is acceptable
+    "D101",  # Missing docstring in public class - allow in examples
+    "D102",  # Missing docstring in public method - allow in examples
+    "E501",  # Line too long - handled by formatter, allow in multiline strings
+    "N806",  # Variable in function should be lowercase - allow W for width
+    "E741",  # Ambiguous variable name - allow l in comprehensions
+    "B007",  # Loop control variable not used - allow for unpacking
+    "SIM110",  # Use any() - sometimes explicit loop is clearer
+    "SIM102",  # Use single if - nested if sometimes clearer
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"examples/*" = ["D", "E501", "N806", "F841", "C401"]
+"tests/*" = ["D"]
 
 [tool.bandit]
 exclude_dirs = ["tests", "examples"]

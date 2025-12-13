@@ -3,6 +3,11 @@
 This module provides semantic-aware scoring for reasoning steps,
 replacing word-overlap heuristics with embedding-based similarity
 and knowledge graph alignment.
+
+Supports three modes of operation:
+1. Word-overlap fallback (no dependencies)
+2. Embedding-based via ContextEncoder (sync)
+3. Embedding-based via AsyncVectorStore (async)
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from src.models.context_encoder import ContextEncoder
     from src.models.knowledge_graph import KnowledgeGraph
+    from src.models.vector_store import AsyncVectorStore
 
 
 # Weights for combining score components
@@ -382,4 +388,120 @@ def calculate_cell_survival_score(
         encoder=encoder,
         kg=kg,
         strategy=strategy,
+    )
+
+
+# =============================================================================
+# Async Scoring with Vector Store
+# =============================================================================
+
+
+async def async_semantic_survival_score(
+    thought: str,
+    context: str,
+    position: int = 0,
+    *,
+    vector_store: AsyncVectorStore | None = None,
+    kg: KnowledgeGraph | None = None,
+    strategy: str | None = None,
+    session_id: str | None = None,
+) -> float:
+    """Calculate semantic survival probability using async vector store.
+
+    Async version of semantic_survival_score that uses AsyncVectorStore
+    for embedding-based similarity instead of the sync ContextEncoder.
+
+    Args:
+        thought: Candidate reasoning step.
+        context: Problem context and previous steps.
+        position: Current step/column number.
+        vector_store: Optional AsyncVectorStore for semantic similarity.
+        kg: Optional KnowledgeGraph for fact alignment.
+        strategy: Optional reasoning strategy (for MoT).
+        session_id: Optional session ID for scoped search.
+
+    Returns:
+        Score between 0.0 and 1.0 (higher = more likely to succeed).
+
+    """
+    # Handle empty input
+    if not thought or not thought.strip():
+        return 0.0
+    if not context or not context.strip():
+        context = ""
+
+    # 1. Semantic similarity via vector store
+    if vector_store is not None:
+        try:
+            # Search for similar thoughts in vector store
+            results = await vector_store.search(thought, k=3)
+            if results:
+                # Use average similarity of top results
+                avg_score = sum(r.score for r in results) / len(results)
+                # Normalize from cosine similarity [0, 1] to score
+                semantic_sim = max(0.0, min(1.0, avg_score))
+            else:
+                semantic_sim = _word_overlap_score(thought, context)
+        except Exception:
+            # Fallback on any error
+            semantic_sim = _word_overlap_score(thought, context)
+    else:
+        semantic_sim = _word_overlap_score(thought, context)
+
+    # 2. Knowledge graph alignment
+    kg_score = _kg_alignment_score(thought, kg)
+
+    # 3. Specificity
+    specificity = _specificity_score(thought)
+
+    # 4. Structure
+    structure = _structure_score(thought, strategy)
+
+    # 5. Length
+    length = _length_score(thought)
+
+    # 6. Position
+    pos_score = _position_score(position)
+
+    # Weighted combination
+    final_score = (
+        WEIGHTS["semantic_similarity"] * semantic_sim
+        + WEIGHTS["kg_alignment"] * kg_score
+        + WEIGHTS["specificity"] * specificity
+        + WEIGHTS["structure"] * structure
+        + WEIGHTS["length"] * length
+        + WEIGHTS["position"] * pos_score
+    )
+
+    return max(0.0, min(1.0, final_score))
+
+
+async def async_calculate_survival_score(
+    thought: str,
+    context: str,
+    step_number: int,
+    *,
+    vector_store: AsyncVectorStore | None = None,
+    kg: KnowledgeGraph | None = None,
+) -> float:
+    """Async wrapper for long-chain reasoning backward compatibility.
+
+    Args:
+        thought: Candidate reasoning step.
+        context: Problem context and previous steps.
+        step_number: Current position in the chain (1-indexed).
+        vector_store: Optional AsyncVectorStore for semantic similarity.
+        kg: Optional KnowledgeGraph for fact alignment.
+
+    Returns:
+        Score between 0.0 and 1.0.
+
+    """
+    return await async_semantic_survival_score(
+        thought=thought,
+        context=context,
+        position=step_number,
+        vector_store=vector_store,
+        kg=kg,
+        strategy=None,
     )

@@ -33,6 +33,12 @@ from typing import Any
 from loguru import logger
 
 from src.models.knowledge_graph import KnowledgeGraphExtractor
+from src.utils.confidence import (
+    CISCSelectionResult,
+    ConfidenceMethod,
+    cisc_select,
+    combine_confidences,
+)
 from src.utils.scoring import calculate_survival_score
 from src.utils.session import SessionManager
 
@@ -131,19 +137,32 @@ def should_explore_alternatives(step_number: int, last_explore_step: int) -> boo
 
 @dataclass
 class CandidateThought:
-    """A candidate reasoning path for multi-path exploration."""
+    """A candidate reasoning path for multi-path exploration.
+
+    Enhanced with CISC confidence scoring:
+    - survival_score: Heuristic score from text analysis
+    - llm_confidence: Self-assessed confidence from calling LLM (0-1)
+    - combined_score: Hybrid of LLM confidence + heuristic (weighted)
+    """
 
     content: str
     survival_score: float
     selected: bool = False
+    llm_confidence: float | None = None  # CISC: LLM self-assessed confidence
+    combined_score: float | None = None  # CISC: Hybrid score
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "content": self.content[:100] + "..." if len(self.content) > 100 else self.content,
             "survival_score": round(self.survival_score, 3),
             "selected": self.selected,
         }
+        if self.llm_confidence is not None:
+            result["llm_confidence"] = round(self.llm_confidence, 3)
+        if self.combined_score is not None:
+            result["combined_score"] = round(self.combined_score, 3)
+        return result
 
 
 @dataclass
@@ -320,14 +339,21 @@ class LongChainManager(SessionManager[ChainState]):
         confidence: float | None = None,
         tags: list[str] | None = None,
         alternatives: list[str] | None = None,  # MPPA: Alternative candidate thoughts
+        alternative_confidences: list[float]
+        | None = None,  # CISC: LLM confidences for alternatives
     ) -> dict[str, Any]:
-        """Add a reasoning step to the chain with optional multi-path exploration.
+        """Add a reasoning step to the chain with CISC-enhanced multi-path exploration.
 
         MPPA Enhancement: When `alternatives` are provided, this method:
         1. Detects if current step is a planning step
         2. Scores all candidates (thought + alternatives) by survival probability
         3. Selects the highest-scoring candidate
         4. Records the exploration for analysis
+
+        CISC Enhancement: When `alternative_confidences` are also provided:
+        1. Combines LLM self-assessed confidence with heuristic scores
+        2. Uses softmax normalization to amplify score differences
+        3. Selects using weighted hybrid scoring (paper shows 11%+ improvement)
 
         Args:
             session_id: Session to add step to.
@@ -338,6 +364,8 @@ class LongChainManager(SessionManager[ChainState]):
             confidence: Optional confidence score for this step.
             tags: Optional tags for categorization.
             alternatives: MPPA - Alternative reasoning paths to consider.
+            alternative_confidences: CISC - LLM self-assessed confidence (0-1) for
+                each alternative. If provided, uses hybrid CISC selection.
 
         Returns:
             Updated state and guidance for next step.
@@ -357,11 +385,12 @@ class LongChainManager(SessionManager[ChainState]):
         if detected_planning:
             state.planning_steps_detected += 1
 
-        # MPPA: Multi-path exploration
+        # MPPA: Multi-path exploration with CISC enhancement
         selected_thought = thought
         survival_score: float | None = None
         candidates: list[CandidateThought] = []
         exploration_performed = False
+        cisc_result: CISCSelectionResult | None = None
 
         # Build context for scoring
         context = state.problem
@@ -374,31 +403,82 @@ class LongChainManager(SessionManager[ChainState]):
             # Score all candidates including the primary thought
             all_thoughts = [thought] + alternatives
 
-            for t in all_thoughts:
-                score = calculate_survival_score(
+            # Get LLM confidences if provided
+            all_llm_confidences: list[float | None] = [confidence]
+            if alternative_confidences:
+                all_llm_confidences.extend(alternative_confidences)
+            else:
+                all_llm_confidences.extend([None] * len(alternatives))
+
+            # Pad if needed
+            while len(all_llm_confidences) < len(all_thoughts):
+                all_llm_confidences.append(None)
+
+            # Build candidates with both heuristic and LLM scores
+            for idx, t in enumerate(all_thoughts):
+                heuristic_score = calculate_survival_score(
                     t, context, step_num, encoder=self._encoder, kg=self._kg
                 )
-                candidates.append(CandidateThought(content=t, survival_score=score))
+                llm_conf = all_llm_confidences[idx]
 
-            # Select the best candidate
-            candidates.sort(
-                key=lambda c: (c.survival_score, random.random()),  # nosec B311
-                reverse=True,
-            )
-            best = candidates[0]
-            best.selected = True
-            selected_thought = best.content
-            survival_score = best.survival_score
+                # CISC: Combine LLM confidence with heuristic if available
+                if llm_conf is not None:
+                    combined = combine_confidences(llm_conf, heuristic_score, llm_weight=0.7)
+                else:
+                    combined = heuristic_score
+
+                candidates.append(
+                    CandidateThought(
+                        content=t,
+                        survival_score=heuristic_score,
+                        llm_confidence=llm_conf,
+                        combined_score=combined,
+                    )
+                )
+
+            # CISC selection: use combined scores with softmax normalization
+            use_cisc = any(c.llm_confidence is not None for c in candidates)
+            if use_cisc:
+                # Use CISC weighted selection
+                cisc_candidates = [
+                    (c.content, c.combined_score or c.survival_score) for c in candidates
+                ]
+                cisc_result = cisc_select(
+                    cisc_candidates,
+                    method=ConfidenceMethod.HYBRID,
+                    temperature=0.5,  # Per paper recommendations
+                )
+                best_idx = cisc_result.selected_index
+                candidates[best_idx].selected = True
+                selected_thought = candidates[best_idx].content
+                survival_score = candidates[best_idx].combined_score
+
+                logger.debug(
+                    f"CISC selection at step {step_num}: "
+                    f"selected idx={best_idx}, score={survival_score:.3f}, "
+                    f"weights={[round(w, 3) for w in cisc_result.normalized_weights]}"
+                )
+            else:
+                # Fallback to MPPA heuristic selection
+                candidates.sort(
+                    key=lambda c: (c.survival_score, random.random()),  # nosec B311
+                    reverse=True,
+                )
+                best = candidates[0]
+                best.selected = True
+                selected_thought = best.content
+                survival_score = best.survival_score
+
+                logger.debug(
+                    f"MPPA exploration at step {step_num}: "
+                    f"selected score={survival_score:.3f} from {len(candidates)} candidates"
+                )
 
             # Track exploration
             state.total_explorations += 1
             state.last_explore_step = step_num
             exploration_performed = True
 
-            logger.debug(
-                f"MPPA exploration at step {step_num}: "
-                f"selected score={survival_score:.3f} from {len(candidates)} candidates"
-            )
         elif detected_planning and should_explore_alternatives(step_num, state.last_explore_step):
             # Planning step detected but no alternatives provided - suggest exploration
             survival_score = calculate_survival_score(
@@ -464,13 +544,23 @@ class LongChainManager(SessionManager[ChainState]):
         if detected_planning:
             response["is_planning_step"] = True
         if exploration_performed:
-            response["mppa_exploration"] = {
+            mppa_info: dict[str, Any] = {
                 "candidates_evaluated": len(candidates),
                 "selected_score": round(survival_score, 3) if survival_score else None,
                 "alternatives_scores": [
                     round(c.survival_score, 3) for c in candidates if not c.selected
                 ],
             }
+            # CISC enhancement info
+            if cisc_result is not None:
+                mppa_info["cisc_enabled"] = True
+                mppa_info["cisc_weights"] = [round(w, 3) for w in cisc_result.normalized_weights]
+                mppa_info["cisc_temperature"] = cisc_result.temperature
+                mppa_info["llm_confidences"] = [
+                    round(c.llm_confidence, 3) if c.llm_confidence is not None else None
+                    for c in candidates
+                ]
+            response["mppa_exploration"] = mppa_info
         elif detected_planning and alternatives is None:
             # Suggest providing alternatives for planning steps
             response["mppa_suggestion"] = (

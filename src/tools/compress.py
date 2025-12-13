@@ -165,9 +165,20 @@ class ContextAwareCompressionTool:
             if not sentences:
                 raise CompressionException("Could not split context into valid sentences")
 
-            # If only a few sentences, return as-is
+            original_tokens = self._count_tokens(context)
+
+            # Always compute relevance scores, even for small contexts
+            encoder = self._get_encoder()
+            query_emb = encoder.encode(question).embeddings.unsqueeze(0)
+            sentence_results = encoder.encode_batch(sentences)
+            sentence_embs = sentence_results.embeddings
+            similarities = F.cosine_similarity(query_emb, sentence_embs, dim=1)
+            relevance_scores = [
+                (sent, float(similarities[idx].item())) for idx, sent in enumerate(sentences)
+            ]
+
+            # If only a few sentences, return as-is with actual relevance scores
             if len(sentences) <= 3:
-                original_tokens = self._count_tokens(context)
                 return CompressionResult(
                     compressed_context=context,
                     compression_ratio=1.0,
@@ -175,23 +186,13 @@ class ContextAwareCompressionTool:
                     compressed_tokens=original_tokens,
                     sentences_kept=len(sentences),
                     sentences_removed=0,
-                    relevance_scores=[(s, 1.0) for s in sentences],
+                    relevance_scores=sorted(relevance_scores, key=lambda x: x[1], reverse=True),
                 )
 
-            original_tokens = self._count_tokens(context)
-
             # Use ContextEncoder to score sentences by similarity to question
-            # encode question + all sentences in one batch for efficiency
-            query_emb = encoder.encode(question).embeddings.unsqueeze(0)
-            sentence_results = encoder.encode_batch(sentences)
-            sentence_embs = sentence_results.embeddings
-
-            # Compute cosine similarities
-            similarities = F.cosine_similarity(query_emb, sentence_embs, dim=1)
-
             # Build scored list: (index, sentence, score)
             scored_sentences: list[tuple[int, str, float]] = [
-                (idx, sent, float(similarities[idx].item())) for idx, sent in enumerate(sentences)
+                (idx, sent, score) for idx, (sent, score) in enumerate(relevance_scores)
             ]
 
             # Sort by relevance (descending)
@@ -336,7 +337,9 @@ class ContextAwareCompressionTool:
             return self._token_cache[text_hash]
 
         _, tokenizer = self._model_manager.get_model()
-        count = len(tokenizer.encode(text, add_special_tokens=False))
+        # Use inference lock - HuggingFace tokenizer's Rust backend is not thread-safe
+        with self._model_manager.inference_lock():
+            count = len(tokenizer.encode(text, add_special_tokens=False))
 
         # Evict oldest entries if cache is full
         if len(self._token_cache) >= self._token_cache_max_size:

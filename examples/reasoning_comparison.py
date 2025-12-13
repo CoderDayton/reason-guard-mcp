@@ -27,239 +27,21 @@ import json
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-import httpx
-
-# =============================================================================
-# LLM Client for Real Answer Generation (Ollama-compatible)
-# =============================================================================
-
-
-@dataclass
-class LLMClient:
-    """Async client supporting both OpenAI-compatible and native Ollama APIs.
-
-    For qwen3 models in thinking mode, uses native Ollama API with think=false.
-    """
-
-    base_url: str = "http://localhost:11434/v1"
-    model: str = "llama3.2"
-    timeout: float = 60.0
-    _client: httpx.AsyncClient = field(init=False, repr=False)
-    _use_native_ollama: bool = field(init=False, default=False)
-
-    def __post_init__(self) -> None:
-        """Initialize HTTP client, detecting Ollama/qwen3 for native API."""
-        # Detect if this is an Ollama endpoint and model needs native API
-        # qwen3 models use "thinking" mode which puts output in reasoning field
-        self._use_native_ollama = "11434" in self.base_url and (
-            "qwen3" in self.model.lower() or "qwq" in self.model.lower()
-        )
-
-        # For native Ollama API, use base URL without /v1
-        if self._use_native_ollama:
-            native_url = self.base_url.replace("/v1", "")
-            self._client = httpx.AsyncClient(base_url=native_url, timeout=self.timeout)
-        else:
-            self._client = httpx.AsyncClient(base_url=self.base_url, timeout=self.timeout)
-
-    async def close(self) -> None:
-        """Close the HTTP client."""
-        await self._client.aclose()
-
-    async def __aenter__(self) -> LLMClient:
-        """Async context manager entry."""
-        return self
-
-    async def __aexit__(self, *args: Any) -> None:
-        """Async context manager exit."""
-        await self.close()
-
-    async def complete(
-        self,
-        prompt: str,
-        system: str = "You are a helpful assistant. Answer concisely.",
-        max_tokens: int = 256,
-    ) -> str:
-        """Generate a completion from the LLM."""
-        try:
-            if self._use_native_ollama:
-                # Use native Ollama API with think=false for qwen3 models
-                response = await self._client.post(
-                    "/api/chat",
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "stream": False,
-                        "think": False,  # Disable thinking mode for direct answers
-                        "options": {
-                            "num_predict": max_tokens,
-                            "temperature": 0.1,
-                        },
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                return data["message"]["content"].strip()
-            else:
-                # OpenAI-compatible API
-                response = await self._client.post(
-                    "/chat/completions",
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": max_tokens,
-                        "temperature": 0.1,
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
-                msg = data["choices"][0]["message"]
-                # Some models put content in "reasoning" field (thinking mode)
-                content = msg.get("content", "") or msg.get("reasoning", "")
-                return content.strip()
-        except Exception as e:
-            return f"[LLM Error: {e}]"
-
-
-# Global LLM client (initialized if --llm flag is used)
-_llm_client: LLMClient | None = None
-
-
-async def get_llm_answer(problem_text: str, context: str = "") -> str:
-    """Get an answer from the LLM for a problem."""
-    if _llm_client is None:
-        return ""
-
-    full_prompt = problem_text
-    if context:
-        full_prompt = f"Context: {context}\n\nQuestion: {problem_text}"
-
-    system = (
-        "You are solving reasoning problems. "
-        "Give only the final answer, no explanation. "
-        "Be concise - just the answer value."
-    )
-    return await _llm_client.complete(full_prompt, system=system, max_tokens=64)
-
-
-async def get_llm_chain_step(
-    problem: ReasoningProblem,
-    step_num: int,
-    previous_steps: list[str],
-) -> str:
-    """Generate a single chain reasoning step using the LLM.
-
-    This simulates a real MCP tool call flow where each step builds on previous ones.
-    """
-    if _llm_client is None:
-        return ""
-
-    # Build context from previous steps
-    if previous_steps:
-        history = "\n".join(f"Step {i + 1}: {s}" for i, s in enumerate(previous_steps))
-        context_block = f"\nYour reasoning so far:\n{history}\n"
-    else:
-        context_block = ""
-
-    # Step-specific prompts based on position in chain
-    total_steps = problem.steps_hint
-    if step_num == 1:
-        instruction = "Start by identifying the key information and what you need to find."
-    elif step_num == total_steps:
-        instruction = "Now give your final answer based on your reasoning."
-    elif step_num == 2:
-        instruction = "Set up the approach or formula you'll use to solve this."
-    else:
-        instruction = "Continue reasoning towards the solution."
-
-    prompt = f"""Problem: {problem.question}
-{f"Context: {problem.context}" if problem.context else ""}
-{context_block}
-{instruction}
-
-Provide Step {step_num} of your reasoning (1-2 sentences, be specific):"""
-
-    system = (
-        "You are a step-by-step reasoning assistant. "
-        "Each step should build logically on previous steps. "
-        "Be specific and show your work. Keep each step concise."
-    )
-    return await _llm_client.complete(prompt, system=system, max_tokens=150)
-
-
-async def get_llm_mot_cell(
-    problem: ReasoningProblem,
-    perspective: str,
-    criterion: str,
-    other_cells: list[tuple[str, str, str]],  # (perspective, criterion, content)
-) -> str:
-    """Generate a single MoT matrix cell using the LLM.
-
-    Each cell analyzes the problem from a specific perspective and criterion.
-    This simulates multi-perspective analysis in MoT.
-    """
-    if _llm_client is None:
-        return ""
-
-    # Build context from other cells
-    if other_cells:
-        others = "\n".join(f"- [{p}×{c}]: {content[:100]}..." for p, c, content in other_cells)
-        context_block = f"\nOther perspectives already analyzed:\n{others}\n"
-    else:
-        context_block = ""
-
-    prompt = f"""Problem: {problem.question}
-{f"Context: {problem.context}" if problem.context else ""}
-{context_block}
-Analyze this problem from the perspective of "{perspective}" using the criterion "{criterion}".
-
-Provide a focused analysis (2-3 sentences):"""
-
-    system = (
-        "You are analyzing a problem from multiple perspectives. "
-        "Focus specifically on the given perspective and criterion. "
-        "Be insightful and specific to this angle of analysis."
-    )
-    return await _llm_client.complete(prompt, system=system, max_tokens=150)
-
-
-async def get_llm_mot_synthesis(
-    problem: ReasoningProblem,
-    column_cells: list[tuple[str, str]],  # (perspective, content)
-    criterion: str,
-) -> str:
-    """Synthesize a column of MoT cells into a unified insight.
-
-    This combines multiple perspectives for a single criterion.
-    """
-    if _llm_client is None:
-        return ""
-
-    cells_text = "\n".join(f"- {perspective}: {content}" for perspective, content in column_cells)
-
-    prompt = f"""Problem: {problem.question}
-
-For the criterion "{criterion}", synthesize these perspectives:
-{cells_text}
-
-Provide a unified synthesis (1-2 sentences):"""
-
-    system = (
-        "You are synthesizing multiple perspectives into a coherent insight. "
-        "Find the common thread and resolve any contradictions."
-    )
-    return await _llm_client.complete(prompt, system=system, max_tokens=100)
-
+# Import shared LLM client utilities
+from llm_client import (
+    add_llm_args,
+    close_llm_client,
+    get_llm_answer,
+    get_llm_chain_step,
+    get_llm_mot_cell,
+    get_llm_mot_synthesis,
+    init_llm_client,
+    is_llm_enabled,
+)
 
 # =============================================================================
 # Problem Definitions
@@ -1869,7 +1651,7 @@ async def solve_baseline(
     start = time.perf_counter()
 
     # Get answer from LLM if available, otherwise use expected
-    if _llm_client is not None:
+    if is_llm_enabled():
         if verbose:
             print("    Calling LLM directly...")
         answer = await get_llm_answer(problem.question, problem.context)
@@ -1890,7 +1672,7 @@ async def solve_baseline(
         final_answer=answer,
         reasoning_steps=reasoning,
         duration_ms=duration_ms,
-        raw_response={"simulated": _llm_client is None, "steps": reasoning},
+        raw_response={"simulated": not is_llm_enabled(), "steps": reasoning},
     )
 
 
@@ -1943,7 +1725,7 @@ async def solve_with_long_chain(
 
         for step_num in range(1, num_steps + 1):
             # Get the thought for this step
-            if _llm_client is not None:
+            if is_llm_enabled():
                 # Real LLM-in-the-loop: each step is generated by the LLM
                 thought = await get_llm_chain_step(problem, step_num, reasoning_steps)
             else:
@@ -1985,7 +1767,7 @@ async def solve_with_long_chain(
                 print(f"      MPPA: selected score {expl['selected_score']}")
 
         # Get final answer from LLM if available
-        if _llm_client is not None:
+        if is_llm_enabled():
             # Build context from reasoning steps
             reasoning_context = "\n".join(
                 f"Step {i + 1}: {s}" for i, s in enumerate(reasoning_steps)
@@ -2117,7 +1899,7 @@ async def solve_with_mot(
         for row_idx, perspective in enumerate(perspectives):
             for col_idx, criterion in enumerate(criteria):
                 # Get the thought for this cell
-                if _llm_client is not None:
+                if is_llm_enabled():
                     # Real LLM-in-the-loop: each cell is generated by the LLM
                     thought = await get_llm_mot_cell(problem, perspective, criterion, filled_cells)
                 else:
@@ -2161,7 +1943,7 @@ async def solve_with_mot(
 
         # Synthesize columns - use LLM if available
         for col_idx, criterion in enumerate(criteria):
-            if _llm_client is not None:
+            if is_llm_enabled():
                 # Gather cells for this column
                 column_cells = [
                     (perspectives[row_idx], content)
@@ -2189,7 +1971,7 @@ async def solve_with_mot(
             reasoning_steps.append(f"[Synthesis/{criterion}] {synthesis}")
 
         # Get final answer from LLM if available
-        if _llm_client is not None:
+        if is_llm_enabled():
             reasoning_context = "\n".join(reasoning_steps)
             final_thought = await get_llm_answer(
                 f"Based on this multi-perspective analysis:\n{reasoning_context}\n\n"
@@ -2287,7 +2069,7 @@ async def solve_with_hybrid(
 
         # Run first 2 steps of chain reasoning with LLM if available
         for step_num in range(1, 3):  # Steps 1 and 2
-            if _llm_client is not None:
+            if is_llm_enabled():
                 thought = await get_llm_chain_step(problem, step_num, reasoning_steps)
             else:
                 thoughts = _generate_chain_thoughts(problem)
@@ -2367,7 +2149,7 @@ async def solve_with_hybrid(
                 # Fill matrix cells with LLM if available
                 for row, perspective in enumerate(perspectives):
                     for col, criterion in enumerate(criteria):
-                        if _llm_client is not None:
+                        if is_llm_enabled():
                             thought = await get_llm_mot_cell(
                                 problem, perspective, criterion, filled_cells
                             )
@@ -2399,7 +2181,7 @@ async def solve_with_hybrid(
 
                 # Synthesize columns with LLM if available
                 for col, criterion in enumerate(criteria):
-                    if _llm_client is not None:
+                    if is_llm_enabled():
                         column_cells = [
                             (p, content) for p, crit, content in filled_cells if crit == criterion
                         ]
@@ -2418,7 +2200,7 @@ async def solve_with_hybrid(
                     )
 
                 # Get final answer from LLM if available (escalated path)
-                if _llm_client is not None:
+                if is_llm_enabled():
                     reasoning_context = "\n".join(reasoning_steps)
                     final_thought = await get_llm_answer(
                         f"Based on this analysis:\n{reasoning_context}\n\n"
@@ -2454,7 +2236,7 @@ async def solve_with_hybrid(
 
         # No escalation - continue and finish chain (we already did 2 steps)
         for step_num in range(3, problem.steps_hint + 1):
-            if _llm_client is not None:
+            if is_llm_enabled():
                 thought = await get_llm_chain_step(problem, step_num, reasoning_steps)
             else:
                 thoughts = _generate_chain_thoughts(problem)
@@ -2480,7 +2262,7 @@ async def solve_with_hybrid(
                 reasoning_steps.append(thought)
 
         # Get final answer from LLM if available (non-escalated path)
-        if _llm_client is not None:
+        if is_llm_enabled():
             reasoning_context = "\n".join(
                 f"Step {i + 1}: {s}" for i, s in enumerate(reasoning_steps)
             )
@@ -3107,8 +2889,6 @@ def print_comparison_report(results: list[ComparisonResult], verbose: bool = Fal
 
 async def main() -> None:
     """Run the comparison benchmark."""
-    global _llm_client
-
     parser = argparse.ArgumentParser(description="Compare Long Chain vs MoT vs Baseline Reasoning")
     parser.add_argument(
         "--verbose",
@@ -3129,23 +2909,8 @@ async def main() -> None:
         choices=["math", "logic", "multi_hop", "analysis"],
         help="Only run problems of this type",
     )
-    parser.add_argument(
-        "--llm",
-        action="store_true",
-        help="Use real LLM for answer generation (requires Ollama or OpenAI-compatible endpoint)",
-    )
-    parser.add_argument(
-        "--llm-url",
-        type=str,
-        default=os.environ.get("LLM_URL", "http://localhost:11434/v1"),
-        help="LLM API endpoint (default: $LLM_URL or Ollama at localhost:11434)",
-    )
-    parser.add_argument(
-        "--llm-model",
-        type=str,
-        default="qwen3:8b",
-        help="LLM model name (default: qwen3:8b)",
-    )
+    # Add standard LLM arguments
+    add_llm_args(parser)
     parser.add_argument(
         "--hard",
         action="store_true",
@@ -3159,9 +2924,9 @@ async def main() -> None:
 
     # Initialize LLM client if requested
     if args.llm:
-        print(f"\nLLM Mode: Using {args.llm_model} at {args.llm_url}")
+        print(f"\nLLM Mode: Using {args.llm_model or 'default'} at {args.llm_url or 'default'}")
         print("  → Real LLM-in-the-loop: Each reasoning step is generated by the LLM")
-        _llm_client = LLMClient(base_url=args.llm_url, model=args.llm_model)
+        await init_llm_client(base_url=args.llm_url, model=args.llm_model)
     else:
         print("\nSimulation Mode: Using expected answers (use --llm for real LLM)")
 
@@ -3187,8 +2952,7 @@ async def main() -> None:
         results = await run_comparison(problems, verbose=args.verbose)
         print_comparison_report(results, verbose=args.verbose)
     finally:
-        if _llm_client is not None:
-            await _llm_client.close()
+        await close_llm_client()
 
 
 if __name__ == "__main__":

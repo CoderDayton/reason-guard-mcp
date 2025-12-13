@@ -31,6 +31,9 @@ from loguru import logger
 
 from src.models.knowledge_graph import KnowledgeGraphExtractor
 from src.utils.complexity import ComplexityResult, detect_complexity
+from src.utils.confidence import (
+    softmax_normalize,
+)
 from src.utils.scoring import calculate_cell_survival_score
 from src.utils.session import SessionManager
 
@@ -41,19 +44,32 @@ from src.utils.session import SessionManager
 
 @dataclass
 class CandidateCell:
-    """A candidate reasoning path for multi-path exploration in Row 0."""
+    """A candidate reasoning path for multi-path exploration in Row 0.
+
+    Enhanced with CISC confidence scoring:
+    - survival_score: Heuristic score from text analysis
+    - llm_confidence: Self-assessed confidence from calling LLM (0-1)
+    - combined_score: Hybrid of LLM confidence + heuristic (weighted)
+    """
 
     content: str
     survival_score: float
     selected: bool = False
+    llm_confidence: float | None = None  # CISC: LLM self-assessed confidence
+    combined_score: float | None = None  # CISC: Hybrid score
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "content": self.content[:100] + "..." if len(self.content) > 100 else self.content,
             "survival_score": round(self.survival_score, 3),
             "selected": self.selected,
         }
+        if self.llm_confidence is not None:
+            result["llm_confidence"] = round(self.llm_confidence, 3)
+        if self.combined_score is not None:
+            result["combined_score"] = round(self.combined_score, 3)
+        return result
 
 
 class MatrixStatus(Enum):
@@ -626,18 +642,26 @@ class MatrixOfThoughtManager(SessionManager[MatrixState]):
         session_id: str,
         answer: str,
         confidence: float | None = None,
+        strategy_confidences: dict[str, float] | None = None,  # CISC: Per-strategy confidence
     ) -> dict[str, Any]:
-        """Finalize the matrix reasoning with FOBAR backward verification.
+        """Finalize the matrix reasoning with FOBAR backward verification and CISC aggregation.
 
         FOBAR (Forward-Backward Reasoning) verifies the answer by:
         1. Checking answer consistency with column syntheses
         2. Tracing backward through reasoning to verify support
         3. Identifying any contradictions or gaps
 
+        CISC Enhancement: When strategy_confidences are provided:
+        1. Aggregates confidences across strategies using softmax normalization
+        2. Weights strategies by their confidence in the final answer
+        3. Combines with FOBAR verification for robust confidence estimation
+
         Args:
             session_id: Session to finalize.
             answer: The final answer.
-            confidence: Optional confidence score.
+            confidence: Optional overall confidence score.
+            strategy_confidences: CISC - Per-strategy confidence scores (0-1).
+                Keys are strategy names (e.g., "direct_factual": 0.8).
 
         Returns:
             Final matrix state with summary and FOBAR verification results.
@@ -646,6 +670,11 @@ class MatrixOfThoughtManager(SessionManager[MatrixState]):
         with self.session(session_id) as state:
             # FOBAR backward verification
             fobar_result = self._fobar_verify(state, answer)
+
+            # CISC: Aggregate strategy confidences
+            cisc_result: dict[str, Any] | None = None
+            if strategy_confidences:
+                cisc_result = self._cisc_aggregate_strategies(state, strategy_confidences)
 
             state.final_answer = answer
             state.status = MatrixStatus.COMPLETED
@@ -656,7 +685,7 @@ class MatrixOfThoughtManager(SessionManager[MatrixState]):
 
         logger.info(f"Finalized matrix session {session_id}")
 
-        result = {
+        result: dict[str, Any] = {
             "session_id": session_id,
             "status": "completed",
             "final_answer": answer,
@@ -668,13 +697,78 @@ class MatrixOfThoughtManager(SessionManager[MatrixState]):
         # Include FOBAR verification results
         if fobar_result:
             result["fobar_verification"] = fobar_result
-            # Adjust confidence based on verification
-            if confidence and fobar_result.get("verification_score"):
-                result["adjusted_confidence"] = round(
-                    confidence * fobar_result["verification_score"], 2
-                )
+
+        # CISC aggregation results
+        if cisc_result:
+            result["cisc_aggregation"] = cisc_result
+
+        # Compute adjusted confidence combining all sources
+        if confidence is not None:
+            adjusted = confidence
+            # FOBAR adjustment
+            if fobar_result and fobar_result.get("verification_score"):
+                adjusted *= fobar_result["verification_score"]
+            # CISC agreement adjustment
+            if cisc_result and cisc_result.get("agreement_score"):
+                # Average FOBAR and CISC adjustments
+                adjusted = (adjusted + cisc_result["agreement_score"]) / 2
+            result["adjusted_confidence"] = round(adjusted, 3)
 
         return result
+
+    def _cisc_aggregate_strategies(
+        self,
+        state: MatrixState,
+        strategy_confidences: dict[str, float],
+    ) -> dict[str, Any]:
+        """CISC-style weighted aggregation across reasoning strategies.
+
+        Applies softmax normalization to strategy confidences to compute
+        agreement score and identify which strategies contribute most.
+
+        Args:
+            state: Current matrix state.
+            strategy_confidences: Per-strategy confidence scores.
+
+        Returns:
+            Aggregation results with weights and agreement score.
+
+        """
+        strategies = list(strategy_confidences.keys())
+        raw_scores = [strategy_confidences.get(s, 0.5) for s in strategies]
+
+        # Apply softmax normalization (temperature 0.5 for moderate sharpening)
+        normalized = softmax_normalize(raw_scores, temperature=0.5)
+
+        # Agreement score: how much strategies converge
+        # High max weight = one strategy dominates = less agreement
+        # Uniform weights = all strategies agree = more agreement
+        max_weight = max(normalized) if normalized else 0.0
+        min_possible_max = 1.0 / len(strategies) if strategies else 1.0
+
+        # Normalize to 0-1 where 1 = perfect agreement (uniform)
+        if len(strategies) > 1:
+            agreement = 1.0 - (max_weight - min_possible_max) / (1.0 - min_possible_max)
+        else:
+            agreement = 1.0  # Single strategy = full agreement
+
+        # Identify dominant strategy
+        dominant_idx = normalized.index(max_weight) if normalized else 0
+        dominant_strategy = strategies[dominant_idx] if strategies else None
+
+        return {
+            "strategy_weights": dict(
+                zip(strategies, [round(w, 3) for w in normalized], strict=False)
+            ),
+            "raw_confidences": dict(
+                zip(strategies, [round(s, 3) for s in raw_scores], strict=False)
+            ),
+            "agreement_score": round(agreement, 3),
+            "dominant_strategy": dominant_strategy,
+            "dominant_weight": round(max_weight, 3),
+            "method": "cisc_softmax_aggregation",
+            "temperature": 0.5,
+        }
 
     def _fobar_verify(
         self,

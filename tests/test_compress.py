@@ -275,15 +275,33 @@ class TestCompressionToolEdgeCases:
         ModelManager.reset_instance()
 
     def test_few_sentences_returns_unchanged(self) -> None:
-        """Test that few sentences (<=3) return unchanged."""
+        """Test that few sentences (<=3) return unchanged with actual relevance scores."""
         with patch.object(ModelManager, "get_instance") as mock_get_instance:
+            mock_model = MagicMock()
+            mock_model.config.hidden_size = 768
+
+            # Mock model output for embedding computation
+            mock_output = MagicMock()
+            # 4 embeddings: 1 for question + 3 for sentences (batch encode calls)
+            mock_output.last_hidden_state = torch.randn(4, 10, 768)
+            mock_model.return_value = mock_output
+            mock_model.__call__ = MagicMock(return_value=mock_output)
+
+            # Mock batch encoding with proper tensor returns
+            mock_batch_encoding = MagicMock()
+            mock_batch_encoding.__getitem__ = lambda self, key: (
+                torch.randint(0, 1000, (4, 10)) if key == "input_ids" else torch.ones(4, 10)
+            )
+            mock_batch_encoding.to = MagicMock(return_value=mock_batch_encoding)
+
             mock_tokenizer = MagicMock()
+            mock_tokenizer.return_value = mock_batch_encoding
             mock_tokenizer.encode.return_value = list(range(10))
 
             mock_manager = MagicMock()
             mock_manager.device = "cpu"
             mock_manager.is_ready.return_value = True
-            mock_manager.get_model.return_value = (MagicMock(), mock_tokenizer)
+            mock_manager.get_model.return_value = (mock_model, mock_tokenizer)
             mock_manager.get_hidden_size.return_value = 768
             mock_get_instance.return_value = mock_manager
 
@@ -296,6 +314,8 @@ class TestCompressionToolEdgeCases:
             assert result.compression_ratio == 1.0
             assert result.sentences_kept == 3
             assert result.sentences_removed == 0
+            # Should have actual relevance scores now (not all 1.0)
+            assert len(result.relevance_scores) == 3
 
     def test_ensures_at_least_one_sentence_selected(self) -> None:
         """Test that at least one sentence is always selected."""

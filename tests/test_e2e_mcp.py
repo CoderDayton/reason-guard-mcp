@@ -70,8 +70,8 @@ class TestMCPProtocol:
             )
             assert not result.is_error
             response = json.loads(result.data)
-            assert response["status"] == "started"
-            assert response["mode"] == "chain"
+            assert response["status"] == "active"  # Unified reasoner uses "active"
+            assert response["mode"] == "chain" or response["actual_mode"] == "chain"
             session_id = response["session_id"]
 
             # Step 2: Add steps with continue action
@@ -125,8 +125,8 @@ class TestMCPProtocol:
             )
             assert not result.is_error
             response = json.loads(result.data)
-            assert response["status"] == "started"
-            assert response["mode"] == "matrix"
+            assert response["status"] == "active"  # Unified reasoner uses "active"
+            assert response["mode"] == "matrix" or response["actual_mode"] == "matrix"
             session_id = response["session_id"]
 
             # Step 2: Set cells with continue action
@@ -188,7 +188,7 @@ class TestMCPProtocol:
         from src.server import mcp
 
         async with Client(mcp) as client:
-            # Step 1: Start verification
+            # Step 1: Start verification (uses chain mode internally)
             result = await client.call_tool(
                 "think",
                 {
@@ -200,11 +200,11 @@ class TestMCPProtocol:
             )
             assert not result.is_error
             response = json.loads(result.data)
-            assert response["status"] == "started"
-            assert response["mode"] == "verify"
+            assert response["status"] == "active"  # Unified reasoner uses "active"
+            assert response["mode"] == "verify"  # Preserved for backwards compatibility
             session_id = response["session_id"]
 
-            # Step 2: Add claim with continue action
+            # Step 2: Add reasoning step with continue action
             result = await client.call_tool(
                 "think",
                 {
@@ -215,29 +215,29 @@ class TestMCPProtocol:
             )
             assert not result.is_error
             response = json.loads(result.data)
-            claim_id = response["claim_id"]
+            # Unified reasoner returns thought_id, not claim_id
+            assert "thought_id" in response or "step" in response
 
-            # Step 3: Verify claim
+            # Step 3: Add verification step
             result = await client.call_tool(
                 "think",
                 {
                     "action": "verify",
                     "session_id": session_id,
-                    "claim_id": claim_id,
-                    "verdict": "supported",
-                    "evidence": "Context confirms this",
+                    "evidence": "Context confirms this claim about Einstein",
                 },
             )
             assert not result.is_error
 
-            # Step 4: Finish verification
+            # Step 4: Finish
             result = await client.call_tool(
                 "think",
-                {"action": "finish", "session_id": session_id},
+                {"action": "finish", "session_id": session_id, "thought": "Verified"},
             )
             assert not result.is_error
             response = json.loads(result.data)
-            assert response["verified"] is True
+            # Unified reasoner returns "completed" status, not "verified"
+            assert response["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_think_error_handling(self) -> None:

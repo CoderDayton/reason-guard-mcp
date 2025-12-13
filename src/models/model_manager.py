@@ -177,6 +177,7 @@ class ModelManager:
         self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
         self._error_message: str | None = None
         self._init_lock = threading.Lock()
+        self._inference_lock = threading.Lock()  # Protects tokenizer/model during inference
 
     @classmethod
     def get_instance(cls) -> ModelManager:
@@ -354,6 +355,25 @@ class ModelManager:
 
         """
         return self.state == ModelState.READY
+
+    def inference_lock(self) -> threading.Lock:
+        """Get the inference lock for thread-safe tokenizer/model access.
+
+        The HuggingFace tokenizer's Rust backend is not thread-safe and will
+        raise "Already borrowed" errors under concurrent access. Use this lock
+        to protect tokenization and model inference calls.
+
+        Returns:
+            The inference lock (use with `with` statement).
+
+        Example:
+            >>> manager = ModelManager.get_instance()
+            >>> with manager.inference_lock():
+            ...     inputs = tokenizer(texts, return_tensors="pt")
+            ...     outputs = model(**inputs)
+
+        """
+        return self._inference_lock
 
     def get_status(self) -> dict[str, str | int | bool | None]:
         """Get current model and system status.

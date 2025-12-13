@@ -139,6 +139,76 @@ jobs:
             echo "$UNRELEASED"
           fi
 
+  benchmark:
+    name: Performance Benchmark
+    runs-on: ubuntu-latest
+    needs: [test]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --frozen --dev
+
+      - name: Run benchmark
+        run: |
+          uv run python examples/benchmark.py --export benchmark_results.json
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat benchmark_results.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Check for performance regression
+        run: |
+          # Extract p95 latencies from benchmark results
+          CHAIN_P95=$(jq -r '.results[] | select(.name=="chain_workflow") | .latency.p95_ms // empty' benchmark_results.json)
+          COMPRESS_P95=$(jq -r '.results[] | select(.name=="compress_latency") | .latency.p95_ms // empty' benchmark_results.json)
+
+          # Validate results exist
+          if [ -z "$CHAIN_P95" ]; then
+            echo "::error::chain_workflow benchmark result not found"
+            exit 1
+          fi
+          if [ -z "$COMPRESS_P95" ]; then
+            echo "::error::compress_latency benchmark result not found"
+            exit 1
+          fi
+
+          # Baseline thresholds (fail if p95 exceeds these by >20%)
+          CHAIN_BASELINE=25.0
+          COMPRESS_BASELINE=10.0
+
+          echo "Chain workflow p95: ${CHAIN_P95}ms (baseline: ${CHAIN_BASELINE}ms)"
+          echo "Compress p95: ${COMPRESS_P95}ms (baseline: ${COMPRESS_BASELINE}ms)"
+
+          # Check regression (allow 20% variance for CI environment)
+          CHAIN_THRESHOLD=$(echo "$CHAIN_BASELINE * 1.2" | bc)
+          COMPRESS_THRESHOLD=$(echo "$COMPRESS_BASELINE * 1.2" | bc)
+
+          if (( $(echo "$CHAIN_P95 > $CHAIN_THRESHOLD" | bc -l) )); then
+            echo "::warning::Chain workflow p95 (${CHAIN_P95}ms) exceeds threshold (${CHAIN_THRESHOLD}ms)"
+          fi
+
+          if (( $(echo "$COMPRESS_P95 > $COMPRESS_THRESHOLD" | bc -l) )); then
+            echo "::warning::Compress p95 (${COMPRESS_P95}ms) exceeds threshold (${COMPRESS_THRESHOLD}ms)"
+          fi
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v5
+        with:
+          name: benchmark-results
+          path: benchmark_results.json
+          retention-days: 30
+
   docker:
     name: Docker Build & Sign
     runs-on: ubuntu-latest

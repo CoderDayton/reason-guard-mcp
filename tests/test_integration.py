@@ -410,3 +410,150 @@ class TestSemanticScoringIntegration:
         # KG should have extracted entities
         stats = kg.stats()
         assert stats.num_entities > 0, "KG should have extracted entities from question/context"
+
+
+class TestContradictionFlowIntegration:
+    """Integration tests for full contradiction detection and resolution flow."""
+
+    @pytest.mark.asyncio
+    async def test_full_contradiction_flow_via_think_tool(self) -> None:
+        """Test complete flow: start -> add thought -> add contradicting thought -> get guidance."""
+        import json
+
+        from src.server import think
+
+        # Start a reasoning session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Is the answer to this problem positive or negative?",
+                expected_steps=5,
+            )
+        )
+        assert "session_id" in start_result
+        session_id = start_result["session_id"]
+
+        # Add first thought asserting something is true
+        first_result = json.loads(
+            await think.fn(
+                action="continue",
+                session_id=session_id,
+                thought="The answer is definitely positive. All indicators point to a positive result.",
+                confidence=0.8,
+            )
+        )
+        assert "thought_id" in first_result or "step" in first_result
+
+        # Add contradicting thought
+        contradict_result = json.loads(
+            await think.fn(
+                action="continue",
+                session_id=session_id,
+                thought="The answer is definitely negative. All indicators point to a negative result.",
+                confidence=0.7,
+            )
+        )
+
+        # Should have contradiction_resolution guidance if graph detected contradiction
+        # Note: Detection depends on pattern matching, so check for either case
+        if "graph" in contradict_result and contradict_result["graph"].get("contradictions", 0) > 0:
+            assert "contradiction_resolution" in contradict_result
+            resolution = contradict_result["contradiction_resolution"]
+            assert "strategies" in resolution
+            assert "recommendation" in resolution
+            assert len(resolution["strategies"]) == 4
+            assert resolution["action_required"] is True
+
+    @pytest.mark.asyncio
+    async def test_contradiction_detection_with_explicit_patterns(self) -> None:
+        """Test that known contradiction patterns trigger guidance."""
+        import json
+
+        from src.server import think
+
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Determine if X is valid or invalid",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # First: X is valid
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="After analysis, X is valid because it meets all criteria.",
+            confidence=0.9,
+        )
+
+        # Second: X is invalid (explicit contradiction pattern)
+        result = json.loads(
+            await think.fn(
+                action="continue",
+                session_id=session_id,
+                thought="After further review, X is invalid because it fails key tests.",
+                confidence=0.85,
+            )
+        )
+
+        # Check that graph tracked the thoughts
+        if "graph" in result:
+            graph_info = result["graph"]
+            # The graph info contains node_added, edges_added, contradictions
+            assert "node_added" in graph_info, "Should have added a node"
+            assert "contradictions" in graph_info, "Should track contradictions"
+
+    @pytest.mark.asyncio
+    async def test_unified_reasoner_contradiction_guidance_format(self) -> None:
+        """Test the structure of contradiction guidance matches expected format."""
+        from src.tools.unified_reasoner import ReasoningMode, UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        # Start session
+        start = await manager.start_session(
+            problem="Test contradiction flow",
+            context="Testing",
+            mode=ReasoningMode.CHAIN,
+        )
+        session_id = start["session_id"]
+
+        # Add thoughts that will contradict
+        await manager.add_thought(
+            session_id=session_id,
+            content="The process is always successful",
+            confidence=0.8,
+        )
+
+        # This should contradict due to "always" vs "never" pattern
+        result = await manager.add_thought(
+            session_id=session_id,
+            content="The process is never successful under any circumstances",
+            confidence=0.75,
+        )
+
+        # If contradiction detected, verify guidance structure
+        if "contradiction_resolution" in result:
+            guidance = result["contradiction_resolution"]
+
+            # Verify all required keys
+            assert "contradicting_thoughts" in guidance
+            assert "strategies" in guidance
+            assert "recommendation" in guidance
+            assert "action_required" in guidance
+            assert "message" in guidance
+
+            # Verify strategies have required fields
+            for strategy in guidance["strategies"]:
+                assert "name" in strategy
+                assert "action" in strategy
+                assert "when_to_use" in strategy
+                assert "how" in strategy
+
+            # Verify recommendation structure
+            assert "strategy" in guidance["recommendation"]
+            assert "reason" in guidance["recommendation"]

@@ -30,6 +30,14 @@ from .scoring import (
     semantic_survival_score,
 )
 from .session import SessionManager, SessionNotFoundError
+from .weight_store import (
+    DEFAULT_WEIGHTS,
+    DecayConfig,
+    DomainWeights,
+    WeightStore,
+    get_weight_store,
+    reset_weight_store,
+)
 
 __all__ = [
     "ReasoningStrategy",
@@ -55,4 +63,10 @@ __all__ = [
     "calculate_cell_survival_score",
     "calculate_survival_score",
     "semantic_survival_score",
+    "DEFAULT_WEIGHTS",
+    "DecayConfig",
+    "DomainWeights",
+    "WeightStore",
+    "get_weight_store",
+    "reset_weight_store",
 ]

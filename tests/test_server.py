@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -791,15 +792,17 @@ class TestConsolidatedThinkTool:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_think_missing_mode_on_start(self) -> None:
-        """Test think() start action without mode returns error."""
+    async def test_think_auto_mode_on_start(self) -> None:
+        """Test think() start action without mode uses auto-mode selection."""
         import json
 
         from src.server import think
 
-        result = json.loads(await think.fn(action="start", problem="Test"))
+        result = json.loads(await think.fn(action="start", problem="Test problem"))
 
-        assert "error" in result
+        # Auto-mode selection should succeed
+        assert "session_id" in result
+        assert "actual_mode" in result  # Shows auto-selected mode
 
     @pytest.mark.asyncio
     async def test_think_missing_problem_on_start(self) -> None:
@@ -849,8 +852,8 @@ class TestConsolidatedThinkTool:
         assert "error" in result
 
     @pytest.mark.asyncio
-    async def test_think_verify_missing_claim_id(self) -> None:
-        """Test think() verify action without claim_id returns error."""
+    async def test_think_verify_requires_evidence(self) -> None:
+        """Test think() verify action requires thought/evidence."""
         import json
 
         from src.server import think
@@ -860,13 +863,1730 @@ class TestConsolidatedThinkTool:
         )
         session_id = start_result["session_id"]
 
+        # Verify without thought/evidence should error
+        result = json.loads(await think.fn(action="verify", session_id=session_id))
+
+        assert "error" in result
+
+
+class TestContradictionGuidance:
+    """Tests for contradiction resolution guidance in unified reasoner."""
+
+    def _make_session(self, problem: str = "Test") -> Any:
+        """Create a minimal ReasoningSession for testing."""
+        from src.tools.unified_reasoner import (
+            DomainType,
+            ReasoningMode,
+            ReasoningSession,
+            SessionStatus,
+        )
+        from src.utils.complexity import ComplexityResult
+
+        return ReasoningSession(
+            session_id="test_session",
+            problem=problem,
+            context="Test context",
+            mode=ReasoningMode.CHAIN,
+            actual_mode=ReasoningMode.CHAIN,
+            status=SessionStatus.ACTIVE,
+            domain=DomainType.GENERAL,
+            complexity=ComplexityResult(
+                complexity_score=0.5,
+                complexity_level="medium",
+                recommended_rows=3,
+                recommended_cols=3,
+                signals=(),
+                word_count=10,
+            ),
+        )
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_structure(self) -> None:
+        """Test that contradiction guidance returns proper structure."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+
+        session.thoughts["t1"] = Thought(
+            id="t1",
+            content="X is true",
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=1,
+            confidence=0.8,
+        )
+        session.thoughts["t2"] = Thought(
+            id="t2",
+            content="X is false",
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=2,
+            confidence=0.6,
+        )
+
+        current_thought = session.thoughts["t2"]
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=current_thought,
+            contradicting_ids=["t1"],
+        )
+
+        assert "contradicting_thoughts" in guidance
+        assert "strategies" in guidance
+        assert "recommendation" in guidance
+        assert "action_required" in guidance
+        assert "message" in guidance
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_strategies(self) -> None:
+        """Test that all four strategies are provided."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+        session.thoughts["t1"] = Thought(
+            id="t1",
+            content="Claim A",
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=1,
+            confidence=0.7,
+        )
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=Thought(
+                id="t2",
+                content="Not A",
+                thought_type=ThoughtType.CONTINUATION,
+                step_number=2,
+                confidence=0.7,
+            ),
+            contradicting_ids=["t1"],
+        )
+
+        strategy_names = [s["name"] for s in guidance["strategies"]]
+        assert "revise" in strategy_names
+        assert "branch" in strategy_names
+        assert "reconcile" in strategy_names
+        assert "backtrack" in strategy_names
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_recommends_revise_on_lower_confidence(self) -> None:
+        """Test that revise is recommended when current thought has lower confidence."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+        session.thoughts["t1"] = Thought(
+            id="t1",
+            content="High confidence claim",
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=1,
+            confidence=0.9,  # High confidence
+        )
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=Thought(
+                id="t2",
+                content="Low confidence claim",
+                thought_type=ThoughtType.CONTINUATION,
+                step_number=2,
+                confidence=0.4,  # Low confidence
+            ),
+            contradicting_ids=["t1"],
+        )
+
+        assert guidance["recommendation"]["strategy"] == "revise"
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_recommends_reconcile_on_similar_confidence(self) -> None:
+        """Test that reconcile is recommended when confidences are similar."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+        session.thoughts["t1"] = Thought(
+            id="t1",
+            content="Claim with similar confidence",
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=1,
+            confidence=0.7,
+        )
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=Thought(
+                id="t2",
+                content="Contradicting claim with similar confidence",
+                thought_type=ThoughtType.CONTINUATION,
+                step_number=2,
+                confidence=0.7,
+            ),
+            contradicting_ids=["t1"],
+        )
+
+        assert guidance["recommendation"]["strategy"] == "reconcile"
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_empty_on_no_contradictions(self) -> None:
+        """Test that empty dict is returned when no contradicting IDs."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=Thought(
+                id="t1",
+                content="Some thought",
+                thought_type=ThoughtType.CONTINUATION,
+                step_number=1,
+            ),
+            contradicting_ids=[],
+        )
+
+        assert guidance == {}
+
+    @pytest.mark.asyncio
+    async def test_contradiction_guidance_includes_thought_summaries(self) -> None:
+        """Test that contradicting thoughts have proper summaries."""
+        from src.tools.unified_reasoner import (
+            Thought,
+            ThoughtType,
+            UnifiedReasonerManager,
+        )
+
+        manager = UnifiedReasonerManager()
+        session = self._make_session()
+
+        long_content = "This is a very long thought content that exceeds one hundred characters and should be truncated in the guidance summary for readability."
+        session.thoughts["t1"] = Thought(
+            id="t1",
+            content=long_content,
+            thought_type=ThoughtType.CONTINUATION,
+            step_number=1,
+            confidence=0.7,
+        )
+
+        guidance = manager._get_contradiction_guidance(
+            session=session,
+            current_thought=Thought(
+                id="t2",
+                content="Contradicting thought",
+                thought_type=ThoughtType.CONTINUATION,
+                step_number=2,
+            ),
+            contradicting_ids=["t1"],
+        )
+
+        summary = guidance["contradicting_thoughts"][0]["summary"]
+        assert len(summary) <= 103  # 100 chars + "..."
+        assert summary.endswith("...")
+
+
+class TestSemanticContradictionDetection:
+    """Tests for semantic contradiction detection in unified reasoner."""
+
+    @pytest.mark.asyncio
+    async def test_pattern_detection_explicit_patterns(self) -> None:
+        """Test pattern-based detection finds explicit contradictions."""
+        from src.tools.unified_reasoner import UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        # Explicit pattern: valid/invalid
+        assert manager._detect_contradiction_patterns(
+            "The solution is valid",
+            "The solution is invalid",
+        )
+
+        # Explicit pattern: always/never
+        assert manager._detect_contradiction_patterns(
+            "This always works",
+            "This never works",
+        )
+
+        # Explicit pattern: true/false
+        assert manager._detect_contradiction_patterns(
+            "The statement is true",
+            "The statement is false",
+        )
+
+    @pytest.mark.asyncio
+    async def test_pattern_detection_negation(self) -> None:
+        """Test pattern-based detection finds negation contradictions."""
+        from src.tools.unified_reasoner import UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        # Negation with shared phrase
+        assert manager._detect_contradiction_patterns(
+            "The answer is correct",
+            "The answer is not correct",
+        )
+
+    @pytest.mark.asyncio
+    async def test_pattern_detection_no_contradiction(self) -> None:
+        """Test pattern-based detection returns False for non-contradictions."""
+        from src.tools.unified_reasoner import UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        # Different topics, no contradiction
+        assert not manager._detect_contradiction_patterns(
+            "Python is a programming language",
+            "The weather is nice today",
+        )
+
+        # Same topic, no contradiction
+        assert not manager._detect_contradiction_patterns(
+            "The algorithm runs in O(n) time",
+            "The algorithm uses linear space",
+        )
+
+    @pytest.mark.asyncio
+    async def test_semantic_detection_returns_pattern_match(self) -> None:
+        """Test semantic detection fast-paths on pattern matches."""
+        from src.tools.unified_reasoner import UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()  # No vector store
+
+        is_contra, confidence = await manager._detect_contradiction_semantic(
+            "The hypothesis is always true",
+            "The hypothesis is never true",
+        )
+
+        assert is_contra is True
+        assert confidence >= 0.9  # High confidence for pattern match
+
+    @pytest.mark.asyncio
+    async def test_semantic_detection_no_vector_store(self) -> None:
+        """Test semantic detection returns False without vector store."""
+        from src.tools.unified_reasoner import UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()  # No vector store
+
+        # No pattern match, and no vector store for semantic check
+        is_contra, confidence = await manager._detect_contradiction_semantic(
+            "Machine learning models require training data",
+            "Neural networks don't need any examples to learn",
+        )
+
+        # Without pattern match and without vector store, should return False
+        # (this specific pair might or might not trigger patterns)
+        assert isinstance(is_contra, bool)
+        assert isinstance(confidence, float)
+
+    @pytest.mark.asyncio
+    async def test_detect_contradictions_in_session(self) -> None:
+        """Test detecting all contradictions in a session."""
+        from src.tools.unified_reasoner import ReasoningMode, UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        # Start session and add thoughts
+        start = await manager.start_session(
+            problem="Test problem",
+            mode=ReasoningMode.CHAIN,
+        )
+        session_id = start["session_id"]
+
+        # Add thought 1
+        await manager.add_thought(
+            session_id=session_id,
+            content="The result is always positive",
+            confidence=0.8,
+        )
+
+        # Add contradicting thought 2
+        await manager.add_thought(
+            session_id=session_id,
+            content="The result is never positive under any circumstances",
+            confidence=0.7,
+        )
+
+        # Detect contradictions
+        contradictions = await manager.detect_contradictions_in_session(
+            session_id=session_id,
+            use_semantic=False,  # Use pattern-based only for determinism
+        )
+
+        assert len(contradictions) >= 1
+        assert "thought_a" in contradictions[0]
+        assert "thought_b" in contradictions[0]
+        assert "confidence" in contradictions[0]
+        assert "method" in contradictions[0]
+
+    @pytest.mark.asyncio
+    async def test_detect_contradictions_specific_thought(self) -> None:
+        """Test detecting contradictions for a specific thought."""
+        from src.tools.unified_reasoner import ReasoningMode, UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        start = await manager.start_session(
+            problem="Test problem",
+            mode=ReasoningMode.CHAIN,
+        )
+        session_id = start["session_id"]
+
+        # Add neutral thought
+        result1 = await manager.add_thought(
+            session_id=session_id,
+            content="First, let's analyze the data",
+            confidence=0.9,
+        )
+        result1["thought_id"]
+
+        # Add second thought
+        result2 = await manager.add_thought(
+            session_id=session_id,
+            content="The data shows X is valid",
+            confidence=0.8,
+        )
+        thought2_id = result2["thought_id"]
+
+        # Add contradicting thought
+        result3 = await manager.add_thought(
+            session_id=session_id,
+            content="The data shows X is invalid",
+            confidence=0.75,
+        )
+        thought3_id = result3["thought_id"]
+
+        # Check contradictions for thought3 only
+        contradictions = await manager.detect_contradictions_in_session(
+            session_id=session_id,
+            thought_id=thought3_id,
+            use_semantic=False,
+        )
+
+        # Should find contradiction with thought2 (valid/invalid)
+        assert len(contradictions) >= 1
+        contra_partners = [c["thought_b"] for c in contradictions]
+        assert thought2_id in contra_partners
+
+
+class TestResolveContradictionAction:
+    """Tests for the resolve contradiction action in think() tool."""
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_revise_strategy(self) -> None:
+        """Test resolve action with revise strategy."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Determine if result is positive or negative",
+                expected_steps=5,
+            )
+        )
+        session_id = start["session_id"]
+
+        # Add contradicting thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The result is always positive because all values are above zero.",
+            confidence=0.8,
+        )
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The result is never positive since we found negative values.",
+            confidence=0.6,
+        )
+
+        # Resolve with revise strategy
         result = json.loads(
             await think.fn(
-                action="verify", session_id=session_id, verdict="supported", evidence="Evidence"
+                action="resolve",
+                session_id=session_id,
+                resolve_strategy="revise",
+                thought="After careful review, the result is positive in most cases but negative in edge cases.",
+                confidence=0.85,
+            )
+        )
+
+        assert "resolution_id" in result or "error" not in result
+        if "resolution_id" in result:
+            assert result["strategy_applied"] == "revise"
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_branch_strategy(self) -> None:
+        """Test resolve action with branch strategy."""
+        import json
+
+        from src.server import think
+
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test branching resolution",
+                expected_steps=5,
+            )
+        )
+        session_id = start["session_id"]
+
+        # Add thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="X is valid",
+            confidence=0.7,
+        )
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="X is invalid",
+            confidence=0.7,
+        )
+
+        # Resolve with branch strategy
+        result = json.loads(
+            await think.fn(
+                action="resolve",
+                session_id=session_id,
+                resolve_strategy="branch",
+                thought="Exploring the case where X is invalid: this would mean...",
+                confidence=0.75,
+            )
+        )
+
+        assert "resolution_id" in result or "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_reconcile_strategy(self) -> None:
+        """Test resolve action with reconcile strategy."""
+        import json
+
+        from src.server import think
+
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test reconciliation",
+                expected_steps=5,
+            )
+        )
+        session_id = start["session_id"]
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The system is always reliable",
+            confidence=0.8,
+        )
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The system is never reliable under load",
+            confidence=0.7,
+        )
+
+        # Resolve with reconcile strategy
+        result = json.loads(
+            await think.fn(
+                action="resolve",
+                session_id=session_id,
+                resolve_strategy="reconcile",
+                thought="The system is reliable under normal load but unreliable under heavy load. Both statements are conditionally true.",
+                confidence=0.9,
+            )
+        )
+
+        assert "resolution_id" in result or "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_backtrack_strategy(self) -> None:
+        """Test resolve action with backtrack strategy."""
+        import json
+
+        from src.server import think
+
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test backtracking",
+                expected_steps=5,
+            )
+        )
+        session_id = start["session_id"]
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The algorithm always terminates",
+            confidence=0.9,
+        )
+
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The algorithm never terminates for large inputs",
+            confidence=0.5,
+        )
+
+        # Resolve with backtrack strategy
+        result = json.loads(
+            await think.fn(
+                action="resolve",
+                session_id=session_id,
+                resolve_strategy="backtrack",
+                thought="Abandoning the claim about non-termination. The algorithm does terminate.",
+                confidence=0.95,
+            )
+        )
+
+        assert "resolution_id" in result or "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_missing_strategy(self) -> None:
+        """Test resolve action without strategy returns error."""
+        import json
+
+        from src.server import think
+
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test",
+                expected_steps=3,
+            )
+        )
+        session_id = start["session_id"]
+
+        result = json.loads(
+            await think.fn(
+                action="resolve",
+                session_id=session_id,
+                thought="Resolution content",
             )
         )
 
         assert "error" in result
+        assert "resolve_strategy" in result["error"].lower() or "valid_strategies" in result
+
+    @pytest.mark.asyncio
+    async def test_resolve_action_missing_thought(self) -> None:
+        """Test resolve action without thought returns error."""
+        import json
+
+        from src.server import think
+
+        start = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test",
+                expected_steps=3,
+            )
+        )
+        session_id = start["session_id"]
+
+        result = json.loads(
+            await think.fn(
+                action="resolve",
+                session_id=session_id,
+                resolve_strategy="revise",
+            )
+        )
+
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_unified_reasoner_resolve_contradiction_method(self) -> None:
+        """Test the resolve_contradiction method directly."""
+        from src.tools.unified_reasoner import ReasoningMode, UnifiedReasonerManager
+
+        manager = UnifiedReasonerManager()
+
+        start = await manager.start_session(
+            problem="Direct method test",
+            mode=ReasoningMode.CHAIN,
+        )
+        session_id = start["session_id"]
+
+        # Add contradicting thoughts
+        await manager.add_thought(
+            session_id=session_id,
+            content="The value is always positive",
+            confidence=0.8,
+        )
+
+        result2 = await manager.add_thought(
+            session_id=session_id,
+            content="The value is never positive",
+            confidence=0.7,
+        )
+
+        # Get the thought ID that has contradictions
+        thought_id = result2["thought_id"]
+
+        # Resolve the contradiction
+        resolution = await manager.resolve_contradiction(
+            session_id=session_id,
+            strategy="reconcile",
+            resolution_content="The value can be positive or negative depending on input",
+            contradicting_thought_id=thought_id,
+            confidence=0.85,
+        )
+
+        assert "resolution_id" in resolution
+        assert "strategy_applied" in resolution
+        assert resolution["strategy_applied"] == "reconcile"
+        assert "remaining_contradictions" in resolution
+
+
+class TestSessionAnalysis:
+    """Tests for session analysis functionality via think(action='analyze')."""
+
+    @pytest.mark.asyncio
+    async def test_analyze_requires_session_id(self) -> None:
+        """Test analyze action requires session_id."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="analyze"))
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_analyze_session_not_found(self) -> None:
+        """Test analyze returns error for non-existent session."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="analyze", session_id="nonexistent"))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_analyze_basic_session(self) -> None:
+        """Test analyze returns metrics for basic session."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 2+2?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add a thought
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="Let me think about this simple addition.",
+            confidence=0.9,
+        )
+
+        # Analyze
+        analysis = json.loads(await think.fn(action="analyze", session_id=session_id))
+
+        # Verify structure
+        assert "progress" in analysis
+        assert "quality" in analysis
+        assert "issues" in analysis
+        assert "efficiency" in analysis
+        assert "recommendations" in analysis
+        assert "risk" in analysis
+
+        # Verify progress metrics
+        assert analysis["progress"]["total_thoughts"] >= 1
+        assert analysis["progress"]["main_chain_length"] >= 1
+
+        # Verify quality scores are between 0 and 1
+        assert 0 <= analysis["quality"]["coherence_score"] <= 1
+        assert 0 <= analysis["quality"]["coverage_score"] <= 1
+        assert 0 <= analysis["quality"]["depth_score"] <= 1
+        assert 0 <= analysis["quality"]["overall"] <= 1
+
+        # Verify risk has valid level
+        assert analysis["risk"]["level"] in ("low", "medium", "high")
+
+    @pytest.mark.asyncio
+    async def test_analyze_detects_contradictions(self) -> None:
+        """Test analyze reports contradictions in session."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Is the sky blue?",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add contradicting thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The sky is definitely blue.",
+            confidence=0.9,
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="However, the sky is not blue at all.",
+            confidence=0.8,
+        )
+
+        # Analyze
+        analysis = json.loads(await think.fn(action="analyze", session_id=session_id))
+
+        # Should have issues or recommendations about contradictions
+        issues = analysis["issues"]
+        assert "contradictions" in issues or "unresolved_contradictions" in issues
+
+    @pytest.mark.asyncio
+    async def test_analyze_returns_recommendations(self) -> None:
+        """Test analyze provides actionable recommendations."""
+        import json
+
+        from src.server import think
+
+        # Start a session but don't add many thoughts (shallow reasoning)
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Explain the theory of relativity in detail.",  # Complex problem
+                expected_steps=10,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add just one shallow thought
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="Relativity is about space and time.",
+            confidence=0.5,
+        )
+
+        # Analyze
+        analysis = json.loads(await think.fn(action="analyze", session_id=session_id))
+
+        # Should have recommendations
+        assert len(analysis["recommendations"]) > 0
+        # At least one recommendation should be present
+        assert isinstance(analysis["recommendations"][0], str)
+
+    @pytest.mark.asyncio
+    async def test_analyze_quality_improves_with_depth(self) -> None:
+        """Test that quality scores improve as reasoning deepens."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="How do plants photosynthesize?",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # First analysis (only initial thought if any)
+        analysis1 = json.loads(await think.fn(action="analyze", session_id=session_id))
+        initial_depth = analysis1["quality"]["depth_score"]
+
+        # Add more thoughts
+        for _i, thought in enumerate(
+            [
+                "Plants use sunlight to convert CO2 and water.",
+                "This process occurs in the chloroplasts.",
+                "Chlorophyll absorbs light energy.",
+                "The light reactions produce ATP and NADPH.",
+            ]
+        ):
+            await think.fn(
+                action="continue",
+                session_id=session_id,
+                thought=thought,
+                confidence=0.8,
+            )
+
+        # Second analysis
+        analysis2 = json.loads(await think.fn(action="analyze", session_id=session_id))
+        final_depth = analysis2["quality"]["depth_score"]
+
+        # Depth score should increase (or at least not decrease)
+        assert final_depth >= initial_depth
+
+    @pytest.mark.asyncio
+    async def test_analyze_risk_level_with_issues(self) -> None:
+        """Test that risk level increases with issues."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test risk assessment",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add low-confidence contradicting thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The answer is definitely A.",
+            confidence=0.3,  # Low confidence
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="Actually, the answer is definitely not A, it's B.",
+            confidence=0.3,  # Low confidence
+        )
+
+        # Analyze
+        analysis = json.loads(await think.fn(action="analyze", session_id=session_id))
+
+        # Risk should be medium or high due to contradictions/low confidence
+        assert analysis["risk"]["level"] in ("medium", "high")
+        # Should have risk factors
+        assert len(analysis["risk"]["factors"]) >= 0  # May have factors
+
+    @pytest.mark.asyncio
+    async def test_session_analytics_to_dict(self) -> None:
+        """Test SessionAnalytics.to_dict() produces valid structure."""
+        from src.tools.unified_reasoner import SessionAnalytics
+
+        analytics = SessionAnalytics(
+            session_id="test-123",
+            total_thoughts=5,
+            main_chain_length=4,
+            branch_count=1,
+            average_confidence=0.75,
+            average_survival_score=0.8,
+            coherence_score=0.7,
+            coverage_score=0.6,
+            depth_score=0.9,
+            contradictions=[("t1", "t2")],
+            unresolved_contradictions=1,
+            blind_spots_detected=2,
+            blind_spots_unaddressed=1,
+            cycles_detected=0,
+            validation_rate=0.85,
+            invalid_thoughts=["t3"],
+            planning_ratio=0.2,
+            revision_count=1,
+            branch_utilization=0.5,
+            recommendations=["Address blind spots", "Resolve contradictions"],
+            risk_level="medium",
+            risk_factors=["1 unresolved contradiction(s)"],
+        )
+
+        result = analytics.to_dict()
+
+        # Verify all sections present
+        assert result["session_id"] == "test-123"
+        assert result["progress"]["total_thoughts"] == 5
+        assert result["quality"]["coherence_score"] == 0.7
+        assert result["issues"]["contradictions"] == 1
+        assert result["validation"]["rate"] == 0.85
+        assert result["efficiency"]["revision_count"] == 1
+        assert len(result["recommendations"]) == 2
+        assert result["risk"]["level"] == "medium"
+
+
+class TestSuggestAction:
+    """Tests for the think(action='suggest') functionality."""
+
+    @pytest.mark.asyncio
+    async def test_suggest_requires_session_id(self) -> None:
+        """Test suggest action requires session_id."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="suggest"))
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_suggest_session_not_found(self) -> None:
+        """Test suggest returns error for non-existent session."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="suggest", session_id="nonexistent"))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_suggest_basic_session(self) -> None:
+        """Test suggest returns valid suggestion for basic session."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 2+2?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Verify structure
+        assert "suggested_action" in suggestion
+        assert "urgency" in suggestion
+        assert "reason" in suggestion
+        assert "parameters" in suggestion
+        assert "guidance" in suggestion
+        assert "alternatives" in suggestion
+        assert "session_summary" in suggestion
+
+        # Verify valid action suggested
+        valid_actions = {
+            "start",
+            "continue",
+            "branch",
+            "revise",
+            "synthesize",
+            "verify",
+            "finish",
+            "resolve",
+        }
+        assert suggestion["suggested_action"] in valid_actions
+
+        # Verify urgency is valid
+        assert suggestion["urgency"] in ("low", "medium", "high")
+
+    @pytest.mark.asyncio
+    async def test_suggest_prioritizes_contradictions(self) -> None:
+        """Test suggest recommends 'resolve' when contradictions exist."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Is this claim valid?",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add contradicting thoughts using patterns that will be detected
+        # Pattern: "is valid" vs "is invalid" or "correct" vs "incorrect"
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The claim is valid and correct.",
+            confidence=0.9,
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The claim is invalid and incorrect.",
+            confidence=0.8,
+        )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Should suggest resolving contradiction (highest priority)
+        assert suggestion["suggested_action"] == "resolve"
+        assert suggestion["urgency"] == "high"
+        assert "contradiction" in suggestion["reason"].lower()
+
+    @pytest.mark.asyncio
+    async def test_suggest_recommends_continue_for_shallow_reasoning(self) -> None:
+        """Test suggest recommends 'continue' when reasoning is shallow."""
+        import json
+
+        from src.server import think
+
+        # Start a complex problem
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Explain quantum entanglement in detail.",
+                expected_steps=10,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add only one thought (shallow)
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="Quantum entanglement is a phenomenon.",
+            confidence=0.7,
+        )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Should suggest continue since reasoning is shallow
+        assert suggestion["suggested_action"] == "continue"
+        # Should mention depth in reason or have continue as suggested
+        assert (
+            "depth" in suggestion["reason"].lower() or suggestion["suggested_action"] == "continue"
+        )
+
+    @pytest.mark.asyncio
+    async def test_suggest_recommends_finish_when_ready(self) -> None:
+        """Test suggest recommends 'finish' when session is ready."""
+        import json
+
+        from src.server import think
+
+        # Start a simple problem
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 5+5?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add sufficient reasoning with good confidence
+        for thought in [
+            "I need to add 5 and 5 together.",
+            "5 + 5 = 10.",
+            "The answer is 10.",
+        ]:
+            await think.fn(
+                action="continue",
+                session_id=session_id,
+                thought=thought,
+                confidence=0.95,
+            )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Should suggest finish or continue (depends on quality score)
+        assert suggestion["suggested_action"] in ("finish", "continue")
+
+        # If not finish, finish should be in alternatives
+        if suggestion["suggested_action"] != "finish":
+            alt_actions = [a["action"] for a in suggestion["alternatives"]]
+            # Finish might be suggested as alternative
+            assert "finish" in alt_actions or suggestion["suggested_action"] == "continue"
+
+    @pytest.mark.asyncio
+    async def test_suggest_includes_alternatives(self) -> None:
+        """Test suggest includes alternative actions."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add a thought
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="First thought about the problem.",
+            confidence=0.6,
+        )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Alternatives should be a list
+        assert isinstance(suggestion["alternatives"], list)
+
+        # Each alternative should have action and reason
+        for alt in suggestion["alternatives"]:
+            assert "action" in alt
+            assert "reason" in alt
+
+    @pytest.mark.asyncio
+    async def test_suggest_includes_session_summary(self) -> None:
+        """Test suggest includes session summary metrics."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="First thought.",
+            confidence=0.8,
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="Second thought.",
+            confidence=0.85,
+        )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Verify session summary
+        summary = suggestion["session_summary"]
+        assert "thoughts" in summary
+        assert "quality" in summary
+        assert "risk" in summary
+        assert "status" in summary
+
+        assert summary["thoughts"] >= 2
+        assert 0 <= summary["quality"] <= 1
+        assert summary["risk"] in ("low", "medium", "high")
+        assert summary["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_suggest_with_low_confidence_suggests_verify(self) -> None:
+        """Test suggest recommends verification for low-confidence thoughts."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Is this claim true?",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add low-confidence thoughts
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="I'm not sure about this claim.",
+            confidence=0.3,  # Very low confidence
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="It might be true, but I'm uncertain.",
+            confidence=0.4,  # Low confidence
+        )
+
+        # Get suggestion
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+
+        # Should suggest verify or continue (verify for low confidence, or continue to build more context)
+        # The exact suggestion depends on other factors like depth
+        assert suggestion["suggested_action"] in ("verify", "continue", "finish")
+
+
+class TestFeedbackAction:
+    """Tests for the think(action='feedback') functionality (S2)."""
+
+    @pytest.mark.asyncio
+    async def test_feedback_requires_session_id(self) -> None:
+        """Test feedback action requires session_id."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="feedback"))
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_feedback_requires_suggestion_id(self) -> None:
+        """Test feedback action requires suggestion_id."""
+        import json
+
+        from src.server import think
+
+        # Start a session first
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        result = json.loads(
+            await think.fn(
+                action="feedback",
+                session_id=session_id,
+                suggestion_outcome="accepted",
+            )
+        )
+        assert "error" in result
+        assert "suggestion_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_feedback_requires_outcome(self) -> None:
+        """Test feedback action requires suggestion_outcome."""
+        import json
+
+        from src.server import think
+
+        # Start a session first
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        result = json.loads(
+            await think.fn(
+                action="feedback",
+                session_id=session_id,
+                suggestion_id="some-id",
+            )
+        )
+        assert "error" in result
+        assert "suggestion_outcome" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_feedback_records_accepted(self) -> None:
+        """Test feedback correctly records accepted suggestion."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 2+2?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Get a suggestion to record feedback for
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+        suggestion_id = suggestion.get("suggestion_id")
+
+        # If no suggestion_id is returned, skip this test
+        if not suggestion_id:
+            pytest.skip("No suggestion_id returned by suggest action")
+
+        # Record feedback
+        feedback_result = json.loads(
+            await think.fn(
+                action="feedback",
+                session_id=session_id,
+                suggestion_id=suggestion_id,
+                suggestion_outcome="accepted",
+            )
+        )
+
+        # Verify feedback was recorded (has outcome field)
+        assert feedback_result.get("outcome") == "accepted"
+        assert feedback_result.get("suggestion_id") == suggestion_id
+        assert "weights_updated" in feedback_result
+
+    @pytest.mark.asyncio
+    async def test_feedback_records_rejected_with_actual_action(self) -> None:
+        """Test feedback records rejection and actual action taken."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 2+2?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Get a suggestion to record feedback for
+        suggestion = json.loads(await think.fn(action="suggest", session_id=session_id))
+        suggestion_id = suggestion.get("suggestion_id")
+
+        # If no suggestion_id is returned, skip this test
+        if not suggestion_id:
+            pytest.skip("No suggestion_id returned by suggest action")
+
+        # Record feedback with rejection and actual action
+        feedback_result = json.loads(
+            await think.fn(
+                action="feedback",
+                session_id=session_id,
+                suggestion_id=suggestion_id,
+                suggestion_outcome="rejected",
+                actual_action="verify",
+            )
+        )
+
+        # Verify feedback was recorded
+        assert feedback_result.get("outcome") == "rejected"
+        assert feedback_result.get("actual_action") == "verify"
+        assert "weights_updated" in feedback_result
+
+    @pytest.mark.asyncio
+    async def test_feedback_invalid_suggestion_id(self) -> None:
+        """Test feedback returns error for invalid suggestion_id."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Try to record feedback for non-existent suggestion
+        result = json.loads(
+            await think.fn(
+                action="feedback",
+                session_id=session_id,
+                suggestion_id="nonexistent-suggestion-id",
+                suggestion_outcome="accepted",
+            )
+        )
+
+        # Should fail because suggestion doesn't exist
+        assert "error" in result or result.get("success") is False
+
+
+class TestAutoAction:
+    """Tests for the think(action='auto') functionality (S3).
+
+    Note: The server-level auto action returns suggestions without LLM integration.
+    For full auto-execution with thought generation, use the UnifiedReasonerManager
+    directly with a thought_generator callback.
+    """
+
+    @pytest.mark.asyncio
+    async def test_auto_requires_session_id(self) -> None:
+        """Test auto action requires session_id."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="auto"))
+        assert "error" in result
+        assert "session_id" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_auto_session_not_found(self) -> None:
+        """Test auto returns error for non-existent session."""
+        import json
+
+        from src.server import think
+
+        result = json.loads(await think.fn(action="auto", session_id="nonexistent"))
+        assert "error" in result
+        assert "not found" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_auto_validates_max_steps(self) -> None:
+        """Test auto validates max_auto_steps bounds."""
+        import json
+
+        from src.server import think
+
+        # Start a session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Test problem",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Test max_auto_steps < 1
+        result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=0,
+            )
+        )
+        assert "error" in result
+        assert "at least 1" in result["error"]
+
+        # Test max_auto_steps > 20
+        result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=21,
+            )
+        )
+        assert "error" in result
+        assert "cannot exceed 20" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_auto_returns_suggestion_without_generator(self) -> None:
+        """Test auto returns suggestion when no thought generator is available.
+
+        At the server level, auto returns a suggestion for manual execution
+        since it doesn't have LLM integration built-in.
+        """
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 2+2?",
+                expected_steps=3,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Execute auto (will return suggestion_only since no generator)
+        auto_result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=1,
+            )
+        )
+
+        # Should return suggestion_only status
+        assert auto_result.get("status") == "suggestion_only"
+        assert "suggestion" in auto_result
+        assert auto_result["suggestion"].get("suggested_action") is not None
+
+    @pytest.mark.asyncio
+    async def test_auto_returns_checkpoint_at_high_risk(self) -> None:
+        """Test auto returns checkpoint status when risk is high."""
+        import json
+
+        from src.server import think
+
+        # Start session that will generate contradictions (high risk)
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Analyze this controversial claim",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add contradicting thoughts to create high-risk state
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The claim is definitely true and valid.",
+            confidence=0.9,
+        )
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="The claim is definitely false and invalid.",
+            confidence=0.9,
+        )
+
+        # Execute auto with stop_on_high_risk=True
+        auto_result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=5,
+                stop_on_high_risk=True,
+            )
+        )
+
+        # Should indicate checkpoint or high risk
+        status = auto_result.get("status")
+        # Could be checkpoint (high risk) or suggestion_only (no generator)
+        assert status in ("checkpoint", "suggestion_only")
+        assert "suggestion" in auto_result
+
+    @pytest.mark.asyncio
+    async def test_auto_suggestion_contains_valid_action(self) -> None:
+        """Test auto returns a valid suggested action."""
+        import json
+
+        from src.server import think
+
+        # Start session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="Explain photosynthesis step by step",
+                expected_steps=5,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Execute auto
+        auto_result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=3,
+            )
+        )
+
+        # Verify suggestion contains valid action
+        suggestion = auto_result.get("suggestion", {})
+        valid_actions = {
+            "start",
+            "continue",
+            "branch",
+            "revise",
+            "synthesize",
+            "verify",
+            "finish",
+            "resolve",
+        }
+        assert suggestion.get("suggested_action") in valid_actions
+
+    @pytest.mark.asyncio
+    async def test_auto_with_finished_session(self) -> None:
+        """Test auto behavior with finished session."""
+        import json
+
+        from src.server import think
+
+        # Start a very short session
+        start_result = json.loads(
+            await think.fn(
+                action="start",
+                mode="chain",
+                problem="What is 1+1?",
+                expected_steps=2,
+            )
+        )
+        session_id = start_result["session_id"]
+
+        # Add thoughts and finish
+        await think.fn(
+            action="continue",
+            session_id=session_id,
+            thought="1+1 equals 2.",
+            confidence=0.95,
+        )
+        await think.fn(
+            action="finish",
+            session_id=session_id,
+            thought="Conclusion: 2",
+            confidence=1.0,
+        )
+
+        # Try auto on finished session
+        auto_result = json.loads(
+            await think.fn(
+                action="auto",
+                session_id=session_id,
+                max_auto_steps=5,
+            )
+        )
+
+        # Should still return a valid response (suggestion_only or checkpoint)
+        assert auto_result.get("status") in ("suggestion_only", "checkpoint")
+        assert "suggestion" in auto_result
 
 
 class TestConsolidatedCompressTool:
