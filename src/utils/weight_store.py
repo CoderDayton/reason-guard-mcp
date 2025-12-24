@@ -32,13 +32,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Default database location
-DEFAULT_DB_PATH = Path.home() / ".matrixmind" / "weights.db"
+DEFAULT_DB_PATH = Path.home() / ".reasonguard" / "weights.db"
 
 # Allowed base directories for database files (security: prevent path traversal)
-# Users can override via MATRIXMIND_ALLOWED_DB_DIRS env var (colon-separated)
+# Users can override via REASONGUARD_ALLOWED_DB_DIRS env var (colon-separated)
 _DEFAULT_ALLOWED_DIRS = [
-    Path.home() / ".matrixmind",
-    Path.home() / ".local" / "share" / "matrixmind",
+    Path.home() / ".reasonguard",
+    Path.home() / ".local" / "share" / "reasonguard",
     Path("/tmp"),  # nosec B108 - intentionally allowed for dev/testing
     Path.cwd(),
 ]
@@ -46,7 +46,7 @@ _DEFAULT_ALLOWED_DIRS = [
 
 def _get_allowed_db_dirs() -> list[Path]:
     """Get list of allowed directories for database files."""
-    env_dirs = os.getenv("MATRIXMIND_ALLOWED_DB_DIRS")
+    env_dirs = os.getenv("REASONGUARD_ALLOWED_DB_DIRS")
     if env_dirs:
         return [Path(d).resolve() for d in env_dirs.split(":") if d]
     return [d.resolve() for d in _DEFAULT_ALLOWED_DIRS]
@@ -87,7 +87,7 @@ def validate_db_path(db_path: Path | str) -> Path:
         raise ValueError(
             f"Database path '{path}' is outside allowed directories. "
             f"Allowed: {allowed_list}. "
-            f"Set MATRIXMIND_ALLOWED_DB_DIRS to add custom directories."
+            f"Set REASONGUARD_ALLOWED_DB_DIRS to add custom directories."
         )
 
     return path

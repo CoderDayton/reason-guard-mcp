@@ -1,0 +1,338 @@
+# Reason Guard Benchmark Problems
+#
+# Each problem tests a specific reasoning trap that LLMs commonly fall for.
+# The seed_knowledge provides correct reasoning patterns that Reason Guard
+# retrieves via RAG to help the LLM avoid these traps.
+#
+# Format:
+#   problems: List of test problems
+#   seed_knowledge: Pre-populated reasoning patterns for RAG retrieval
+
+problems:
+  # === CLASSIC TRAPS (Medium) ===
+  - id: algebra_trap
+    question: >
+      A bat and ball cost $1.10 total. The bat costs $1.00 more than the ball.
+      How much does the ball cost in cents?
+    answer: "5"
+    category: algebra
+    difficulty: medium
+    known_failure_modes:
+      - "Intuitive answer of $0.10 (10 cents) is wrong"
+      - "Fails to set up proper algebraic equation"
+
+  - id: harmonic_mean
+    question: >
+      A train travels from A to B at 60 mph and returns at 40 mph.
+      What is the average speed for the round trip in mph?
+    answer: "48"
+    category: statistics
+    difficulty: medium
+    known_failure_modes:
+      - "Uses arithmetic mean (50) instead of harmonic mean"
+      - "Doesn't account for time spent at each speed"
+
+  # === HARD MULTI-STEP REASONING ===
+  - id: monty_hall
+    question: >
+      In Monty Hall, you pick door 1. Host opens door 3 (goat). You switch to door 2.
+      What's your probability of winning the car as a percentage?
+    answer: "67"
+    category: probability
+    difficulty: hard
+    known_failure_modes:
+      - "Says 50% thinking it's now 1 of 2 doors"
+      - "Doesn't understand conditional probability"
+
+  - id: simpson_paradox
+    question: >
+      Hospital A: 90/100 mild cases survive (90%), 10/100 severe cases survive (10%). Overall: 100/200 = 50%.
+      Hospital B: 5/10 mild cases survive (50%), 50/90 severe cases survive (56%). Overall: 55/100 = 55%.
+      Hospital B has higher overall survival. Which hospital is actually better for BOTH mild AND severe cases?
+    answer: "A"
+    category: statistics
+    difficulty: hard
+    known_failure_modes:
+      - "Picks B because of higher overall rate"
+      - "Fails to see aggregation paradox"
+
+  - id: base_rate_neglect
+    question: >
+      A disease affects 1 in 1000 people. A test is 99% accurate (99% true positive, 99% true negative).
+      You test positive. What's the approximate probability (percentage) you actually have the disease?
+    answer: "9"
+    category: probability
+    difficulty: hard
+    known_failure_modes:
+      - "Says 99% because test is 99% accurate"
+      - "Ignores base rate of disease"
+
+  - id: birthday_paradox
+    question: >
+      In a room of 23 people, what is the approximate probability (percentage) that at least
+      two people share the same birthday? Round to nearest integer.
+    answer: "50"
+    category: probability
+    difficulty: hard
+    known_failure_modes:
+      - "Calculates 23/365 = 6%"
+      - "Doesn't compute pairwise combinations correctly"
+
+  # === EXTREMELY HARD ===
+  - id: two_envelope_paradox
+    question: >
+      Two envelopes contain money. One has twice the other. You pick envelope A with $100.
+      Should you switch? What's the expected value in envelope B if you reason correctly?
+      Answer just the dollar amount.
+    answer: "100"
+    category: probability
+    difficulty: extreme
+    known_failure_modes:
+      - "Says 125 using flawed E[B] = 0.5*50 + 0.5*200"
+      - "Doesn't see the paradox in naive reasoning"
+
+  - id: newcomb_problem
+    question: >
+      Predictor is 99% accurate. Box A always has $1000. Box B has $1M if Predictor predicted you'd take only B, $0 otherwise.
+      You're a one-boxer (take only B). Given Predictor's 99% accuracy on your type, what's your expected value in dollars?
+      Round to nearest thousand.
+    answer: "990000"
+    category: decision_theory
+    difficulty: extreme
+    known_failure_modes:
+      - "Says $1,001,000 using two-box dominance reasoning"
+      - "Doesn't understand evidential decision theory"
+
+  - id: sleeping_beauty
+    question: >
+      Sleeping Beauty is woken once if coin lands heads, twice (Mon+Tue) if tails.
+      She has no memory between wakings. When woken, what probability should she assign to heads?
+      Answer as fraction numerator (denominator is 3).
+    answer: "1"
+    category: probability
+    difficulty: extreme
+    known_failure_modes:
+      - "Says 1/2 (halfer position) without considering indexical uncertainty"
+      - "Doesn't weight by number of observations"
+
+  - id: linda_problem
+    question: >
+      Linda is 31, single, outspoken, very bright. She majored in philosophy.
+      As a student, she was deeply concerned with discrimination and social justice.
+      Which is MORE PROBABLE: (A) Linda is a bank teller, or (B) Linda is a bank teller who is active in the feminist movement?
+      Answer A or B.
+    answer: "A"
+    category: probability
+    difficulty: hard
+    known_failure_modes:
+      - "Says B because it 'fits' Linda's profile"
+      - "Commits conjunction fallacy"
+
+  - id: selection_bias
+    question: >
+      Study finds hospital patients who pray recover faster than those who don't.
+      Can we conclude prayer causes faster recovery? Answer YES or NO.
+    answer: "NO"
+    category: statistics
+    difficulty: hard
+    known_failure_modes:
+      - "Says YES because correlation found"
+      - "Ignores confounders and selection bias"
+
+  - id: survivorship_bias
+    question: >
+      WWII analysts recommend adding armor where returning bombers have bullet holes.
+      Abraham Wald says armor the spots with NO holes. Is Wald correct? Answer YES or NO.
+    answer: "YES"
+    category: statistics
+    difficulty: hard
+    known_failure_modes:
+      - "Says NO thinking more holes = more damage"
+      - "Doesn't consider planes that didn't return"
+
+  - id: zeno_achilles
+    question: >
+      Achilles runs 10 m/s, tortoise 1 m/s with 100m head start.
+      Zeno claims Achilles never catches up since tortoise always moves while Achilles closes gap.
+      How many seconds until Achilles catches the tortoise? Round to nearest integer.
+    answer: "11"
+    category: math
+    difficulty: medium
+    known_failure_modes:
+      - "Says infinity or never due to Zeno's paradox"
+      - "Doesn't solve simple relative velocity problem"
+
+  - id: russian_roulette
+    question: >
+      Russian roulette: 6-chamber revolver, 2 bullets in adjacent chambers.
+      First pull: click (empty). Second pull: should you spin again or fire without spinning?
+      Which gives better survival odds? Answer SPIN or FIRE.
+    answer: "FIRE"
+    category: probability
+    difficulty: extreme
+    known_failure_modes:
+      - "Says SPIN thinking randomization is safer"
+      - "Doesn't analyze conditional probabilities given adjacent chambers"
+
+  - id: boy_girl_paradox
+    question: >
+      A family has two children. At least one is a boy born on Tuesday.
+      What's the probability both are boys? Express as numerator (denominator is 27).
+    answer: "13"
+    category: probability
+    difficulty: extreme
+    known_failure_modes:
+      - "Says 1/3 ignoring Tuesday constraint"
+      - "Says 1/2 treating children independently"
+
+seed_knowledge:
+  - id: algebra_trap_warning
+    thought: >
+      TRAP WARNING: When items differ by a fixed amount, use algebra.
+      If bat = ball + $1.00 and bat + ball = $1.10, then (ball + 1.00) + ball = 1.10,
+      so 2*ball = 0.10, ball = $0.05. The intuitive answer of $0.10 is WRONG because
+      that would make the bat cost $1.00, not $1.00 MORE than the ball.
+    strategy: algebra
+    score: 0.95
+    keywords: ["bat", "ball", "more than", "total cost"]
+
+  - id: harmonic_mean_warning
+    thought: >
+      TRAP WARNING: Average speed is NOT arithmetic mean of speeds.
+      For round trips at different speeds, use harmonic mean: 2*v1*v2/(v1+v2).
+      Example: 60 mph and 40 mph gives 2*60*40/(60+40) = 4800/100 = 48 mph.
+      The intuitive answer of 50 mph (arithmetic mean) is WRONG.
+    strategy: harmonic_mean
+    score: 0.95
+    keywords: ["average speed", "round trip", "mph", "returns"]
+
+  - id: monty_hall_warning
+    thought: >
+      TRAP WARNING: Monty Hall - switching wins 2/3 of the time.
+      Initial pick has 1/3 chance. Other two doors combined have 2/3.
+      Host opening a goat door concentrates that 2/3 onto the remaining door.
+      After switch, probability is 2/3 ≈ 67%. NOT 50% - this isn't a new 1-of-2 choice.
+    strategy: conditional_probability
+    score: 0.95
+    keywords: ["monty hall", "door", "switch", "goat"]
+
+  - id: simpson_paradox_warning
+    thought: >
+      TRAP WARNING: Simpson's Paradox - aggregate statistics can reverse when split by subgroups.
+      Always check if a confounding variable (like case severity) has unequal distribution.
+      Compare within each subgroup, not overall totals. The hospital treating harder cases
+      may have lower overall rate but be superior for each case type.
+    strategy: statistics
+    score: 0.95
+    keywords: ["hospital", "survival", "overall", "cases"]
+
+  - id: base_rate_warning
+    thought: >
+      TRAP WARNING: Base rate neglect - must use Bayes' theorem.
+      If disease is 1/1000 and test is 99% accurate:
+      - True positives: 1 × 0.99 = 0.99
+      - False positives: 999 × 0.01 = 9.99
+      - P(disease|positive) = 0.99/(0.99+9.99) ≈ 9%
+      NOT 99%! The rare base rate dominates.
+    strategy: bayes
+    score: 0.95
+    keywords: ["test", "accurate", "disease", "positive", "probability"]
+
+  - id: birthday_paradox_warning
+    thought: >
+      TRAP WARNING: Birthday paradox - compare pairs, not individuals to 365.
+      23 people = 253 pairs. P(no match) = 364/365 × 363/365 × ... ≈ 0.493.
+      P(at least one match) ≈ 50.7%. NOT 23/365 = 6%.
+      The rapid growth of pairs makes collisions likely.
+    strategy: combinatorics
+    score: 0.95
+    keywords: ["birthday", "people", "probability", "share"]
+
+  - id: two_envelope_warning
+    thought: >
+      TRAP WARNING: Two envelope paradox - the naive calculation E[B] = 0.5(X/2) + 0.5(2X) = 1.25X is WRONG.
+      You can't use the observed value as if it's equally likely to be the smaller or larger.
+      By symmetry, E[B] = E[A] = $100. No advantage to switching.
+      The fallacy is treating your observation as new information when it isn't.
+    strategy: decision_theory
+    score: 0.95
+    keywords: ["envelope", "switch", "expected value", "money"]
+
+  - id: newcomb_warning
+    thought: >
+      TRAP WARNING: Newcomb's problem - for one-boxers with accurate predictor.
+      If you're the type who takes only B, predictor put $1M in B with 99% accuracy.
+      E[one-box] = 0.99 × $1M = $990,000.
+      Causal decision theory says two-box, but evidential reasoning favors one-box given your type.
+    strategy: decision_theory
+    score: 0.95
+    keywords: ["predictor", "box", "million", "take"]
+
+  - id: sleeping_beauty_warning
+    thought: >
+      TRAP WARNING: Sleeping Beauty - thirder position: P(heads) = 1/3.
+      Three equally-weighted awakenings: Mon-heads, Mon-tails, Tue-tails.
+      Only 1 of 3 is heads. The 1/2 (halfer) position ignores that tails produces more observations.
+      Answer: 1/3, so numerator is 1 (of 3).
+    strategy: probability
+    score: 0.95
+    keywords: ["sleeping beauty", "woken", "heads", "tails"]
+
+  - id: conjunction_fallacy_warning
+    thought: >
+      TRAP WARNING: Conjunction fallacy - P(A and B) ≤ P(A) always.
+      "Bank teller AND feminist" cannot be more probable than "bank teller" alone.
+      No matter how well B fits the description, adding conditions can only narrow the set.
+      Answer A (bank teller alone) is always more probable.
+    strategy: probability
+    score: 0.95
+    keywords: ["linda", "bank teller", "feminist", "probable"]
+
+  - id: selection_bias_warning
+    thought: >
+      TRAP WARNING: Correlation ≠ causation, especially with selection bias.
+      People who pray might differ systematically (more family support, positive outlook, milder conditions).
+      Without randomized control, we cannot conclude causation. Answer: NO.
+    strategy: statistics
+    score: 0.95
+    keywords: ["study", "pray", "recover", "conclude"]
+
+  - id: survivorship_bias_warning
+    thought: >
+      TRAP WARNING: Survivorship bias - we only see the survivors.
+      Bullet holes on returning planes show where aircraft CAN survive hits.
+      Planes hit elsewhere didn't return. Armor the UNHIT areas - those hits were fatal.
+      Wald is correct: YES.
+    strategy: statistics
+    score: 0.95
+    keywords: ["bomber", "armor", "holes", "wald"]
+
+  - id: zeno_paradox_warning
+    thought: >
+      TRAP WARNING: Zeno's paradox is resolved by calculus/limits.
+      Achilles at 10m/s, tortoise at 1m/s with 100m lead.
+      Relative velocity: 10-1 = 9 m/s. Time to close 100m: 100/9 ≈ 11.11 seconds.
+      Infinite series of shrinking intervals DOES converge. Answer: 11 seconds.
+    strategy: math
+    score: 0.95
+    keywords: ["achilles", "tortoise", "catch", "zeno"]
+
+  - id: russian_roulette_warning
+    thought: >
+      TRAP WARNING: Russian roulette with adjacent bullets.
+      If first shot was empty, 4 chambers remain in sequence: 2 empty, then 2 bullets.
+      Without spinning: next chamber has 75% empty chance (3 of 4 possible positions lead to empty).
+      Spinning: 4/6 = 67% empty. FIRE without spinning is safer.
+    strategy: probability
+    score: 0.95
+    keywords: ["russian roulette", "revolver", "bullets", "spin"]
+
+  - id: boy_girl_tuesday_warning
+    thought: >
+      TRAP WARNING: Boy born on Tuesday changes the probability.
+      Total two-child families with boy born Tuesday: 27 (out of 196 total family configurations).
+      Both boys with at least one Tuesday-born: 13 configurations.
+      P(both boys | boy born Tuesday) = 13/27. Answer: 13.
+    strategy: probability
+    score: 0.95
+    keywords: ["boy", "tuesday", "children", "probability"]

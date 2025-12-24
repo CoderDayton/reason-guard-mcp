@@ -14,13 +14,16 @@ from src.utils.logging import (
     LogLevel,
     StructuredLogger,
     _request_id,
+    _session_id,
     _tool_name,
     _trace_id,
     get_default_logger,
     get_logger,
+    get_session_id,
     json_serializer,
     redact_sensitive,
     set_request_id,
+    set_session_id,
     set_tool_name,
     set_trace_id,
 )
@@ -398,10 +401,63 @@ class TestGetDefaultLogger:
         """Test get_default_logger returns logger."""
         logger = get_default_logger()
         assert isinstance(logger, StructuredLogger)
-        assert logger.name == "matrixmind_mcp"
+        assert logger.name == "reason_guard_mcp"
 
     def test_get_default_logger_singleton(self) -> None:
         """Test default logger is singleton."""
         logger1 = get_default_logger()
         logger2 = get_default_logger()
         assert logger1 is logger2
+
+
+class TestSessionIdContext:
+    """Tests for session_id correlation ID."""
+
+    def test_set_and_get_session_id(self) -> None:
+        """Test setting and getting session ID."""
+        # Save original
+        original = _session_id.get()
+        try:
+            set_session_id("test-session-123")
+            assert get_session_id() == "test-session-123"
+
+            set_session_id(None)
+            assert get_session_id() is None
+        finally:
+            _session_id.set(original)
+
+    def test_session_id_in_json_output(self) -> None:
+        """Test session_id appears in JSON serialized log."""
+        original = _session_id.get()
+        try:
+            set_session_id("sess-abc123")
+
+            mock_record: dict[str, Any] = {
+                "level": MagicMock(name="INFO"),
+                "message": "test message",
+                "name": "test_module",
+                "function": "test_func",
+                "line": 42,
+                "extra": {},
+                "exception": None,
+            }
+
+            result = json_serializer(mock_record)  # type: ignore[arg-type]
+            data = json.loads(result)
+
+            assert data["session_id"] == "sess-abc123"
+        finally:
+            _session_id.set(original)
+
+    def test_context_manager_with_session_id(self) -> None:
+        """Test context manager sets session_id."""
+        logger = StructuredLogger("test", level=LogLevel.DEBUG)
+
+        # Verify session_id is None before context
+        assert _session_id.get() is None
+
+        with logger.context(session_id="ctx-session-456"):
+            assert _session_id.get() == "ctx-session-456"
+
+        # Verify session_id is reset after context
+        assert _session_id.get() is None

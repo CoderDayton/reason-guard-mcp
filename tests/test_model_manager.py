@@ -35,7 +35,7 @@ class TestHelperFunctions:
             # Remove EMBEDDING_CACHE_DIR if it exists
             os.environ.pop("EMBEDDING_CACHE_DIR", None)
             result = _get_default_cache_dir()
-            assert result == Path.home() / ".cache" / "matrixmind-mcp" / "models"
+            assert result == Path.home() / ".cache" / "reason-guard-mcp" / "models"
 
     def test_get_default_cache_dir_with_env(self) -> None:
         """Test default cache directory when env var is set."""

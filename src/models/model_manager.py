@@ -3,7 +3,7 @@
 Handles downloading, caching, and loading of embedding models with proper
 error handling for cases where models are not yet ready.
 
-Cache location: ~/.cache/matrixmind-mcp/models/ (configurable via EMBEDDING_CACHE_DIR)
+Cache location: ~/.cache/reason-guard-mcp/models/ (configurable via EMBEDDING_CACHE_DIR)
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def _get_default_cache_dir() -> Path:
     env_cache_dir = os.getenv("EMBEDDING_CACHE_DIR")
     if env_cache_dir:
         return Path(env_cache_dir)
-    return Path.home() / ".cache" / "matrixmind-mcp" / "models"
+    return Path.home() / ".cache" / "reason-guard-mcp" / "models"
 
 
 def _get_model_size_mb(model_name: str) -> int:
@@ -213,7 +213,7 @@ class ModelManager:
         Args:
             model_name: HuggingFace model name (e.g., "sentence-transformers/all-mpnet-base-v2").
             cache_dir: Custom cache directory. Defaults to EMBEDDING_CACHE_DIR env var,
-                      or ~/.cache/matrixmind-mcp/models/ if not set.
+                      or ~/.cache/reason-guard-mcp/models/ if not set.
             blocking: If True, wait for model to load. If False, load in background thread.
 
         Raises:

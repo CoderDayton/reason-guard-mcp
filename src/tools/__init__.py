@@ -1,56 +1,39 @@
-"""MatrixMind reasoning tools - State managers for structured reasoning."""
+"""Reason Guard reasoning tools - State managers for structured reasoning."""
 
-# Re-export scoring from utils for backward compatibility
 from src.utils.scoring import calculate_survival_score
 
 from .compress import ContextAwareCompressionTool
-from .long_chain import (
-    CandidateThought,
-    ChainState,
-    ChainStatus,
-    LongChainManager,
-    ReasoningStep,
-    StepType,
-    get_chain_manager,
-    is_planning_step,
-    should_explore_alternatives,
-)
-from .mot_reasoning import (
-    MatrixOfThoughtManager,
-    MatrixState,
-    MatrixStatus,
-    get_matrix_manager,
-)
-from .verify import (
-    ClaimStatus,
-    VerificationManager,
-    VerificationState,
-    get_verification_manager,
+from .reasoning_types import (
+    BlindSpot,
+    DomainType,
+    ReasoningMode,
+    ReasoningSession,
+    ResponseVerbosity,
+    RewardSignal,
+    SessionAnalytics,
+    SessionStatus,
+    SuggestionRecord,
+    SuggestionWeights,
+    Thought,
+    ThoughtType,
 )
 
 __all__ = [
-    # Compression (unchanged - uses embeddings)
+    # Compression
     "ContextAwareCompressionTool",
-    # Long Chain state manager
-    "LongChainManager",
-    "ChainState",
-    "ChainStatus",
-    "ReasoningStep",
-    "StepType",
-    "get_chain_manager",
-    # MPPA functions
-    "CandidateThought",
-    "is_planning_step",
+    # Scoring
     "calculate_survival_score",
-    "should_explore_alternatives",
-    # Matrix of Thought state manager
-    "MatrixOfThoughtManager",
-    "MatrixState",
-    "MatrixStatus",
-    "get_matrix_manager",
-    # Verification state manager
-    "VerificationManager",
-    "VerificationState",
-    "ClaimStatus",
-    "get_verification_manager",
+    # Reasoning types
+    "BlindSpot",
+    "DomainType",
+    "ReasoningMode",
+    "ReasoningSession",
+    "ResponseVerbosity",
+    "RewardSignal",
+    "SessionAnalytics",
+    "SessionStatus",
+    "SuggestionRecord",
+    "SuggestionWeights",
+    "Thought",
+    "ThoughtType",
 ]

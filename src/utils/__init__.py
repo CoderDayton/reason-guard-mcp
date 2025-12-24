@@ -1,4 +1,6 @@
-"""Utility modules for MatrixMind MCP."""
+"""Utility modules for Reason Guard MCP."""
+
+import warnings
 
 from .complexity import (
     ComplexityLevel,
@@ -11,7 +13,7 @@ from .errors import (
     CompressionException,
     ConfigException,
     LLMException,
-    MatrixMindException,
+    ReasonGuardException,
     ReasoningException,
     ToolExecutionError,
     VerificationException,
@@ -30,6 +32,16 @@ from .scoring import (
     semantic_survival_score,
 )
 from .session import SessionManager, SessionNotFoundError
+from .session_signing import (
+    SessionSigner,
+    TokenError,
+    TokenExpiredError,
+    TokenInvalidError,
+    TokenPayload,
+    get_session_signer,
+    hash_client_id,
+    reset_session_signer,
+)
 from .weight_store import (
     DEFAULT_WEIGHTS,
     DecayConfig,
@@ -39,13 +51,28 @@ from .weight_store import (
     reset_weight_store,
 )
 
+
+def __getattr__(name: str) -> type[ReasonGuardException]:
+    """Lazy attribute access for deprecated names."""
+    if name == "MatrixMindException":
+        warnings.warn(
+            "MatrixMindException is deprecated, use ReasonGuardException instead. "
+            "MatrixMindException will be removed in version 1.0.0.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return ReasonGuardException
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "ReasoningStrategy",
     "CompressionResult",
     "ReasoningResult",
     "StrategyRecommendation",
     "safe_json_serialize",
-    "MatrixMindException",
+    "ReasonGuardException",
+    "MatrixMindException",  # Deprecated alias
     "CompressionException",
     "ReasoningException",
     "VerificationException",
@@ -60,6 +87,14 @@ __all__ = [
     "get_cache_stats",
     "SessionManager",
     "SessionNotFoundError",
+    "SessionSigner",
+    "TokenError",
+    "TokenExpiredError",
+    "TokenInvalidError",
+    "TokenPayload",
+    "get_session_signer",
+    "hash_client_id",
+    "reset_session_signer",
     "calculate_cell_survival_score",
     "calculate_survival_score",
     "semantic_survival_score",

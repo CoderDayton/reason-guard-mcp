@@ -1,4 +1,4 @@
-"""Structured logging utilities for MatrixMind MCP.
+"""Structured logging utilities for Reason Guard MCP.
 
 Provides a consistent logging interface with:
 - Structured JSON logging for production
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 # Context variables for request tracking
 _trace_id: ContextVar[str | None] = ContextVar("trace_id", default=None)
 _request_id: ContextVar[str | None] = ContextVar("request_id", default=None)
+_session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
 _tool_name: ContextVar[str | None] = ContextVar("tool_name", default=None)
 
 
@@ -122,6 +123,8 @@ def json_serializer(record: Record) -> str:
         log_entry["trace_id"] = trace_id
     if request_id := _request_id.get():
         log_entry["request_id"] = request_id
+    if session_id := _session_id.get():
+        log_entry["session_id"] = session_id
     if tool_name := _tool_name.get():
         log_entry["tool"] = tool_name
 
@@ -156,6 +159,8 @@ def text_format(record: Record) -> str:
     context_parts = []
     if trace_id := _trace_id.get():
         context_parts.append(f"trace={trace_id[:8]}")
+    if session_id := _session_id.get():
+        context_parts.append(f"sess={session_id[:8]}")
     if tool_name := _tool_name.get():
         context_parts.append(f"tool={tool_name}")
 
@@ -291,10 +296,12 @@ class StructuredLogger:
             self,
             trace_id: str | None = None,
             request_id: str | None = None,
+            session_id: str | None = None,
             tool_name: str | None = None,
         ) -> None:
             self.trace_id = trace_id
             self.request_id = request_id
+            self.session_id = session_id
             self.tool_name = tool_name
             self._tokens: list[Any] = []
 
@@ -303,6 +310,8 @@ class StructuredLogger:
                 self._tokens.append(_trace_id.set(self.trace_id))
             if self.request_id:
                 self._tokens.append(_request_id.set(self.request_id))
+            if self.session_id:
+                self._tokens.append(_session_id.set(self.session_id))
             if self.tool_name:
                 self._tokens.append(_tool_name.set(self.tool_name))
             return self
@@ -316,6 +325,7 @@ class StructuredLogger:
         self,
         trace_id: str | None = None,
         request_id: str | None = None,
+        session_id: str | None = None,
         tool_name: str | None = None,
     ) -> _ContextManager:
         """Create a context manager for scoped logging context.
@@ -323,17 +333,18 @@ class StructuredLogger:
         Args:
             trace_id: Trace ID for distributed tracing.
             request_id: Request ID for request tracking.
+            session_id: Session ID for reasoning session correlation.
             tool_name: Name of the tool being executed.
 
         Returns:
             Context manager that sets the logging context.
 
         Example:
-            with log.context(trace_id="abc123", tool_name="compress"):
-                log.info("Processing")  # Includes trace_id and tool_name
+            with log.context(session_id="abc123", tool_name="think"):
+                log.info("Processing")  # Includes session_id and tool_name
 
         """
-        return self._ContextManager(trace_id, request_id, tool_name)
+        return self._ContextManager(trace_id, request_id, session_id, tool_name)
 
 
 def set_trace_id(trace_id: str) -> None:
@@ -354,6 +365,26 @@ def set_request_id(request_id: str) -> None:
 
     """
     _request_id.set(request_id)
+
+
+def set_session_id(session_id: str | None) -> None:
+    """Set the session ID for the current context.
+
+    Args:
+        session_id: Session ID string, or None to clear.
+
+    """
+    _session_id.set(session_id)
+
+
+def get_session_id() -> str | None:
+    """Get the current session ID from context.
+
+    Returns:
+        Current session ID or None if not set.
+
+    """
+    return _session_id.get()
 
 
 def set_tool_name(tool_name: str) -> None:
@@ -417,7 +448,7 @@ def get_default_logger() -> StructuredLogger:
     """
     global _default_logger
     if _default_logger is None:
-        _default_logger = get_logger("matrixmind_mcp")
+        _default_logger = get_logger("reason_guard_mcp")
     return _default_logger
 
 

@@ -72,9 +72,9 @@ echo "LOG_LEVEL=DEBUG" > .env
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp="https://github.com/coderdayton/matrixmind-mcp.*" \
+  --certificate-identity-regexp="https://github.com/coderdayton/reason-guard-mcp.*" \
   --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-  ghcr.io/OWNER/matrixmind-mcp:latest
+  ghcr.io/OWNER/reason-guard-mcp:latest
 ```
 
 ### Dependency Management
@@ -85,6 +85,34 @@ cosign verify \
 - Use `uv audit` or similar tools to check for known vulnerabilities
 
 ## Security Features
+
+### Input Validation
+
+Reason Guard enforces strict input limits to prevent resource exhaustion:
+
+| Limit | Default | Environment Variable |
+|-------|---------|---------------------|
+| Max problem size | 50,000 chars | `MAX_PROBLEM_SIZE` |
+| Max thought size | 10,000 chars | `MAX_THOUGHT_SIZE` |
+| Max context size | 100,000 chars | `MAX_CONTEXT_SIZE` |
+| Max thoughts per session | 1,000 | `MAX_THOUGHTS_PER_SESSION` |
+| Max concurrent sessions | 500 | `MAX_TOTAL_SESSIONS` |
+| Rate limit | 100/min | `RATE_LIMIT_MAX_SESSIONS` |
+
+### Path Traversal Protection
+
+Database paths are validated against an allowlist:
+
+```bash
+# Default allowed directories
+REASONGUARD_ALLOWED_DB_DIRS="~/.reasonguard:~/.local/share/reasonguard:/tmp:$CWD"
+```
+
+### Network Security
+
+- HTTP/SSE binds to `127.0.0.1` by default (not `0.0.0.0`)
+- Session IDs use full UUIDs (cryptographically strong)
+- Error messages don't leak internal state
 
 ### Supply Chain Security
 

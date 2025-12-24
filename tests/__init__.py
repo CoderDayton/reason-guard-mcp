@@ -1,1 +1,1 @@
-"""Tests for MatrixMind MCP Server."""
+"""Tests for Reason Guard MCP Server."""

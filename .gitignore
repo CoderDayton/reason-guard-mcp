@@ -79,3 +79,8 @@ tmp/
 temp/
 *.tmp
 *.bak
+
+# SQLite database files
+matrixmind_thoughts.db
+matrixmind_thoughts.db-shm
+matrixmind_thoughts.db-wal

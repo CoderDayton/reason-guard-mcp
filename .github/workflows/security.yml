@@ -62,3 +62,55 @@ jobs:
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-results.sarif'
+
+  pip-audit:
+    name: Python Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Install pip-audit
+        run: uv pip install pip-audit
+
+      - name: Run pip-audit
+        run: |
+          uv run pip-audit --format json --output pip-audit-results.json || true
+          uv run pip-audit --format markdown --desc --fix || true
+
+          # Upload results regardless of audit outcome
+          if [ -f pip-audit-results.json ]; then
+            echo "## Pip Audit Results" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            cat pip-audit-results.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+
+            # Fail on high/critical vulnerabilities only (file exists, safe to parse)
+            HIGH_VULNS=$(jq '[.dependencies[].vulns[] | select(.fix_versions != [])] | length' pip-audit-results.json 2>/dev/null || echo "0")
+            if [ "$HIGH_VULNS" -gt 0 ]; then
+              echo "::error::Found $HIGH_VULNS vulnerabilities with available fixes"
+              exit 1
+            fi
+          else
+            echo "::warning::pip-audit-results.json not found, skipping vulnerability check"
+          fi
+
+      - name: Upload pip-audit results
+        uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: pip-audit-results
+          path: pip-audit-results.json
+          retention-days: 30

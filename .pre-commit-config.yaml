@@ -1,4 +1,4 @@
-# Pre-commit hooks for MatrixMind MCP Server
+# Pre-commit hooks for Reason Guard MCP Server
 # Install: pre-commit install
 # Run all: pre-commit run --all-files
 
@@ -56,6 +56,25 @@ repos:
     rev: v8.21.2
     hooks:
       - id: gitleaks
+
+  # Dependency vulnerability scanning with pip-audit
+  - repo: https://github.com/pypa/pip-audit
+    rev: v2.7.3
+    hooks:
+      - id: pip-audit
+        args: [--require-hashes, --disable-pip]
+        stages: [pre-push]  # Only run on push (slow)
+
+  # Fast server import check - catches Pydantic/type resolution errors early
+  - repo: local
+    hooks:
+      - id: server-import-check
+        name: server-import-check
+        entry: uv run python -c "import src.server; print('✓ src.server imports OK')"
+        language: system
+        pass_filenames: false
+        files: ^src/.*\.py$
+        stages: [pre-commit]
 
 # CI configuration
 ci:

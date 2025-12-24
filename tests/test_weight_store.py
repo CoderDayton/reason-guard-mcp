@@ -285,7 +285,7 @@ class TestWeightStoreIntegration:
         session_id = result["session_id"]
 
         # Verify weights were loaded
-        with manager.session(session_id) as session:
+        async with manager.session(session_id) as session:
             assert session.suggestion_weights.verify == 1.5
             assert session.suggestion_weights.finish == 0.2
 
@@ -311,12 +311,12 @@ class TestWeightStoreIntegration:
         session_id = result["session_id"]
 
         # Get suggestion
-        suggestion = manager.suggest_next_action(session_id)
+        suggestion = await manager.suggest_next_action(session_id)
         suggestion_id = suggestion.get("suggestion_id")
 
         if suggestion_id:
             # Record feedback
-            manager.record_suggestion_outcome(
+            await manager.record_suggestion_outcome(
                 session_id=session_id,
                 suggestion_id=suggestion_id,
                 outcome="accepted",
@@ -345,20 +345,20 @@ class TestWeightStoreIntegration:
         result1 = await manager1.start_session(problem="What is 2 + 2?", expected_steps=3)
         session_id1 = result1["session_id"]
 
-        suggestion1 = manager1.suggest_next_action(session_id1)
+        suggestion1 = await manager1.suggest_next_action(session_id1)
         if suggestion1.get("suggestion_id"):
             # Accept verify suggestion multiple times
             for _ in range(3):
-                suggestion = manager1.suggest_next_action(session_id1)
+                suggestion = await manager1.suggest_next_action(session_id1)
                 if suggestion.get("suggestion_id"):
-                    manager1.record_suggestion_outcome(
+                    await manager1.record_suggestion_outcome(
                         session_id=session_id1,
                         suggestion_id=suggestion["suggestion_id"],
                         outcome="accepted",
                     )
 
         # Get final weights from session 1
-        with manager1.session(session_id1):
+        async with manager1.session(session_id1):
             pass
 
         # Session 2: New manager, same store
@@ -373,7 +373,7 @@ class TestWeightStoreIntegration:
         session_id2 = result2["session_id"]
 
         # Verify weights were loaded from persistence
-        with manager2.session(session_id2):
+        async with manager2.session(session_id2):
             # Weights should reflect learned preferences
             loaded_weights = weight_store.load_weights("math")
             assert loaded_weights.total_feedback > 0

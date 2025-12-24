@@ -198,7 +198,7 @@ jobs:
     if: ${{ !inputs.dry_run }}
     environment:
       name: pypi
-      url: https://pypi.org/project/matrixmind-mcp/
+      url: https://pypi.org/project/reason-guard-mcp/
     permissions:
       id-token: write  # Required for trusted publishing
 
@@ -389,34 +389,34 @@ jobs:
 
           # Verify wheel
           cosign verify-blob \
-            --signature matrixmind_mcp-VERSION-py3-none-any.whl.sig \
-            --certificate matrixmind_mcp-VERSION-py3-none-any.whl.pem \
-            --certificate-identity-regexp "https://github.com/CoderDayton/matrixmind-mcp/" \
+            --signature reason_guard_mcp-VERSION-py3-none-any.whl.sig \
+            --certificate reason_guard_mcp-VERSION-py3-none-any.whl.pem \
+            --certificate-identity-regexp "https://github.com/coderdayton/reason-guard-mcp/" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            matrixmind_mcp-VERSION-py3-none-any.whl
+            reason_guard_mcp-VERSION-py3-none-any.whl
 
           # Verify Docker image
           cosign verify \
-            --certificate-identity-regexp "https://github.com/CoderDayton/matrixmind-mcp/" \
+            --certificate-identity-regexp "https://github.com/coderdayton/reason-guard-mcp/" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            ghcr.io/coderdayton/matrixmind-mcp:VERSION
+            ghcr.io/coderdayton/reason-guard-mcp:VERSION
           ```
 
           ## Installation
 
           ```bash
           # Install from PyPI
-          pip install matrixmind-mcp
+          pip install reason-guard-mcp
 
           # Or run directly with uvx
-          uvx matrixmind-mcp
+          uvx reason-guard
           ```
 
           ## Docker
 
           ```bash
-          docker pull ghcr.io/coderdayton/matrixmind-mcp:VERSION
-          docker run -p 8000:8000 -e SERVER_TRANSPORT=http ghcr.io/coderdayton/matrixmind-mcp:VERSION
+          docker pull ghcr.io/coderdayton/reason-guard-mcp:VERSION
+          docker run -p 8000:8000 -e SERVER_TRANSPORT=http ghcr.io/coderdayton/reason-guard-mcp:VERSION
           ```
           EOF
 

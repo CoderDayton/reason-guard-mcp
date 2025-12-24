@@ -12,7 +12,10 @@ Designed for MCP server use with full async/await support.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
+import math
+import os
 import sys
 import threading
 import types
@@ -20,12 +23,16 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from loguru import logger
+
+if TYPE_CHECKING:
+    from src.models.context_encoder import ContextEncoder
 
 
 # =============================================================================
@@ -115,6 +122,27 @@ class SearchResult:
     doc_id: int | None = None
 
 
+class QuantizationType(str, Enum):
+    """Quantization types for vector storage (SimpleVecDB 2.0).
+
+    Trade-offs:
+    - FLOAT32: Best precision, largest storage (1x)
+    - FLOAT16: Good precision, 2x compression (recommended)
+    - INT8: Moderate precision, 4x compression
+    - BIT: Binary quantization, 32x compression (fastest, lowest precision)
+    """
+
+    FLOAT32 = "float32"
+    FLOAT16 = "float16"
+    INT8 = "int8"
+    BIT = "bit"
+    NONE = "none"  # Alias for FLOAT32
+
+
+# Default embedding model - matches server.py default
+DEFAULT_EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-xs")
+
+
 @dataclass
 class VectorStoreConfig:
     """Configuration for VectorStore.
@@ -122,25 +150,29 @@ class VectorStoreConfig:
     Attributes:
         db_path: Path to SQLite database file.
         collection_name: Name of the vector collection.
-        embedding_model: Sentence-transformer model name.
+        embedding_model: Sentence-transformer model name (default from EMBEDDING_MODEL env).
         embedding_dim: Embedding dimension (auto-detected if None).
         distance_metric: Distance metric for similarity search.
-        use_quantization: Whether to use int8 quantization for storage.
+        quantization: Quantization type for storage (float32, float16, int8, bit).
+        use_quantization: Deprecated. Use quantization instead.
         cache_size: LRU cache size for embeddings.
         cache_max_memory_mb: Maximum cache memory in megabytes.
         max_workers: Thread pool size for async operations.
+        search_threads: Number of threads for parallel search (None = auto).
 
     """
 
     db_path: str | Path = "ghostdm.db"
     collection_name: str = "thoughts"
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_model: str = field(default_factory=lambda: DEFAULT_EMBEDDING_MODEL)
     embedding_dim: int | None = None  # Auto-detect
     distance_metric: DistanceMetric = DistanceMetric.COSINE
-    use_quantization: bool = False
+    quantization: QuantizationType = QuantizationType.FLOAT16  # 2x compression, good precision
+    use_quantization: bool = False  # Deprecated, use quantization instead
     cache_size: int = 1000
     cache_max_memory_mb: float = 50.0
     max_workers: int = 4
+    search_threads: int | None = None  # None = auto-detect
 
 
 class EmbeddingCache:
@@ -243,6 +275,20 @@ class EmbeddingCache:
             }
 
 
+def prewarm_embedding_model(model_name: str) -> None:
+    """Pre-warm the embedding model at startup to avoid first-call latency.
+
+    Call this during server initialization to load the SentenceTransformer
+    model before any tool calls. This eliminates the ~3s delay on first
+    vector store operation.
+
+    Args:
+        model_name: HuggingFace model name (e.g., "BAAI/bge-small-en-v1.5").
+
+    """
+    _get_embedding_model(model_name)
+
+
 def _get_embedding_model(model_name: str) -> Any:
     """Lazy-load the sentence transformer model (thread-safe singleton).
 
@@ -297,7 +343,7 @@ class AsyncVectorStore:
     """Async vector store with embedding generation and persistent storage.
 
     Combines:
-    - sentence-transformers for embedding generation
+    - sentence-transformers for embedding generation (or shared ContextEncoder)
     - SimpleVecDB for SQLite-backed vector storage
     - LRU cache for embedding reuse
     - Full async/await API for MCP server integration
@@ -310,14 +356,21 @@ class AsyncVectorStore:
 
     """
 
-    def __init__(self, config: VectorStoreConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: VectorStoreConfig | None = None,
+        encoder: ContextEncoder | None = None,
+    ) -> None:
         """Initialize async vector store.
 
         Args:
             config: Store configuration. Uses defaults if None.
+            encoder: Optional shared ContextEncoder to avoid loading duplicate model.
+                     If provided, bypasses SentenceTransformer and uses ModelManager's model.
 
         """
         self.config = config or VectorStoreConfig()
+        self._encoder = encoder  # Shared encoder from ModelManager
         self._cache = EmbeddingCache(
             max_size=self.config.cache_size,
             max_memory_mb=self.config.cache_max_memory_mb,
@@ -355,7 +408,22 @@ class AsyncVectorStore:
                 DistanceMetric.DOT: DistanceStrategy.COSINE,
             }
 
-            quant = Quantization.INT8 if self.config.use_quantization else Quantization.FLOAT
+            # SimpleVecDB 2.0: Map quantization type
+            quant_map = {
+                QuantizationType.FLOAT32: Quantization.FLOAT,
+                QuantizationType.FLOAT16: Quantization.FLOAT16,
+                QuantizationType.INT8: Quantization.INT8,
+                QuantizationType.BIT: Quantization.BIT,
+                QuantizationType.NONE: Quantization.FLOAT,
+            }
+            # Support legacy use_quantization bool (maps to INT8)
+            if (
+                self.config.use_quantization
+                and self.config.quantization == QuantizationType.FLOAT16
+            ):
+                quant = Quantization.INT8  # Legacy behavior
+            else:
+                quant = quant_map.get(self.config.quantization, Quantization.FLOAT16)
 
             # Use sync VectorDB wrapped with async executor
             db = VectorDB(
@@ -367,10 +435,13 @@ class AsyncVectorStore:
             )
             self._db = db
             self._collection = db.collection(self.config.collection_name)
-            logger.debug(f"Initialized VectorDB at {self.config.db_path}")
+            logger.debug(f"Initialized VectorDB at {self.config.db_path} (quantization={quant})")
 
     def _embed_texts_sync(self, texts: list[str]) -> np.ndarray:
         """Synchronous embedding generation (runs in executor).
+
+        Uses shared ContextEncoder if available, otherwise falls back to
+        SentenceTransformer. The shared encoder avoids loading duplicate models.
 
         Args:
             texts: List of texts to embed.
@@ -379,15 +450,15 @@ class AsyncVectorStore:
             Array of shape (len(texts), embedding_dim).
 
         """
-        model = _get_embedding_model(self.config.embedding_model)
-
         # Check cache for each text
         embeddings: list[np.ndarray | None] = []
         uncached_indices: list[int] = []
         uncached_texts: list[str] = []
 
+        model_key = "shared_encoder" if self._encoder else self.config.embedding_model
+
         for i, text in enumerate(texts):
-            cached = self._cache.get(text, self.config.embedding_model)
+            cached = self._cache.get(text, model_key)
             if cached is not None:
                 embeddings.append(cached)
             else:
@@ -397,27 +468,45 @@ class AsyncVectorStore:
 
         # Batch encode uncached texts
         if uncached_texts:
-            new_embeddings = model.encode(
-                uncached_texts,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-                show_progress_bar=False,
-            )
+            if self._encoder is not None:
+                # Use shared ContextEncoder (already loaded via ModelManager)
+                enc_result = self._encoder.encode_batch(uncached_texts, use_cache=False)
+                # Normalize embeddings for cosine similarity
+                emb_tensor = enc_result.embeddings
+                # Handle CUDA tensors - must move to CPU before numpy conversion
+                if hasattr(emb_tensor, "cpu"):
+                    emb_tensor = emb_tensor.cpu()
+                if hasattr(emb_tensor, "numpy"):
+                    new_embeddings = emb_tensor.numpy()
+                else:
+                    new_embeddings = np.array(emb_tensor)
+                # Normalize
+                norms = np.linalg.norm(new_embeddings, axis=1, keepdims=True)
+                new_embeddings = new_embeddings / np.maximum(norms, 1e-9)
+            else:
+                # Fall back to SentenceTransformer
+                model = _get_embedding_model(self.config.embedding_model)
+                new_embeddings = model.encode(
+                    uncached_texts,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
 
             # Cache and fill in results
             for i, (idx, text) in enumerate(zip(uncached_indices, uncached_texts, strict=False)):
                 emb = new_embeddings[i]
-                self._cache.put(text, self.config.embedding_model, emb)
+                self._cache.put(text, model_key, emb)
                 embeddings[idx] = emb
 
         # Stack into single array
-        result = np.stack([e for e in embeddings if e is not None])
+        stacked: np.ndarray = np.stack([e for e in embeddings if e is not None])
 
         # Update embedding dim if not set
         if self._embedding_dim is None:
-            self._embedding_dim = result.shape[1]
+            self._embedding_dim = int(stacked.shape[1])
 
-        return result
+        return stacked
 
     async def _embed_texts(self, texts: list[str]) -> np.ndarray:
         """Generate embeddings for texts (async, runs in executor).
@@ -444,7 +533,7 @@ class AsyncVectorStore:
 
         """
         result = await self._embed_texts([text])
-        return result[0]
+        return np.asarray(result[0])
 
     async def _run_sync(self, fn: Any) -> Any:
         """Run a synchronous function in the executor."""
@@ -535,13 +624,21 @@ class AsyncVectorStore:
         query: str,
         k: int = 5,
         filter: dict[str, Any] | None = None,
+        exact: bool | None = None,
+        threads: int | None = None,
     ) -> list[SearchResult]:
         """Search for similar texts.
+
+        SimpleVecDB 2.0 uses adaptive search: brute-force for <10k vectors
+        (perfect recall), HNSW for larger collections (faster, approximate).
 
         Args:
             query: Query text.
             k: Number of results to return.
             filter: Optional metadata filter.
+            exact: Force exact (brute-force) search for perfect recall.
+                   None = adaptive (default), True = exact, False = HNSW.
+            threads: Number of threads for parallel search (None = auto).
 
         Returns:
             List of SearchResult objects, sorted by similarity.
@@ -552,14 +649,20 @@ class AsyncVectorStore:
 
         # Embed query
         query_embedding = await self._embed_single(query)
+        search_threads = threads or self.config.search_threads
 
         # Search (sync call in executor)
         def _search() -> list[tuple[Any, float]]:
-            return self._collection.similarity_search(  # type: ignore
-                query=query_embedding.tolist(),
-                k=k,
-                filter=filter,
-            )
+            kwargs: dict[str, Any] = {
+                "query": query_embedding.tolist(),
+                "k": k,
+                "filter": filter,
+            }
+            if exact is not None:
+                kwargs["exact"] = exact
+            if search_threads is not None:
+                kwargs["threads"] = search_threads
+            return self._collection.similarity_search(**kwargs)  # type: ignore
 
         results = await self._run_sync(_search)
 
@@ -572,6 +675,65 @@ class AsyncVectorStore:
                 doc_id=doc.metadata.get("id"),
             )
             for doc, score in results
+        ]
+
+    async def search_batch(
+        self,
+        queries: list[str],
+        k: int = 5,
+        filter: dict[str, Any] | None = None,
+        threads: int | None = None,
+    ) -> list[list[SearchResult]]:
+        """Batch search for multiple queries (10x throughput).
+
+        SimpleVecDB 2.0 optimizes batch queries for parallel execution.
+
+        Args:
+            queries: List of query texts.
+            k: Number of results per query.
+            filter: Optional metadata filter (applied to all queries).
+            threads: Number of threads for parallel search (None = auto).
+
+        Returns:
+            List of SearchResult lists, one per query.
+
+        """
+        await self._ensure_initialized()
+        assert self._collection is not None
+
+        if not queries:
+            return []
+
+        # Embed all queries
+        query_embeddings = await self._embed_texts(queries)
+        search_threads = threads or self.config.search_threads
+
+        # Batch search (sync call in executor)
+        def _batch_search() -> list[list[tuple[Any, float]]]:
+            kwargs: dict[str, Any] = {
+                "queries": query_embeddings.tolist(),
+                "k": k,
+            }
+            if filter is not None:
+                kwargs["filter"] = filter
+            if search_threads is not None:
+                kwargs["threads"] = search_threads
+            return self._collection.similarity_search_batch(**kwargs)  # type: ignore
+
+        batch_results = await self._run_sync(_batch_search)
+
+        # Convert to SearchResults
+        return [
+            [
+                SearchResult(
+                    text=doc.page_content,
+                    score=score,
+                    metadata=doc.metadata,
+                    doc_id=doc.metadata.get("id"),
+                )
+                for doc, score in results
+            ]
+            for results in batch_results
         ]
 
     async def search_by_session(
@@ -750,7 +912,8 @@ class AsyncVectorStore:
         emb_b = emb_a if texts_b is None else await self._embed_texts(texts_b)
 
         # Cosine similarity (embeddings are already normalized)
-        return np.dot(emb_a, emb_b.T)
+        similarity_matrix: np.ndarray = np.dot(emb_a, emb_b.T)
+        return similarity_matrix
 
     async def delete_session(self, session_id: str) -> int:
         """Delete all documents from a session.
@@ -764,13 +927,316 @@ class AsyncVectorStore:
         """
         await self._ensure_initialized()
         assert self._collection is not None
+        collection = self._collection  # Capture for closure
 
         def _delete() -> int:
-            result = self._collection.remove_texts(filter={"session_id": session_id})  # type: ignore
+            result = collection.remove_texts(filter={"session_id": session_id})  # type: ignore
             return int(result) if result else 0
 
         deleted: int = await self._run_sync(_delete)
         return deleted
+
+    async def add_kg_facts(
+        self,
+        session_id: str,
+        entities: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+        domain: str | None = None,
+        confidence: float | None = None,
+    ) -> list[int]:
+        """Store knowledge graph facts for cross-session learning.
+
+        Persists entities and relations from a successful reasoning session
+        so they can be retrieved in future sessions for relevant problems.
+
+        Args:
+            session_id: Source session that produced these facts.
+            entities: List of entity dicts with 'name', 'type', etc.
+            relations: List of relation dicts with 'subject', 'predicate', 'object'.
+            domain: Optional domain classification (math, code, etc.).
+            confidence: Optional session confidence score.
+
+        Returns:
+            List of document IDs for stored facts.
+
+        """
+        if not entities and not relations:
+            return []
+
+        texts: list[str] = []
+        metadatas: list[dict[str, Any]] = []
+        timestamp = int(datetime.now().timestamp())
+
+        # Store entity facts as searchable text
+        for entity in entities:
+            name = entity.get("name", "")
+            etype = entity.get("type", "OTHER")
+            text = f"Entity: {name} (type: {etype})"
+
+            metadata: dict[str, Any] = {
+                "session_id": session_id,
+                "type": "kg_entity",
+                "entity_name": name,
+                "entity_type": etype,
+                "created_at": timestamp,
+                "access_count": 0,
+            }
+            if domain:
+                metadata["domain"] = domain
+            if confidence is not None:
+                metadata["source_confidence"] = confidence
+
+            texts.append(text)
+            metadatas.append(metadata)
+
+        # Store relation facts as searchable text (triple format)
+        for relation in relations:
+            subj = relation.get("subject", "")
+            pred = relation.get("predicate", "")
+            obj = relation.get("object", "")
+            evidence = relation.get("evidence", "")
+
+            # Create searchable representation
+            text = f"Fact: {subj} {pred} {obj}"
+            if evidence:
+                text += f" (evidence: {evidence[:100]})"
+
+            metadata = {
+                "session_id": session_id,
+                "type": "kg_relation",
+                "subject": subj,
+                "predicate": pred,
+                "object": obj,
+                "created_at": timestamp,
+                "access_count": 0,
+            }
+            if domain:
+                metadata["domain"] = domain
+            if confidence is not None:
+                metadata["source_confidence"] = confidence
+
+            texts.append(text)
+            metadatas.append(metadata)
+
+        return await self.add_texts(texts, metadatas)
+
+    async def search_kg_facts(
+        self,
+        query: str,
+        k: int = 5,
+        domain: str | None = None,
+        min_confidence: float | None = None,
+    ) -> list[SearchResult]:
+        """Search for relevant KG facts from past sessions.
+
+        Args:
+            query: Query text to find relevant facts.
+            k: Maximum facts to return.
+            domain: Optional domain filter.
+            min_confidence: Optional minimum source confidence.
+
+        Returns:
+            List of relevant KG facts.
+
+        """
+        # Search for entities and relations separately, then merge
+        # (simplevecdb doesn't support $in operator)
+        entity_results: list[SearchResult] = []
+        relation_results: list[SearchResult] = []
+
+        entity_filter: dict[str, Any] = {"type": "kg_entity"}
+        relation_filter: dict[str, Any] = {"type": "kg_relation"}
+        if domain:
+            entity_filter["domain"] = domain
+            relation_filter["domain"] = domain
+
+        with contextlib.suppress(Exception):
+            # Filter may not work on empty DB
+            entity_results = await self.search(query, k=k, filter=entity_filter)
+
+        with contextlib.suppress(Exception):
+            relation_results = await self.search(query, k=k, filter=relation_filter)
+
+        # Merge and sort by score
+        results = entity_results + relation_results
+        results.sort(key=lambda r: r.score, reverse=True)
+
+        # Post-filter by confidence if specified
+        if min_confidence is not None:
+            results = [
+                r for r in results if r.metadata.get("source_confidence", 1.0) >= min_confidence
+            ]
+
+        return results[:k]
+
+    def compute_fact_quality_score(
+        self,
+        result: SearchResult,
+        max_age_days: float = 30.0,
+        decay_rate: float = 0.1,
+    ) -> float:
+        """Compute quality score for a KG fact with time decay.
+
+        Quality = base_confidence * time_decay * access_bonus
+
+        Args:
+            result: SearchResult with metadata containing fact info.
+            max_age_days: Age at which decay reaches minimum (default 30 days).
+            decay_rate: Exponential decay rate (higher = faster decay).
+
+        Returns:
+            Quality score between 0.0 and 1.0.
+
+        """
+        metadata = result.metadata
+
+        # Base confidence from source session
+        base_confidence = metadata.get("source_confidence", 0.7)
+
+        # Time decay: exponential decay based on age
+        created_at = metadata.get("created_at", 0)
+        if created_at > 0:
+            age_seconds = datetime.now().timestamp() - created_at
+            age_days = age_seconds / 86400.0
+            # Exponential decay: e^(-decay_rate * age_days)
+            time_decay = math.exp(-decay_rate * age_days)
+            # Clamp to minimum of 0.1 (facts don't become completely useless)
+            time_decay = max(0.1, time_decay)
+        else:
+            time_decay = 0.5  # Unknown age gets neutral score
+
+        # Access bonus: frequently accessed facts are more valuable
+        access_count = metadata.get("access_count", 0)
+        # Logarithmic bonus: diminishing returns on access count
+        access_bonus = 1.0 + 0.1 * math.log1p(access_count)
+        access_bonus = min(1.5, access_bonus)  # Cap at 1.5x
+
+        # Combined quality score
+        quality = base_confidence * time_decay * access_bonus
+
+        return float(min(1.0, max(0.0, quality)))
+
+    async def search_kg_facts_with_decay(
+        self,
+        query: str,
+        k: int = 5,
+        domain: str | None = None,
+        min_quality: float = 0.3,
+    ) -> list[tuple[SearchResult, float]]:
+        """Search KG facts with quality-weighted ranking.
+
+        Combines semantic similarity with fact quality (confidence + recency).
+
+        Args:
+            query: Query text.
+            k: Maximum results.
+            domain: Optional domain filter.
+            min_quality: Minimum quality score threshold.
+
+        Returns:
+            List of (SearchResult, quality_score) tuples, sorted by combined score.
+
+        """
+        # Get more candidates than needed for quality filtering
+        results = await self.search_kg_facts(query, k=k * 3, domain=domain)
+
+        # Compute combined scores
+        scored_results: list[tuple[SearchResult, float, float]] = []
+        for result in results:
+            quality = self.compute_fact_quality_score(result)
+            if quality >= min_quality:
+                # Combined score: similarity * quality
+                # (similarity score from vector search, quality from metadata)
+                combined = result.score * quality
+                scored_results.append((result, quality, combined))
+
+        # Sort by combined score (descending)
+        scored_results.sort(key=lambda x: x[2], reverse=True)
+
+        return [(r, q) for r, q, _ in scored_results[:k]]
+
+    async def prune_kg_facts(
+        self,
+        max_age_days: float = 90.0,
+        min_confidence: float = 0.5,
+        max_facts: int = 10000,
+    ) -> int:
+        """Prune old or low-quality KG facts to maintain store quality.
+
+        Removes facts that are:
+        - Older than max_age_days AND have low confidence
+        - Beyond max_facts limit (oldest first)
+
+        Args:
+            max_age_days: Maximum age for low-confidence facts.
+            min_confidence: Facts below this AND old get pruned.
+            max_facts: Maximum total KG facts to retain.
+
+        Returns:
+            Number of facts pruned.
+
+        """
+        await self._ensure_initialized()
+        assert self._collection is not None
+        collection = self._collection  # Capture for closures
+
+        cutoff_timestamp = int(datetime.now().timestamp() - (max_age_days * 86400))
+        pruned = 0
+        embedding_dim = self.embedding_dim
+
+        # Get all KG facts (entities and relations)
+        # This is expensive but necessary for pruning
+        def _get_all_kg_facts() -> list[tuple[Any, float]]:
+            all_facts: list[tuple[Any, float]] = []
+            # Query with dummy vector to get all documents
+            for fact_type in ["kg_entity", "kg_relation"]:
+                try:
+                    results = collection.similarity_search(
+                        query=[0.0] * embedding_dim,
+                        k=max_facts * 2,
+                        filter={"type": fact_type},
+                    )
+                    all_facts.extend(results)
+                except Exception:
+                    pass  # nosec B110 - empty DB or filter issues are non-fatal
+            return all_facts
+
+        all_facts = await self._run_sync(_get_all_kg_facts)
+
+        # Identify facts to prune by their text content
+        # (simplevecdb doesn't expose row IDs in metadata, so we use text matching)
+        texts_to_prune: list[str] = []
+        remaining_facts: list[tuple[Any, int]] = []
+
+        for doc, _score in all_facts:
+            metadata = doc.metadata
+            created_at = metadata.get("created_at", 0)
+            confidence = metadata.get("source_confidence", 0.7)
+
+            # Prune if old AND low confidence
+            if created_at < cutoff_timestamp and confidence < min_confidence:
+                texts_to_prune.append(doc.page_content)
+            else:
+                remaining_facts.append((doc, created_at))
+
+        # If still over limit, prune oldest facts
+        if len(remaining_facts) > max_facts:
+            remaining_facts.sort(key=lambda x: x[1])  # Sort by age (oldest first)
+            excess = len(remaining_facts) - max_facts
+            for doc, _ in remaining_facts[:excess]:
+                texts_to_prune.append(doc.page_content)
+
+        # Execute pruning using remove_texts
+        if texts_to_prune:
+
+            def _prune() -> int:
+                result = collection.remove_texts(texts=texts_to_prune)
+                return int(result) if result else 0
+
+            pruned = await self._run_sync(_prune)
+            logger.info(f"Pruned {pruned} KG facts (old/low-quality)")
+
+        return pruned
 
     @property
     def embedding_dim(self) -> int:

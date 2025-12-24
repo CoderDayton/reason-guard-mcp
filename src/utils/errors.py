@@ -1,47 +1,66 @@
-"""Custom exceptions for MatrixMind MCP."""
+"""Custom exceptions for Reason Guard MCP."""
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 
-class MatrixMindException(Exception):
-    """Base exception for MatrixMind MCP."""
+class ReasonGuardException(Exception):
+    """Base exception for Reason Guard MCP."""
 
     pass
 
 
-class CompressionException(MatrixMindException):
+def _get_deprecated_matrixmind_exception() -> type[ReasonGuardException]:
+    """Return ReasonGuardException with deprecation warning."""
+    warnings.warn(
+        "MatrixMindException is deprecated, use ReasonGuardException instead. "
+        "MatrixMindException will be removed in version 1.0.0.",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return ReasonGuardException
+
+
+# Backwards compatibility - lazy deprecation via __getattr__
+def __getattr__(name: str) -> type[ReasonGuardException]:
+    if name == "MatrixMindException":
+        return _get_deprecated_matrixmind_exception()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+class CompressionException(ReasonGuardException):
     """Raised during compression failures."""
 
     pass
 
 
-class ReasoningException(MatrixMindException):
+class ReasoningException(ReasonGuardException):
     """Raised during reasoning failures."""
 
     pass
 
 
-class VerificationException(MatrixMindException):
+class VerificationException(ReasonGuardException):
     """Raised during verification failures."""
 
     pass
 
 
-class LLMException(MatrixMindException):
+class LLMException(ReasonGuardException):
     """Raised during LLM API calls."""
 
     pass
 
 
-class ConfigException(MatrixMindException):
+class ConfigException(ReasonGuardException):
     """Raised during configuration issues."""
 
     pass
 
 
-class ModelNotReadyException(MatrixMindException):
+class ModelNotReadyException(ReasonGuardException):
     """Raised when a tool is called before the embedding model is ready.
 
     This typically occurs when:
@@ -53,13 +72,13 @@ class ModelNotReadyException(MatrixMindException):
     pass
 
 
-class InvalidActionError(MatrixMindException):
+class InvalidActionError(ReasonGuardException):
     """Raised when an invalid action is provided to a tool."""
 
     pass
 
 
-class SessionNotFoundError(MatrixMindException):
+class SessionNotFoundError(ReasonGuardException):
     """Raised when a session ID is not found."""
 
     pass

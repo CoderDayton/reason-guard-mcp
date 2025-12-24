@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 import pytest
 
-from src.utils.session import SessionManager, SessionNotFoundError
+from src.utils.session import (
+    AsyncSessionManager,
+    SessionManager,
+    SessionNotFoundError,
+    is_uvloop_installed,
+)
 
 
 @dataclass
@@ -297,3 +303,303 @@ class TestThreadSafety:
 
         assert mgr.session_count() == 1
         assert mgr._get_session("test").value == "second"
+
+
+# =============================================================================
+# AsyncSessionManager Tests
+# =============================================================================
+
+
+class MockAsyncManager(AsyncSessionManager[MockState]):
+    """Concrete async implementation for testing."""
+
+    async def create_session(self, session_id: str, value: str = "") -> MockState:
+        """Create and register a new session."""
+        state = MockState(session_id=session_id, value=value)
+        await self.register_session(session_id, state)
+        return state
+
+
+class TestAsyncSessionManagerBasics:
+    """Tests for basic AsyncSessionManager operations."""
+
+    @pytest.mark.asyncio
+    async def test_init_empty(self) -> None:
+        """New async manager should have no sessions."""
+        mgr = MockAsyncManager()
+        assert await mgr.session_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_register_session(self) -> None:
+        """register_session should add session to storage."""
+        mgr = MockAsyncManager()
+        state = MockState(session_id="test1")
+        await mgr.register_session("test1", state)
+        assert await mgr.session_count() == 1
+        assert await mgr.session_exists("test1")
+
+    @pytest.mark.asyncio
+    async def test_session_exists_false(self) -> None:
+        """session_exists should return False for unknown IDs."""
+        mgr = MockAsyncManager()
+        assert await mgr.session_exists("nonexistent") is False
+
+    @pytest.mark.asyncio
+    async def test_get_session_success(self) -> None:
+        """get_session should return registered session."""
+        mgr = MockAsyncManager()
+        state = MockState(session_id="test1", value="hello")
+        await mgr.register_session("test1", state)
+
+        retrieved = await mgr.get_session("test1")
+        assert retrieved.value == "hello"
+
+    @pytest.mark.asyncio
+    async def test_get_session_not_found(self) -> None:
+        """get_session should raise SessionNotFoundError."""
+        mgr = MockAsyncManager()
+        with pytest.raises(SessionNotFoundError) as exc_info:
+            await mgr.get_session("nonexistent")
+        assert exc_info.value.session_id == "nonexistent"
+
+    @pytest.mark.asyncio
+    async def test_remove_session_success(self) -> None:
+        """remove_session should remove and return session."""
+        mgr = MockAsyncManager()
+        state = MockState(session_id="test1")
+        await mgr.register_session("test1", state)
+
+        removed = await mgr.remove_session("test1")
+        assert removed is state
+        assert await mgr.session_count() == 0
+        assert not await mgr.session_exists("test1")
+
+    @pytest.mark.asyncio
+    async def test_remove_session_not_found(self) -> None:
+        """remove_session should return None for unknown IDs."""
+        mgr = MockAsyncManager()
+        removed = await mgr.remove_session("nonexistent")
+        assert removed is None
+
+
+class TestAsyncSessionContextManager:
+    """Tests for async session() context manager."""
+
+    @pytest.mark.asyncio
+    async def test_session_yields_state(self) -> None:
+        """session() should yield the session state."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1", "original")
+
+        async with mgr.session("test1") as state:
+            assert state.value == "original"
+
+    @pytest.mark.asyncio
+    async def test_session_allows_mutation(self) -> None:
+        """Mutations inside session() should persist."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1", "original")
+
+        async with mgr.session("test1") as state:
+            state.value = "modified"
+
+        async with mgr.session("test1") as state:
+            assert state.value == "modified"
+
+    @pytest.mark.asyncio
+    async def test_session_not_found(self) -> None:
+        """session() should raise SessionNotFoundError."""
+        mgr = MockAsyncManager()
+        with pytest.raises(SessionNotFoundError):
+            async with mgr.session("nonexistent"):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_session_exception_releases_lock(self) -> None:
+        """Lock should be released even if exception occurs."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1")
+
+        with pytest.raises(ValueError):
+            async with mgr.session("test1"):
+                raise ValueError("test error")
+
+        # Lock should be released - this should not deadlock
+        async with mgr.session("test1") as state:
+            state.value = "after_exception"
+
+        retrieved = await mgr.get_session("test1")
+        assert retrieved.value == "after_exception"
+
+
+class TestAsyncLockedContextManager:
+    """Tests for async locked() context manager."""
+
+    @pytest.mark.asyncio
+    async def test_locked_yields_sessions_dict(self) -> None:
+        """locked() should yield the sessions dictionary."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1")
+        await mgr.create_session("test2")
+
+        async with mgr.locked() as sessions:
+            assert len(sessions) == 2
+            assert "test1" in sessions
+            assert "test2" in sessions
+
+    @pytest.mark.asyncio
+    async def test_locked_allows_iteration(self) -> None:
+        """Should be able to iterate over sessions."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("a", "value_a")
+        await mgr.create_session("b", "value_b")
+
+        values = []
+        async with mgr.locked() as sessions:
+            for sid, state in sessions.items():
+                values.append((sid, state.value))
+
+        assert sorted(values) == [("a", "value_a"), ("b", "value_b")]
+
+    @pytest.mark.asyncio
+    async def test_locked_exception_releases_lock(self) -> None:
+        """Lock should be released even if exception occurs."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1")
+
+        with pytest.raises(RuntimeError):
+            async with mgr.locked():
+                raise RuntimeError("test error")
+
+        # Lock should be released - this should not deadlock
+        async with mgr.locked() as sessions:
+            assert len(sessions) == 1
+
+
+class TestAsyncCleanupStale:
+    """Tests for async cleanup_stale() method."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_removes_old_sessions(self) -> None:
+        """Old sessions should be removed."""
+        mgr = MockAsyncManager()
+
+        # Create old session
+        old_state = MockState(session_id="old")
+        old_state.updated_at = datetime.now() - timedelta(hours=2)
+        await mgr.register_session("old", old_state)
+
+        # Create recent session
+        new_state = MockState(session_id="new")
+        new_state.updated_at = datetime.now()
+        await mgr.register_session("new", new_state)
+
+        removed = await mgr.cleanup_stale(timedelta(hours=1))
+
+        assert removed == ["old"]
+        assert await mgr.session_count() == 1
+        assert await mgr.session_exists("new")
+        assert not await mgr.session_exists("old")
+
+    @pytest.mark.asyncio
+    async def test_cleanup_with_predicate(self) -> None:
+        """Predicate should filter which sessions are eligible."""
+        mgr = MockAsyncManager()
+
+        # Both old, but different statuses
+        completed = MockState(session_id="completed", status="completed")
+        completed.updated_at = datetime.now() - timedelta(hours=2)
+        await mgr.register_session("completed", completed)
+
+        active = MockState(session_id="active", status="active")
+        active.updated_at = datetime.now() - timedelta(hours=2)
+        await mgr.register_session("active", active)
+
+        # Only remove completed sessions
+        removed = await mgr.cleanup_stale(
+            timedelta(hours=1), predicate=lambda s: s.status == "completed"
+        )
+
+        assert removed == ["completed"]
+        assert await mgr.session_exists("active")
+        assert not await mgr.session_exists("completed")
+
+
+class TestAsyncConcurrency:
+    """Tests for async concurrency guarantees."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_session_access(self) -> None:
+        """Multiple concurrent accesses should be serialized."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test", "0")
+
+        async def increment(n: int) -> None:
+            for _ in range(n):
+                async with mgr.session("test") as state:
+                    current = int(state.value)
+                    # Small yield to encourage context switches
+                    await asyncio.sleep(0)
+                    state.value = str(current + 1)
+
+        # Run multiple concurrent incrementers
+        await asyncio.gather(
+            increment(10),
+            increment(10),
+            increment(10),
+        )
+
+        # With proper locking, final value should be 30
+        state = await mgr.get_session("test")
+        assert state.value == "30"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_session_creation(self) -> None:
+        """Multiple concurrent session creations should all succeed."""
+        mgr = MockAsyncManager()
+
+        async def create(sid: str) -> None:
+            await mgr.create_session(sid, f"value_{sid}")
+
+        # Create many sessions concurrently
+        await asyncio.gather(*[create(f"session_{i}") for i in range(100)])
+
+        assert await mgr.session_count() == 100
+
+    @pytest.mark.asyncio
+    async def test_get_all_sessions_snapshot(self) -> None:
+        """get_all_sessions_snapshot should return copy without blocking."""
+        mgr = MockAsyncManager()
+        await mgr.create_session("test1", "a")
+        await mgr.create_session("test2", "b")
+
+        # Non-blocking snapshot
+        snapshot = mgr.get_all_sessions_snapshot()
+
+        assert len(snapshot) == 2
+        assert "test1" in snapshot
+        assert "test2" in snapshot
+
+        # Modifications to snapshot shouldn't affect manager
+        snapshot["test3"] = MockState(session_id="test3")
+        assert await mgr.session_count() == 2
+
+
+class TestUvloopInstalled:
+    """Tests for uvloop detection."""
+
+    def test_is_uvloop_installed_returns_bool(self) -> None:
+        """is_uvloop_installed should return a boolean."""
+        result = is_uvloop_installed()
+        assert isinstance(result, bool)
+
+    @pytest.mark.skipif(
+        __import__("sys").platform == "win32",
+        reason="uvloop not available on Windows",
+    )
+    def test_uvloop_installed_on_unix(self) -> None:
+        """On Unix, uvloop should be installed and active."""
+        # This test verifies uvloop is properly installed in the project
+        result = is_uvloop_installed()
+        # Should be True since we added uvloop to dependencies
+        assert result is True

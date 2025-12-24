@@ -1,4 +1,4 @@
-"""Type definitions and schemas for MatrixMind MCP."""
+"""Type definitions and schemas for Reason Guard MCP."""
 
 from __future__ import annotations
 

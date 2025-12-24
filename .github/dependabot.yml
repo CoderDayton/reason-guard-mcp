@@ -3,13 +3,14 @@
 
 version: 2
 updates:
-  # Python dependencies (uv/pip)
+  # Python dependencies (pip/uv)
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
       time: "09:00"
+      timezone: "Etc/UTC"
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
@@ -18,13 +19,19 @@ updates:
       - "dependencies"
       - "python"
     groups:
-      # Group minor/patch updates together
+      # Group minor/patch updates to reduce PR noise
       python-minor:
         patterns:
           - "*"
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # Ignore major version bumps for stability (review manually)
+      - dependency-name: "numpy"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sentence-transformers"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -32,31 +39,26 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-      time: "09:00"
-    open-pull-requests-limit: 3
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
-      include: "scope"
     labels:
       - "dependencies"
       - "github-actions"
     groups:
-      # Group all action updates together
       actions:
         patterns:
           - "*"
 
-  # Docker dependencies
+  # Docker base images
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
-      time: "09:00"
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 3
     commit-message:
       prefix: "docker"
-      include: "scope"
     labels:
       - "dependencies"
       - "docker"

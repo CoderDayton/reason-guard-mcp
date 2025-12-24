@@ -13,8 +13,10 @@ Note: Uses ModelManager to share the embedding model instance with other tools
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from collections import OrderedDict
+from concurrent.futures import Executor
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -24,7 +26,7 @@ import torch.nn.functional as F
 from loguru import logger
 
 from src.models.model_manager import ModelManager
-from src.utils.errors import MatrixMindException, ModelNotReadyException
+from src.utils.errors import ModelNotReadyException, ReasonGuardException
 
 
 class PoolingStrategy(str, Enum):
@@ -36,7 +38,7 @@ class PoolingStrategy(str, Enum):
     MEAN_SQRT_LEN = "mean_sqrt_len"  # Mean divided by sqrt(sequence_length)
 
 
-class EncoderException(MatrixMindException):
+class EncoderException(ReasonGuardException):
     """Raised during encoding failures."""
 
     pass
@@ -209,14 +211,8 @@ class ContextEncoder:
         >>> result = encoder.encode_batch(texts)
         >>> print(result.embeddings.shape)  # torch.Size([2, 768])
 
-        >>> # Similarity computation
-        >>> query = encoder.encode("query text")
-        >>> docs = encoder.encode_batch(["doc1", "doc2", "doc3"])
-        >>> similarities = F.cosine_similarity(
-        ...     query.embeddings.unsqueeze(0),
-        ...     docs.embeddings,
-        ...     dim=1
-        ... )
+        >>> # Async batch encoding
+        >>> result = await encoder.encode_batch_async(texts)
 
     """
 
@@ -296,6 +292,56 @@ class ContextEncoder:
             cached=result.cached,
         )
 
+    async def encode_async(
+        self,
+        text: str,
+        pooling: PoolingStrategy | None = None,
+        use_cache: bool = True,
+        executor: Executor | None = None,
+    ) -> EncodingResult:
+        """Encode single text asynchronously.
+
+        Args:
+            text: Text to encode.
+            pooling: Override pooling strategy.
+            use_cache: Whether to use embedding cache.
+            executor: Optional executor to run in.
+
+        Returns:
+            EncodingResult with embedding tensor.
+
+        """
+        return await self.encode_batch_async(
+            [text], pooling=pooling, use_cache=use_cache, executor=executor
+        )
+
+    async def encode_batch_async(
+        self,
+        texts: list[str],
+        pooling: PoolingStrategy | None = None,
+        use_cache: bool = True,
+        executor: Executor | None = None,
+    ) -> EncodingResult:
+        """Encode batch of texts asynchronously (non-blocking).
+
+        Offloads the CPU-intensive encoding to a separate thread.
+
+        Args:
+            texts: List of texts to encode.
+            pooling: Override pooling strategy.
+            use_cache: Whether to use embedding cache.
+            executor: Optional executor to run in (default: loop's default).
+
+        Returns:
+            EncodingResult with stacked embedding tensors.
+
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            executor,
+            lambda: self.encode_batch(texts, pooling=pooling, use_cache=use_cache),
+        )
+
     def encode_batch(
         self,
         texts: list[str],
@@ -330,6 +376,8 @@ class ContextEncoder:
         # Check cache for each text
         for idx, text in enumerate(texts):
             if not text or not text.strip():
+                # Handle empty strings gracefully - return zero vector or skip
+                # For now, we'll raise to maintain strictness, but could be relaxed
                 raise EncoderException(f"Empty text at index {idx}")
 
             cache_key = self._cache_key(text, pooling)
@@ -362,11 +410,13 @@ class ContextEncoder:
                             max_length=self.config.max_length,
                         ).to(self.device)
 
-                        # Get token counts
-                        for _i, text in enumerate(batch_texts):
-                            tokens_per_text.append(
-                                len(self.tokenizer.encode(text, add_special_tokens=False))
-                            )
+                        # Get token counts from attention_mask (avoids double tokenization)
+                        # Count non-padding, non-special tokens per sequence
+                        attention_mask = inputs["attention_mask"]
+                        for i in range(attention_mask.shape[0]):
+                            # Subtract 2 for [CLS] and [SEP] special tokens
+                            token_count = int(attention_mask[i].sum().item()) - 2
+                            tokens_per_text.append(max(0, token_count))
 
                         # Forward pass
                         with torch.no_grad():

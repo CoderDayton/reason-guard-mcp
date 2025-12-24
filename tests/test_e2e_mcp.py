@@ -25,10 +25,17 @@ class TestMCPProtocol:
 
             tool_names = {tool.name for tool in tools}
             expected_tools = {
-                # Consolidated tools (3 total)
+                # Guidance mode tools (4)
                 "think",
                 "compress",
                 "status",
+                "paradigm_hint",
+                # Enforcement mode tools (5)
+                "initialize_reasoning",
+                "submit_step",
+                "create_branch",
+                "verify_claims",
+                "router_status",
             }
 
             missing = expected_tools - tool_names
@@ -317,6 +324,346 @@ class TestMCPProtocol:
             assert response["compression_ratio"] <= 0.5  # Should be compressed
 
 
+class TestEnforcementModeWorkflow:
+    """Test enforcement mode (atomic router) workflow via MCP protocol."""
+
+    @pytest.mark.asyncio
+    async def test_enforcement_complete_workflow(self) -> None:
+        """Test complete enforcement workflow: initialize -> submit_step -> verify_claims."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Step 1: Initialize reasoning session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Prove that 2 + 2 = 4", "complexity": "low"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "session_id" in response
+            assert response["complexity"] == "low"
+            assert "min_steps" in response
+            assert "max_steps" in response
+            session_id = response["session_id"]
+
+            # Step 2: Submit premise step
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "premise",
+                    "content": "We define 2 as the successor of 1",
+                    "confidence": 0.95,
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "ACCEPTED"
+            assert "valid_next_steps" in response
+
+            # Step 3: Submit hypothesis step
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "hypothesis",
+                    "content": "2 + 2 equals the successor of successor of 2",
+                    "confidence": 0.9,
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "ACCEPTED"
+
+            # Step 4: Submit verification step
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "verification",
+                    "content": "By Peano axioms, S(S(2)) = S(3) = 4",
+                    "confidence": 0.95,
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "ACCEPTED"
+
+            # Step 5: Verify claims before synthesis
+            result = await client.call_tool(
+                "verify_claims",
+                {
+                    "session_id": session_id,
+                    "claims": ["2 + 2 = 4"],
+                    "evidence": ["Peano axioms define successor function"],
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "verified" in response
+
+            # Step 6: Submit synthesis step
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "Therefore, 2 + 2 = 4 is proven",
+                    "confidence": 0.99,
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            # Synthesis should be accepted (low complexity = 2-5 steps, we did 4)
+            assert response["status"] == "ACCEPTED"
+
+    @pytest.mark.asyncio
+    async def test_enforcement_rejects_early_synthesis(self) -> None:
+        """Test that enforcement mode rejects synthesis before min_steps."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize with medium complexity (min 4 steps)
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Explain the Monty Hall problem", "complexity": "medium"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+            min_steps = response["min_steps"]
+
+            # Try to synthesize immediately (should be rejected)
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "The answer is to switch doors",
+                    "confidence": 0.9,
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["status"] == "REJECTED"
+            assert "rejection_reason" in response
+            # Should mention needing more steps
+            assert (
+                str(min_steps) in response["rejection_reason"]
+                or "step" in response["rejection_reason"].lower()
+            )
+
+    @pytest.mark.asyncio
+    async def test_enforcement_branch_required_for_low_confidence(self) -> None:
+        """Test that low confidence triggers BRANCH_REQUIRED."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Solve a probability puzzle", "complexity": "medium"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+            confidence_threshold = response["confidence_threshold"]
+
+            # Submit premise with high confidence
+            await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "premise",
+                    "content": "Initial premise",
+                    "confidence": 0.95,
+                },
+            )
+
+            # Submit hypothesis with LOW confidence (below threshold)
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "hypothesis",
+                    "content": "Uncertain hypothesis",
+                    "confidence": confidence_threshold - 0.2,  # Below threshold
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "BRANCH_REQUIRED"
+
+            # Create branch to resolve
+            result = await client.call_tool(
+                "create_branch",
+                {
+                    "session_id": session_id,
+                    "alternatives": ["Alternative A", "Alternative B"],
+                },
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "branch_ids" in response
+            assert len(response["branch_ids"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_router_status_returns_session_state(self) -> None:
+        """Test router_status returns session state when session_id provided."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Get session state via router_status
+            result = await client.call_tool(
+                "router_status",
+                {"session_id": session_id},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            # Session state includes these fields
+            assert "complexity" in response
+            assert "step_count" in response
+            assert "can_synthesize" in response
+            assert "valid_next_steps" in response
+
+    @pytest.mark.asyncio
+    async def test_router_status_global_stats(self) -> None:
+        """Test router_status returns global stats without session_id."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.call_tool("router_status", {})
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert "router" in response
+            assert "sessions" in response
+            assert "tools" in response["router"]
+            assert "rules" in response["router"]
+
+
+class TestParadigmHint:
+    """Test paradigm_hint tool for recommending guidance vs enforcement."""
+
+    @pytest.mark.asyncio
+    async def test_paradigm_hint_recommends_enforcement_for_proofs(self) -> None:
+        """Test paradigm_hint recommends enforcement for mathematical proofs."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": "Prove that the Monty Hall solution is correct mathematically"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["recommendation"] == "enforcement"
+            assert response["confidence"] >= 0.6
+            assert "enforcement_signals" in response
+            assert "suggested_tools" in response
+            assert "initialize_reasoning" in response["suggested_tools"]
+
+    @pytest.mark.asyncio
+    async def test_paradigm_hint_recommends_guidance_for_creative(self) -> None:
+        """Test paradigm_hint recommends guidance for creative/exploratory tasks."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": "Brainstorm ideas for improving user engagement"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            assert response["recommendation"] == "guidance"
+            assert response["confidence"] >= 0.6
+            assert "guidance_signals" in response
+            assert "suggested_tools" in response
+            assert "think" in response["suggested_tools"]
+
+    @pytest.mark.asyncio
+    async def test_paradigm_hint_includes_workflow_hint(self) -> None:
+        """Test paradigm_hint includes workflow_hint for both paradigms."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Test enforcement workflow hint
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": "Verify that the theorem is valid"},
+            )
+            response = json.loads(result.data)
+            assert "workflow_hint" in response
+            if response["recommendation"] == "enforcement":
+                assert "initialize_reasoning" in response["workflow_hint"]
+                assert "submit_step" in response["workflow_hint"]
+
+            # Test guidance workflow hint
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": "Help me debug this code issue"},
+            )
+            response = json.loads(result.data)
+            assert "workflow_hint" in response
+            if response["recommendation"] == "guidance":
+                assert "think" in response["workflow_hint"]
+
+    @pytest.mark.asyncio
+    async def test_paradigm_hint_handles_empty_problem(self) -> None:
+        """Test paradigm_hint handles empty problem gracefully."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": ""},
+            )
+            response = json.loads(result.data)
+            assert "error" in response
+
+    @pytest.mark.asyncio
+    async def test_paradigm_hint_neutral_problem(self) -> None:
+        """Test paradigm_hint handles neutral problems with default guidance."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # A neutral problem with no strong signals
+            result = await client.call_tool(
+                "paradigm_hint",
+                {"problem": "Tell me about elephants"},
+            )
+            assert not result.is_error
+            response = json.loads(result.data)
+            # Should default to guidance for flexibility
+            assert "recommendation" in response
+            assert "confidence" in response
+            assert "suggested_tools" in response
+
+
 class TestMCPServerInitialization:
     """Test server initialization and configuration."""
 
@@ -334,7 +681,7 @@ class TestMCPServerInitialization:
         """Test that server name is properly configured."""
         from src.server import mcp
 
-        assert mcp.name == "MatrixMind-MCP"
+        assert mcp.name == "Reason-Guard-MCP"
 
     @pytest.mark.asyncio
     async def test_client_can_ping_server(self) -> None:
@@ -346,3 +693,78 @@ class TestMCPServerInitialization:
         async with Client(mcp) as client:
             # If we get here without exception, connection works
             assert client.is_connected()
+
+
+class TestTrustedProxiesValidation:
+    """Test TRUSTED_PROXIES parsing and validation."""
+
+    def test_parse_trusted_proxies_valid_entries(self) -> None:
+        """Test that valid IPs and CIDRs are accepted."""
+        from src.server import _parse_trusted_proxies
+
+        result = _parse_trusted_proxies("10.0.0.1,192.168.1.0/24,::1")
+        assert "10.0.0.1" in result
+        assert "192.168.1.0/24" in result
+        assert "::1" in result
+        assert len(result) == 3
+
+    def test_parse_trusted_proxies_empty_string(self) -> None:
+        """Test that empty string returns empty frozenset."""
+        from src.server import _parse_trusted_proxies
+
+        result = _parse_trusted_proxies("")
+        assert result == frozenset()
+
+    def test_parse_trusted_proxies_whitespace_handling(self) -> None:
+        """Test that whitespace is properly stripped."""
+        from src.server import _parse_trusted_proxies
+
+        result = _parse_trusted_proxies("  10.0.0.1 , 192.168.1.1  ")
+        assert "10.0.0.1" in result
+        assert "192.168.1.1" in result
+
+    def test_parse_trusted_proxies_invalid_entries_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Test that invalid entries emit warning and are excluded."""
+        import logging
+
+        from src.server import _parse_trusted_proxies
+
+        with caplog.at_level(logging.WARNING):
+            result = _parse_trusted_proxies("10.0.0.1,invalid-ip,256.1.1.1,192.168.1.0/24")
+
+        # Valid entries should be included
+        assert "10.0.0.1" in result
+        assert "192.168.1.0/24" in result
+
+        # Invalid entries should be excluded
+        assert "invalid-ip" not in result
+        assert "256.1.1.1" not in result
+        assert len(result) == 2
+
+        # Warnings should be logged for invalid entries
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("invalid-ip" in msg for msg in warning_messages)
+        assert any("256.1.1.1" in msg for msg in warning_messages)
+
+    def test_parse_trusted_proxies_invalid_cidr_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Test that invalid CIDR notation emits warning."""
+        import logging
+
+        from src.server import _parse_trusted_proxies
+
+        with caplog.at_level(logging.WARNING):
+            result = _parse_trusted_proxies("10.0.0.0/33,172.16.0.0/12")
+
+        # Valid CIDR should be included
+        assert "172.16.0.0/12" in result
+
+        # Invalid CIDR should be excluded
+        assert "10.0.0.0/33" not in result
+
+        # Warning should be logged
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("10.0.0.0/33" in msg for msg in warning_messages)

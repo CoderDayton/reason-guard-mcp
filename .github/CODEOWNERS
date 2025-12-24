@@ -1,0 +1,18 @@
+# CODEOWNERS - Require review for sensitive areas
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything
+* @matrixmind/maintainers
+
+# Security-sensitive: CI/CD workflows, security config, dependencies
+.github/** @matrixmind/security @matrixmind/platform
+pyproject.toml @matrixmind/security @matrixmind/maintainers
+uv.lock @matrixmind/security @matrixmind/maintainers
+
+# Core server and authentication
+src/server.py @matrixmind/security @matrixmind/maintainers
+src/utils/session_signing.py @matrixmind/security
+
+# Docker and deployment
+Dockerfile @matrixmind/platform @matrixmind/security
+docker-compose.yml @matrixmind/platform @matrixmind/security

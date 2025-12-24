@@ -1,24 +1,39 @@
-# Docker Compose for MatrixMind MCP Server
+# Docker Compose for Reason Guard MCP Server
 # Usage: docker compose up -d
+#
+# Security Notes (V-002):
+# - API keys are loaded from Docker secrets (not environment variables)
+# - Create secrets before running: echo "your-key" | docker secret create reasonguard_api_keys -
+# - For local dev without Swarm, use secrets file: ./secrets/reasonguard_api_keys
 
 services:
-  matrixmind-mcp:
+  reason-guard-mcp:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: matrixmind-mcp
+    container_name: reason-guard-mcp
     ports:
       - "8000:8000"
     environment:
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
-      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4-turbo}
+      # Non-sensitive configuration only
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - SERVER_TRANSPORT=http
-      - SERVER_HOST=0.0.0.0
+      # V-004: Bind to localhost in production; use 0.0.0.0 only with proper auth/firewall
+      - SERVER_HOST=${SERVER_HOST:-127.0.0.1}
       - SERVER_PORT=8000
+      # V-001: Enable authentication in production
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - AUTH_BYPASS_LOCALHOST=${AUTH_BYPASS_LOCALHOST:-true}
+      # Model configuration (not sensitive)
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-Snowflake/snowflake-arctic-embed-xs}
+      - ENABLE_RAG=${ENABLE_RAG:-true}
+    # V-002: Use Docker secrets for sensitive data (not env vars)
+    secrets:
+      - reasonguard_api_keys
+      - openai_api_key
     volumes:
       - ./logs:/app/logs
+      - reasonguard-data:/app/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -26,6 +41,9 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    # Security: Run as non-root user (already configured in Dockerfile)
+    # security_opt:
+    #   - no-new-privileges:true
     # Uncomment for GPU support (requires nvidia-docker)
     # deploy:
     #   resources:
@@ -38,13 +56,29 @@ services:
   # Optional: Redis for caching (future enhancement)
   # redis:
   #   image: redis:7-alpine
-  #   container_name: matrixmind-redis
+  #   container_name: reasonguard-redis
   #   ports:
   #     - "6379:6379"
   #   volumes:
   #     - redis-data:/data
   #   restart: unless-stopped
 
+# Docker secrets configuration
+# For Docker Swarm: docker secret create reasonguard_api_keys ./secrets/api_keys.txt
+# For local development: Use file-based secrets (less secure but works without Swarm)
+secrets:
+  reasonguard_api_keys:
+    # Option 1: Docker Swarm secret (production)
+    # external: true
+    # Option 2: File-based secret (development)
+    file: ./secrets/reasonguard_api_keys
+  openai_api_key:
+    # Option 1: Docker Swarm secret (production)
+    # external: true
+    # Option 2: File-based secret (development)
+    file: ./secrets/openai_api_key
+
 volumes:
   logs:
+  reasonguard-data:
   # redis-data:

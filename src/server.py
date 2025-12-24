@@ -1,4 +1,4 @@
-"""MatrixMind MCP Server.
+"""Reason Guard MCP Server.
 
 FastMCP 2.0 implementation providing reasoning state management tools.
 The calling LLM does all reasoning; these tools track and organize the process.
@@ -8,44 +8,69 @@ Tools:
 2. compress - Semantic context compression
 3. status - Server/session status
 
-Run with: uvx matrixmind-mcp
+Run with: uvx reason-guard
 Or: python -m src.server
 """
 
-from __future__ import annotations
+# Note: We intentionally do NOT use `from __future__ import annotations` here
+# because it causes issues with Pydantic/FastMCP type resolution at decorator time.
+# Python 3.11+ supports PEP 604 union syntax (X | Y) natively.
 
 import asyncio
+import hashlib
 import json
 import os
+import secrets
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
-from functools import partial
-from typing import Any, Literal
+from functools import partial, wraps
+from typing import Any, Literal, TypeVar
 
+# Note: uvloop is installed automatically when importing src.utils.session
+# (via AsyncSessionManager -> unified_reasoner imports)
 from dotenv import load_dotenv
 from fastmcp import Context, FastMCP
+from fastmcp.server.dependencies import get_http_request
 from loguru import logger
 
 from src.models.model_manager import ModelManager
 from src.tools.compress import ContextAwareCompressionTool
 from src.tools.unified_reasoner import (
     ReasoningMode,
+    ResponseVerbosity,
     SessionStatus,
     ThoughtType,
     UnifiedReasonerManager,
     get_unified_manager,
     init_unified_manager,
 )
-from src.utils.errors import MatrixMindException, ModelNotReadyException, ToolExecutionError
+from src.utils.errors import ModelNotReadyException, ReasonGuardException, ToolExecutionError
+from src.utils.observability import get_metrics_store
+from src.utils.session import SessionNotFoundError
 
 # Load environment variables from .env file (for local development)
 load_dotenv()
 
 
 def _get_env(key: str, default: str = "") -> str:
-    """Get environment variable, treating empty string as unset."""
+    """Get environment variable, treating empty string as unset.
+
+    Also checks Docker secrets path for sensitive values.
+    """
+    # Check Docker secrets first for sensitive keys
+    secrets_path = f"/run/secrets/{key.lower()}"
+    if os.path.isfile(secrets_path):
+        try:
+            with open(secrets_path) as f:
+                value = f.read().strip()
+                if value:
+                    return value
+        except Exception:  # nosec B110
+            pass  # Fall through to env var
+
     value = os.getenv(key, default)
     return value if value else default
 
@@ -65,11 +90,222 @@ def _get_env_int(key: str, default: int) -> int:
 # Configuration from Environment Variables
 # =============================================================================
 
+# =============================================================================
+# Authentication Configuration (V-001: CWE-306 Mitigation)
+# =============================================================================
+
+# API Key Authentication
+# Keys can be provided via:
+#   1. REASONGUARD_API_KEYS env var (comma-separated list of keys)
+#   2. REASONGUARD_API_KEYS_FILE env var (path to file with one key per line)
+#   3. Docker secrets at /run/secrets/reasonguard_api_keys
+# SECURITY: Default to true for network transports, false only for stdio (local dev)
+# This prevents unauthenticated access when server is exposed to network (CWE-306)
+_auth_default = "false" if _get_env("SERVER_TRANSPORT", "stdio") == "stdio" else "true"
+AUTH_ENABLED = _get_env("AUTH_ENABLED", _auth_default).lower() == "true"
+AUTH_BYPASS_LOCALHOST = _get_env("AUTH_BYPASS_LOCALHOST", "true").lower() == "true"
+
+# Trusted proxies for X-Forwarded-For header validation (V-002: CWE-348 Mitigation)
+# Only trust X-Forwarded-For when the direct client is in this list
+# Comma-separated list of IP addresses or CIDR ranges (e.g., "10.0.0.0/8,172.16.0.0/12")
+_TRUSTED_PROXIES_RAW = _get_env("TRUSTED_PROXIES", "")
+
+
+def _parse_trusted_proxies(raw: str) -> frozenset[str]:
+    """Parse and validate TRUSTED_PROXIES, warning on invalid entries."""
+    import ipaddress
+
+    valid_proxies: list[str] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            if "/" in entry:
+                # Validate CIDR notation
+                ipaddress.ip_network(entry, strict=False)
+            else:
+                # Validate IP address
+                ipaddress.ip_address(entry)
+            valid_proxies.append(entry)
+        except ValueError as e:
+            # Log at module load time - admin needs to know config is broken
+            import logging
+
+            logging.getLogger(__name__).warning(
+                f"Invalid TRUSTED_PROXIES entry '{entry}': {e}. Entry will be ignored."
+            )
+    return frozenset(valid_proxies)
+
+
+TRUSTED_PROXIES: frozenset[str] = _parse_trusted_proxies(_TRUSTED_PROXIES_RAW)
+
+
+def _load_api_keys() -> set[str]:
+    """Load API keys from environment or secrets file.
+
+    Priority order:
+    1. Docker secrets file (/run/secrets/reasonguard_api_keys)
+    2. REASONGUARD_API_KEYS_FILE environment variable
+    3. REASONGUARD_API_KEYS environment variable (comma-separated)
+
+    Returns:
+        Set of valid API key hashes (SHA-256).
+
+    """
+    keys: set[str] = set()
+
+    # Try Docker secrets first (most secure in containerized environments)
+    secrets_path = "/run/secrets/reasonguard_api_keys"
+    if os.path.isfile(secrets_path):
+        try:
+            with open(secrets_path) as f:
+                for line in f:
+                    key = line.strip()
+                    if key and not key.startswith("#"):
+                        # Store hash of key, not the key itself
+                        keys.add(hashlib.sha256(key.encode()).hexdigest())
+            logger.info(f"Loaded {len(keys)} API key(s) from Docker secrets")
+            return keys
+        except Exception as e:
+            logger.warning(f"Failed to load Docker secrets: {e}")
+
+    # Try file path from environment
+    keys_file = _get_env("REASONGUARD_API_KEYS_FILE")
+    if keys_file and os.path.isfile(keys_file):
+        try:
+            with open(keys_file) as f:
+                for line in f:
+                    key = line.strip()
+                    if key and not key.startswith("#"):
+                        keys.add(hashlib.sha256(key.encode()).hexdigest())
+            logger.info(f"Loaded {len(keys)} API key(s) from {keys_file}")
+            return keys
+        except Exception as e:
+            logger.warning(f"Failed to load keys from {keys_file}: {e}")
+
+    # Fall back to environment variable (least secure, for development)
+    keys_env = _get_env("REASONGUARD_API_KEYS")
+    if keys_env:
+        for key in keys_env.split(","):
+            key = key.strip()
+            if key:
+                keys.add(hashlib.sha256(key.encode()).hexdigest())
+        logger.info(f"Loaded {len(keys)} API key(s) from environment variable")
+        return keys
+
+    if AUTH_ENABLED:
+        logger.warning(
+            "AUTH_ENABLED=true but no API keys configured. "
+            "Set REASONGUARD_API_KEYS, REASONGUARD_API_KEYS_FILE, or use Docker secrets."
+        )
+
+    return keys
+
+
+# Load API keys at startup
+_API_KEY_HASHES: set[str] = set()
+
+
+def _init_api_keys() -> None:
+    """Initialize API keys (called at server startup)."""
+    global _API_KEY_HASHES
+    _API_KEY_HASHES = _load_api_keys()
+
+
+def validate_api_key(api_key: str | None) -> tuple[bool, str]:
+    """Validate an API key.
+
+    Uses constant-time comparison to prevent timing attacks.
+
+    Args:
+        api_key: The API key to validate.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+
+    """
+    if not AUTH_ENABLED:
+        return True, ""
+
+    if not api_key:
+        return False, "API key required. Set Authorization header with Bearer token."
+
+    # Strip "Bearer " prefix if present
+    if api_key.startswith("Bearer "):
+        api_key = api_key[7:]
+
+    # Hash the provided key
+    key_hash = hashlib.sha256(api_key.encode()).hexdigest()
+
+    # Constant-time comparison against all valid key hashes
+    # We iterate all hashes to prevent timing attacks from revealing key count
+    is_valid = False
+    for valid_hash in _API_KEY_HASHES:
+        if secrets.compare_digest(key_hash, valid_hash):
+            is_valid = True
+            # Don't break - continue checking all hashes for constant time
+
+    if not is_valid:
+        return False, "Invalid API key"
+
+    return True, ""
+
+
+def generate_api_key() -> str:
+    """Generate a new secure API key.
+
+    Returns:
+        A URL-safe 32-byte random key.
+
+    """
+    return secrets.token_urlsafe(32)
+
+
+# Type variable for decorator
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def require_auth(func: F) -> F:
+    """Decorator to require API key authentication for a tool.
+
+    Note: In FastMCP 2.0, Context provides limited access to request headers.
+    This decorator checks if auth is enabled and validates when possible.
+    For HTTP transport, clients should pass api_key in tool arguments or
+    configure auth at the transport level.
+
+    """
+
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if not AUTH_ENABLED:
+            return await func(*args, **kwargs)
+
+        # Check for api_key in kwargs (passed by client)
+        api_key = kwargs.pop("api_key", None)
+
+        # Also check ctx for any auth info (transport-dependent)
+        ctx = kwargs.get("ctx")
+        if ctx is not None and hasattr(ctx, "request_context"):
+            # Some transports may provide request context
+            req_ctx = getattr(ctx, "request_context", {})
+            if isinstance(req_ctx, dict):
+                api_key = api_key or req_ctx.get("authorization")
+
+        is_valid, error = validate_api_key(api_key)
+        if not is_valid:
+            return json.dumps({"error": "authentication_required", "message": error})
+
+        return await func(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
+
+
 # Model Configuration
 EMBEDDING_MODEL = _get_env("EMBEDDING_MODEL", "Snowflake/snowflake-arctic-embed-xs")
 
 # Server Configuration
-SERVER_NAME = _get_env("SERVER_NAME", "MatrixMind-MCP")
+SERVER_NAME = _get_env("SERVER_NAME", "Reason-Guard-MCP")
 SERVER_TRANSPORT = _get_env("SERVER_TRANSPORT", "stdio")
 # Bind to localhost by default for security (CWE-306: Missing Authentication)
 # Use 0.0.0.0 only in production with proper authentication/firewall
@@ -94,9 +330,9 @@ MAX_CONTEXT_SIZE = _get_env_int("MAX_CONTEXT_SIZE", 100000)  # 100KB
 MAX_ALTERNATIVES = _get_env_int("MAX_ALTERNATIVES", 10)  # Max alternatives for MPPA
 MAX_THOUGHTS_PER_SESSION = _get_env_int("MAX_THOUGHTS_PER_SESSION", 1000)  # Memory exhaustion guard
 
-# RAG Configuration
-ENABLE_RAG = _get_env("ENABLE_RAG", "false").lower() == "true"
-VECTOR_DB_PATH = _get_env("VECTOR_DB_PATH", ":memory:")
+# RAG Configuration - Enabled by default for semantic scoring and thought retrieval
+ENABLE_RAG = _get_env("ENABLE_RAG", "true").lower() == "true"
+VECTOR_DB_PATH = _get_env("VECTOR_DB_PATH", "reasonguard_thoughts.db")
 
 
 def _validate_vector_db_path() -> str:
@@ -140,7 +376,7 @@ def _init_model_manager() -> None:
 # =============================================================================
 # Thread Pool for CPU-bound Operations
 # =============================================================================
-_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="matrixmind-worker")
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="reasonguard-worker")
 
 
 # =============================================================================
@@ -234,6 +470,221 @@ def get_rate_limiter() -> SessionRateLimiter:
 
 
 # =============================================================================
+# IP-Based Rate Limiting (V-003)
+# =============================================================================
+
+# Configuration for IP-based rate limiting
+IP_RATE_LIMIT_MAX_REQUESTS = int(_get_env("IP_RATE_LIMIT_MAX_REQUESTS", "100"))
+IP_RATE_LIMIT_WINDOW_SECONDS = int(_get_env("IP_RATE_LIMIT_WINDOW_SECONDS", "60"))
+IP_RATE_LIMIT_ENABLED = _get_env("IP_RATE_LIMIT_ENABLED", "true").lower() in ("true", "1", "yes")
+
+
+class IPRateLimiter:
+    """Per-IP sliding window rate limiter.
+
+    V-003: Prevents abuse by limiting requests per client IP address.
+    Uses asyncio.Lock for non-blocking concurrent access.
+    """
+
+    def __init__(self, max_requests: int, window_seconds: int) -> None:
+        """Initialize IP rate limiter.
+
+        Args:
+            max_requests: Maximum requests per IP in the time window
+            window_seconds: Time window in seconds
+
+        """
+        self._max_requests = max_requests
+        self._window_seconds = window_seconds
+        self._ip_timestamps: dict[str, deque[float]] = {}
+        self._lock = asyncio.Lock()
+
+    def _cleanup_old_timestamps(self, ip: str) -> None:
+        """Remove timestamps outside the current window for an IP."""
+        if ip not in self._ip_timestamps:
+            return
+        cutoff = time.monotonic() - self._window_seconds
+        timestamps = self._ip_timestamps[ip]
+        while timestamps and timestamps[0] < cutoff:
+            timestamps.popleft()
+        # Remove empty deques to prevent memory leak
+        if not timestamps:
+            del self._ip_timestamps[ip]
+
+    async def check_rate_limit(self, ip: str) -> tuple[bool, dict[str, Any]]:
+        """Check if a request from this IP is allowed.
+
+        Args:
+            ip: Client IP address
+
+        Returns:
+            Tuple of (allowed, info_dict).
+            If allowed is False, info_dict contains error details.
+
+        """
+        async with self._lock:
+            self._cleanup_old_timestamps(ip)
+
+            timestamps = self._ip_timestamps.get(ip, deque())
+
+            if len(timestamps) >= self._max_requests:
+                # Calculate when the oldest request will expire
+                oldest = timestamps[0]
+                retry_after = self._window_seconds - (time.monotonic() - oldest)
+                return False, {
+                    "error": "ip_rate_limit_exceeded",
+                    "message": (
+                        f"Too many requests from this IP. "
+                        f"Max {self._max_requests} per {self._window_seconds}s."
+                    ),
+                    "retry_after_seconds": max(1, int(retry_after)),
+                    "current_count": len(timestamps),
+                    "max_allowed": self._max_requests,
+                }
+
+            return True, {"remaining": self._max_requests - len(timestamps)}
+
+    async def record_request(self, ip: str) -> None:
+        """Record a request from an IP."""
+        async with self._lock:
+            if ip not in self._ip_timestamps:
+                self._ip_timestamps[ip] = deque()
+            self._ip_timestamps[ip].append(time.monotonic())
+
+    def get_stats(self) -> dict[str, Any]:
+        """Get current rate limiter statistics."""
+        # Cleanup all IPs first
+        for ip in list(self._ip_timestamps.keys()):
+            self._cleanup_old_timestamps(ip)
+        return {
+            "active_ips": len(self._ip_timestamps),
+            "max_requests_per_ip": self._max_requests,
+            "window_seconds": self._window_seconds,
+        }
+
+
+# Global IP rate limiter instance
+_ip_rate_limiter: IPRateLimiter | None = None
+
+
+def get_ip_rate_limiter() -> IPRateLimiter:
+    """Get or create IP rate limiter instance."""
+    global _ip_rate_limiter
+    if _ip_rate_limiter is None:
+        _ip_rate_limiter = IPRateLimiter(
+            max_requests=IP_RATE_LIMIT_MAX_REQUESTS,
+            window_seconds=IP_RATE_LIMIT_WINDOW_SECONDS,
+        )
+    return _ip_rate_limiter
+
+
+def _is_trusted_proxy(ip: str) -> bool:
+    """Check if an IP is in the trusted proxies list.
+
+    Supports exact IP matching and basic CIDR notation.
+    """
+    if not TRUSTED_PROXIES:
+        return False
+
+    import ipaddress
+
+    try:
+        client_addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+
+    for proxy in TRUSTED_PROXIES:
+        try:
+            if "/" in proxy:
+                # CIDR notation
+                if client_addr in ipaddress.ip_network(proxy, strict=False):
+                    return True
+            else:
+                # Exact IP match
+                if client_addr == ipaddress.ip_address(proxy):
+                    return True
+        except ValueError:
+            continue  # Skip invalid entries
+
+    return False
+
+
+def get_client_ip() -> str:
+    """Get client IP from HTTP request, with proxy header support.
+
+    Only trusts X-Forwarded-For when the direct client is in TRUSTED_PROXIES.
+    This prevents IP spoofing attacks via header injection.
+
+    Returns:
+        Client IP address, or "unknown" if not available.
+
+    """
+    try:
+        request = get_http_request()
+        direct_ip = request.client.host if request.client else None
+
+        # Only trust forwarded headers if direct client is a trusted proxy
+        if direct_ip and _is_trusted_proxy(direct_ip):
+            # Check X-Forwarded-For header (for reverse proxies)
+            forwarded_for = request.headers.get("x-forwarded-for")
+            if forwarded_for:
+                # Take the first IP in the chain (original client)
+                client_ip = forwarded_for.split(",")[0].strip()
+                # Reject localhost values in forwarded headers (spoofing attempt)
+                if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                    return str(client_ip)
+                else:
+                    logger.warning(
+                        f"Rejected spoofed localhost in X-Forwarded-For from {direct_ip}"
+                    )
+            # Check X-Real-IP header (nginx)
+            real_ip = request.headers.get("x-real-ip")
+            if real_ip:
+                ip = real_ip.strip()
+                if ip not in ("127.0.0.1", "::1", "localhost"):
+                    return str(ip)
+                else:
+                    logger.warning(f"Rejected spoofed localhost in X-Real-IP from {direct_ip}")
+
+        # Fall back to direct client IP
+        if direct_ip:
+            return str(direct_ip)
+        return "unknown"
+    except Exception:
+        # Not in HTTP context (e.g., stdio transport)
+        return "unknown"
+
+
+async def check_ip_rate_limit() -> tuple[bool, dict[str, Any] | None]:
+    """Check IP-based rate limit for current request.
+
+    Returns:
+        Tuple of (allowed, error_info or None)
+
+    """
+    if not IP_RATE_LIMIT_ENABLED:
+        return True, None
+
+    client_ip = get_client_ip()
+    if client_ip == "unknown":
+        # Can't rate limit without IP, allow through
+        return True, None
+
+    # Skip localhost if AUTH_BYPASS_LOCALHOST is enabled
+    if AUTH_BYPASS_LOCALHOST and client_ip in ("127.0.0.1", "::1", "localhost"):
+        return True, None
+
+    limiter = get_ip_rate_limiter()
+    allowed, info = await limiter.check_rate_limit(client_ip)
+    if not allowed:
+        logger.warning(f"IP rate limit exceeded for {client_ip}")
+        return False, info
+
+    await limiter.record_request(client_ip)
+    return True, None
+
+
+# =============================================================================
 # Automatic Session Cleanup
 # =============================================================================
 
@@ -253,7 +704,7 @@ async def _cleanup_stale_sessions() -> None:
             await asyncio.sleep(CLEANUP_INTERVAL_SECONDS)
 
             manager = get_unified_manager()
-            removed = manager.cleanup_stale(max_age)
+            removed = await manager.cleanup_stale(max_age)
 
             if removed:
                 logger.info(f"Cleaned up {len(removed)} stale sessions: {removed}")
@@ -294,53 +745,89 @@ def _stop_cleanup_task() -> None:
 
 mcp = FastMCP(
     name=SERVER_NAME,
-    instructions="""MatrixMind reasoning state manager with unified reasoning tool.
+    instructions="""Reason Guard MCP Server - Dual-paradigm reasoning state manager.
 
-ARCHITECTURE: You (the calling LLM) do ALL reasoning. These tools TRACK and ORGANIZE your thoughts.
+ARCHITECTURE: You (the LLM) do ALL reasoning. These tools TRACK, ORGANIZE, and optionally ENFORCE.
 
-TOOLS:
+=== CHOOSE YOUR PARADIGM ===
+
+Use paradigm_hint(problem) first! It analyzes your problem and recommends which paradigm to use.
+
+GUIDANCE MODE (think tool): Server provides suggestions, warnings, rewards.
+  - Use when: You want flexibility with helpful feedback
+  - Bad steps get warnings but are still recorded
+
+ENFORCEMENT MODE (atomic router): Server REJECTS invalid steps.
+  - Use when: Problem requires disciplined reasoning (proofs, traps, paradoxes)
+  - Bad steps are REJECTED - you must fix and retry
+
+=== PARADIGM SELECTION TOOL ===
+
+0. paradigm_hint(problem) - Analyze problem, get recommendation
+   Returns: recommendation (guidance/enforcement), confidence, suggested_tools
+
+=== GUIDANCE MODE TOOLS ===
 
 1. think(action, ...) - Unified reasoning with auto-mode selection
-   Actions:
-   - "start": Begin reasoning (mode: auto/chain/matrix/hybrid)
-   - "continue": Add reasoning step
-   - "branch": Branch from a step (chain/hybrid only)
-   - "revise": Revise a step (chain/hybrid only)
-   - "synthesize": Synthesize column (matrix/hybrid only)
-   - "finish": Complete reasoning
+   Actions: start, continue, branch, revise, synthesize, verify, finish
+   Modes: auto (default), chain, matrix, hybrid
 
-2. compress(context, query, ratio) - Reduce context size semantically
+2. compress(context, query, ratio) - Semantic context compression
 
-3. status(session_id?) - Get server or session status
+3. status(session_id?) - Server/session status
 
-AUTO-MODE SELECTION:
-By default, mode="auto" analyzes your problem and selects:
-- CHAIN: Simple, sequential problems (low complexity)
-- MATRIX: Complex, multi-perspective problems (high complexity)
-- HYBRID: Long context that may need escalation
-
-FEATURES:
-- Blind spot detection: Catches unstated assumptions, uncertain claims
-- RLVR rewards: Tracks reasoning quality (consistency, coherence, efficiency)
-- MPPA integration: Pass alternatives to explore multiple paths
-- CISC integration: Weighted candidate selection with confidences
-- Domain detection: Math, code, logic, factual handlers
-
-WORKFLOW EXAMPLE (Auto mode):
+GUIDANCE WORKFLOW:
 1. think(action="start", problem="Solve X")
-   -> Server analyzes complexity, selects optimal mode
-2. think(action="continue", session_id=ID, thought="Step 1: ...")
+2. think(action="continue", session_id=ID, thought="Step 1...")
    -> Receives guidance, blind spot warnings, reward signals
-3. think(action="continue", session_id=ID, thought="Step 2: ...", alternatives=["alt1", "alt2"])
-   -> MPPA: Server evaluates alternatives via CISC
-4. think(action="finish", session_id=ID, thought="The answer is...")
-   -> Final summary with total rewards, unaddressed blind spots
+3. think(action="finish", session_id=ID, thought="Answer...")
 
-WORKFLOW EXAMPLE (Matrix mode):
-1. think(action="start", mode="matrix", problem="Analyze Y", rows=3, cols=2)
-2. think(action="continue", session_id=ID, row=0, col=0, thought="...")
-3. think(action="synthesize", session_id=ID, col=0, thought="Column synthesis")
-4. think(action="finish", session_id=ID, thought="Final analysis...")
+=== ENFORCEMENT MODE TOOLS (Atomic Router) ===
+
+4. initialize_reasoning(problem, complexity) - Start enforced session
+   Complexity: low (2-5 steps), medium (4-8), high (6-12), auto
+
+5. submit_step(session_id, step_type, content, confidence) - Submit step
+   Step types: premise -> hypothesis -> verification -> synthesis
+   Returns: ACCEPTED, REJECTED, BRANCH_REQUIRED, or VERIFICATION_REQUIRED
+
+6. create_branch(session_id, alternatives) - Required when confidence too low
+
+7. verify_claims(session_id, claims, evidence) - Verify before synthesis
+
+8. router_status(session_id?) - Router/session state
+
+ENFORCEMENT RULES:
+- Rule A: Cannot synthesize until min_steps reached
+- Rule B: Low confidence requires branching (create_branch)
+- Rule C: Must verify before synthesis
+- Rule D: Must follow state machine (premise->hypothesis->verification->synthesis)
+- Rule E: Must synthesize at max_steps
+
+ENFORCEMENT WORKFLOW:
+1. initialize_reasoning("Prove the Monty Hall solution", "high")
+   -> Gets trap warning, min=6, max=12 steps
+2. submit_step(id, "premise", "There are 3 doors...", 0.95)
+   -> ACCEPTED
+3. submit_step(id, "hypothesis", "Switching wins 2/3...", 0.5)
+   -> BRANCH_REQUIRED (confidence < 0.75)
+4. create_branch(id, ["Switching wins 2/3", "Staying wins 1/2", "Equal odds"])
+   -> ACCEPTED, now explore alternatives
+5. submit_step(id, "verification", "Enumerating cases...", 0.9)
+   -> ACCEPTED
+6. submit_step(id, "synthesis", "Switching wins 2/3 proven", 0.95)
+   -> ACCEPTED (session complete)
+
+=== WHEN TO USE WHICH ===
+
+| Problem Type              | Paradigm    | Why                           |
+|---------------------------|-------------|-------------------------------|
+| Open-ended analysis       | Guidance    | Flexibility, exploration      |
+| Math proofs               | Enforcement | Prevents jumping to conclusion|
+| Paradoxes (Monty Hall)    | Enforcement | Traps require discipline      |
+| Code debugging            | Guidance    | Iterative, exploratory        |
+| Logical arguments         | Enforcement | Forces verification           |
+| Creative brainstorming    | Guidance    | No strict structure needed    |
 """,
 )
 
@@ -486,6 +973,8 @@ async def think(
     # S3: Auto-execute parameters
     max_auto_steps: int = 5,
     stop_on_high_risk: bool = True,
+    # OPT4: Response verbosity (minimal by default for ~50% token reduction)
+    verbosity: Literal["minimal", "normal", "full"] = "minimal",
     ctx: Context | None = None,
 ) -> str:
     """Unified reasoning tool with auto-mode selection.
@@ -533,12 +1022,18 @@ async def think(
         actual_action: What action was actually taken, if different from suggestion (feedback action)
         max_auto_steps: Maximum steps for auto-execute (default 5, auto action)
         stop_on_high_risk: Stop auto-execution at high-risk checkpoints (default True, auto action)
+        verbosity: Response detail level - minimal (default, ~50% fewer tokens), normal, or full
 
     Returns:
         JSON with action result, session state, guidance, and any warnings
 
     """
     try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
         # Validate input sizes (CWE-400 prevention)
         validation_error = _validate_input_sizes(
             problem=problem,
@@ -572,6 +1067,7 @@ async def think(
                 confidence=confidence,
                 alternatives=alternatives,
                 alternative_confidences=alternative_confidences,
+                verbosity=ResponseVerbosity(verbosity),
                 ctx=ctx,
             )
         elif action == "branch":
@@ -688,8 +1184,8 @@ async def _think_start(
             await ctx.warning(f"Rate limit exceeded: {info['message']}")
         return json.dumps(info)
 
-    # Check total session count
-    total_sessions = len(manager._sessions)
+    # Check total session count (eventual consistency is fine for this check)
+    total_sessions = len(manager.get_all_sessions_snapshot())
     if total_sessions >= MAX_TOTAL_SESSIONS:
         error_info = {
             "error": "max_sessions_exceeded",
@@ -720,15 +1216,32 @@ async def _think_start(
             except ValueError:
                 return json.dumps({"error": f"Unknown mode: {mode}"})
 
-    # Start session
-    result = await manager.start_session(
-        problem=problem,
-        context=context or "",
-        mode=reasoning_mode,
-        expected_steps=expected_steps,
-        rows=rows,
-        cols=cols,
-    )
+    # Start session with observability
+    store = get_metrics_store()
+    with store.trace("think_start") as span:
+        span.set_attribute("mode", mode or "auto")
+        span.set_attribute("problem_length", len(problem))
+
+        result = await manager.start_session(
+            problem=problem,
+            context=context or "",
+            mode=reasoning_mode,
+            expected_steps=expected_steps,
+            rows=rows,
+            cols=cols,
+        )
+
+        # Record session in metrics
+        session_id = result.get("session_id", "")
+        actual_mode = result.get("actual_mode", "unknown")
+        span.set_attribute("session_id", session_id)
+        span.set_attribute("actual_mode", actual_mode)
+        store.record_session_start(
+            session_id=session_id,
+            problem=problem[:500],
+            mode=actual_mode,
+            complexity=result.get("domain", "unknown"),
+        )
 
     # Backwards compatibility: if user requested "verify", show that in response
     if mode == "verify":
@@ -753,6 +1266,7 @@ async def _think_continue(
     confidence: float | None,
     alternatives: list[str] | None,
     alternative_confidences: list[float] | None,
+    verbosity: ResponseVerbosity,
     ctx: Context | None,
 ) -> str:
     """Handle think continue action."""
@@ -761,28 +1275,29 @@ async def _think_continue(
     if not thought:
         return json.dumps({"error": "thought is required for continue action"})
 
-    if session_id not in manager._sessions:
+    try:
+        result = await manager.add_thought(
+            session_id=session_id,
+            content=thought,
+            thought_type=ThoughtType.CONTINUATION,
+            row=row,
+            col=col,
+            confidence=confidence,
+            alternatives=alternatives,
+            alternative_confidences=alternative_confidences,
+            verbosity=verbosity,
+        )
+    except SessionNotFoundError:
         return json.dumps({"error": "Invalid or expired session"})
-
-    result = await manager.add_thought(
-        session_id=session_id,
-        content=thought,
-        thought_type=ThoughtType.CONTINUATION,
-        row=row,
-        col=col,
-        confidence=confidence,
-        alternatives=alternatives,
-        alternative_confidences=alternative_confidences,
-    )
 
     if ctx:
         step = result.get("step", "?")
         score = result.get("survival_score", 0)
         await ctx.info(f"Added step {step} (score={score:.2f})")
 
-        # Warn about blind spots
-        if "blind_spots_detected" in result:
-            count = len(result["blind_spots_detected"])
+        # Warn about blind spots (key changed from blind_spots_detected)
+        if "blind_spots" in result:
+            count = len(result["blind_spots"])
             await ctx.warning(f"Detected {count} blind spot(s) in this step")
 
     return json.dumps(result, indent=2)
@@ -803,15 +1318,15 @@ async def _think_branch(
     if not branch_from:
         return json.dumps({"error": "branch_from is required for branch action"})
 
-    if session_id not in manager._sessions:
+    try:
+        result = await manager.add_thought(
+            session_id=session_id,
+            content=thought,
+            thought_type=ThoughtType.BRANCH,
+            branch_from=branch_from,
+        )
+    except SessionNotFoundError:
         return json.dumps({"error": "Invalid or expired session"})
-
-    result = await manager.add_thought(
-        session_id=session_id,
-        content=thought,
-        thought_type=ThoughtType.BRANCH,
-        branch_from=branch_from,
-    )
 
     if ctx:
         await ctx.info(f"Branched from thought {branch_from}")
@@ -833,9 +1348,6 @@ async def _think_revise(
         return json.dumps({"error": "thought is required for revise action"})
     if not revises:
         return json.dumps({"error": "revises is required for revise action"})
-
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
 
     result = await manager.add_thought(
         session_id=session_id,
@@ -866,9 +1378,6 @@ async def _think_synthesize(
     if not thought:
         return json.dumps({"error": "thought is required for synthesize action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
-
     result = await manager.synthesize(
         session_id=session_id,
         col=col,
@@ -898,9 +1407,6 @@ async def _think_verify(
     if not thought:
         return json.dumps({"error": "thought/evidence is required for verify action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
-
     result = await manager.add_thought(
         session_id=session_id,
         content=thought,
@@ -926,19 +1432,29 @@ async def _think_finish(
     if not session_id:
         return json.dumps({"error": "session_id is required for finish action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
+    store = get_metrics_store()
+    with store.trace("think_finish", session_id=session_id) as span:
+        result = await manager.finalize(
+            session_id=session_id,
+            answer=thought or "",
+            confidence=confidence,
+        )
 
-    result = await manager.finalize(
-        session_id=session_id,
-        answer=thought or "",
-        confidence=confidence,
-    )
-
-    if ctx:
         total_steps = result.get("total_steps", 0)
         mode = result.get("mode_used", "unknown")
         total_reward = result.get("total_reward", 0)
+
+        span.set_attribute("total_steps", total_steps)
+        span.set_attribute("mode", mode)
+        span.set_attribute("total_reward", total_reward)
+
+        # Record session end in metrics
+        duration_ms = result.get("duration_ms", 0)
+        store.record_session_end(session_id, status="completed", total_steps=total_steps)
+        if duration_ms:
+            store.record_histogram("session.duration_ms", duration_ms, {"mode": mode})
+
+    if ctx:
         await ctx.info(f"Finalized: {total_steps} steps, mode={mode}, reward={total_reward:.2f}")
 
         # Warn about unaddressed blind spots
@@ -981,9 +1497,6 @@ async def _think_resolve(
     if not thought:
         return json.dumps({"error": "thought is required for resolve action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
-
     result = await manager.resolve_contradiction(
         session_id=session_id,
         strategy=resolve_strategy,
@@ -1016,10 +1529,11 @@ async def _think_analyze(
     if not session_id:
         return json.dumps({"error": "session_id is required for analyze action"})
 
-    if session_id not in manager._sessions:
+    try:
+        analytics = await manager.analyze_session(session_id)
+    except SessionNotFoundError:
         return json.dumps({"error": "Invalid or expired session"})
 
-    analytics = manager.analyze_session(session_id)
     result = analytics.to_dict()
 
     if ctx:
@@ -1060,10 +1574,10 @@ async def _think_suggest(
     if not session_id:
         return json.dumps({"error": "session_id is required for suggest action"})
 
-    if session_id not in manager._sessions:
+    try:
+        suggestion = await manager.suggest_next_action(session_id)
+    except SessionNotFoundError:
         return json.dumps({"error": "Invalid or expired session"})
-
-    suggestion = manager.suggest_next_action(session_id)
 
     if ctx:
         action = suggestion["suggested_action"]
@@ -1103,9 +1617,6 @@ async def _think_feedback(
     if not session_id:
         return json.dumps({"error": "session_id is required for feedback action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
-
     if not suggestion_id:
         return json.dumps({"error": "suggestion_id is required for feedback action"})
 
@@ -1115,7 +1626,7 @@ async def _think_feedback(
     # Map string outcome to the expected type
     outcome: Literal["accepted", "rejected"] = suggestion_outcome
 
-    result = manager.record_suggestion_outcome(
+    result = await manager.record_suggestion_outcome(
         session_id=session_id,
         suggestion_id=suggestion_id,
         outcome=outcome,
@@ -1156,9 +1667,6 @@ async def _think_auto(
     if not session_id:
         return json.dumps({"error": "session_id is required for auto action"})
 
-    if session_id not in manager._sessions:
-        return json.dumps({"error": "Invalid or expired session"})
-
     if max_auto_steps < 1:
         return json.dumps({"error": "max_auto_steps must be at least 1"})
 
@@ -1166,12 +1674,15 @@ async def _think_auto(
         return json.dumps({"error": "max_auto_steps cannot exceed 20"})
 
     # Execute auto steps
-    result = await manager.auto_execute_suggestion(
-        session_id=session_id,
-        max_auto_steps=max_auto_steps,
-        stop_on_high_risk=stop_on_high_risk,
-        thought_generator=None,  # No LLM integration at server level
-    )
+    try:
+        result = await manager.auto_execute_suggestion(
+            session_id=session_id,
+            max_auto_steps=max_auto_steps,
+            stop_on_high_risk=stop_on_high_risk,
+            thought_generator=None,  # No LLM integration at server level
+        )
+    except SessionNotFoundError:
+        return json.dumps({"error": "Invalid or expired session"})
 
     if ctx:
         actions_executed = result.get("actions_executed", [])
@@ -1238,6 +1749,11 @@ async def compress(
 
     """
     try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
         if not query:
             return json.dumps({"error": "query is required for compression"})
 
@@ -1287,7 +1803,7 @@ async def compress(
         error = ToolExecutionError("compress", str(e), {"retry_after_seconds": 30})
         logger.warning(f"Model not ready: {e}")
         return json.dumps(error.to_dict())
-    except MatrixMindException as e:
+    except ReasonGuardException as e:
         error = ToolExecutionError("compress", str(e))
         logger.error(f"Compression failed: {e}")
         return json.dumps(error.to_dict())
@@ -1321,21 +1837,21 @@ async def status(
 
         # If session_id provided, return that session's status
         if session_id:
-            if session_id not in manager._sessions:
+            try:
+                result = await manager.get_status(session_id)
+                return json.dumps(result, indent=2, default=str)
+            except SessionNotFoundError:
                 return json.dumps({"error": f"Session not found: {session_id}"})
-
-            result = await manager.get_status(session_id)
-            return json.dumps(result, indent=2, default=str)
 
         # Otherwise return server status
         model_manager = ModelManager.get_instance()
         model_status = model_manager.get_status()
         rate_limiter = get_rate_limiter()
 
-        # Count sessions by status
+        # Count sessions by status (eventual consistency is fine for status)
         active_count = 0
         completed_count = 0
-        for session in manager._sessions.values():
+        for session in manager.get_all_sessions_snapshot().values():
             if session.status == SessionStatus.ACTIVE:
                 active_count += 1
             elif session.status == SessionStatus.COMPLETED:
@@ -1345,7 +1861,19 @@ async def status(
             "server": {
                 "name": SERVER_NAME,
                 "transport": SERVER_TRANSPORT,
-                "tools": ["think", "compress", "status"],
+                "tools": [
+                    # Guidance mode
+                    "think",
+                    "compress",
+                    "status",
+                    "paradigm_hint",
+                    # Enforcement mode (atomic router)
+                    "initialize_reasoning",
+                    "submit_step",
+                    "create_branch",
+                    "verify_claims",
+                    "router_status",
+                ],
                 "version": "2.0.0",  # Unified reasoner version
             },
             "model": model_status,
@@ -1359,19 +1887,23 @@ async def status(
                 "rag_enabled": ENABLE_RAG,
             },
             "sessions": {
-                "total": len(manager._sessions),
+                "total": active_count + completed_count,
                 "active": active_count,
                 "completed": completed_count,
                 "max_total": MAX_TOTAL_SESSIONS,
             },
             # Backwards compatibility alias
             "active_sessions": {
-                "total": len(manager._sessions),
+                "total": active_count + completed_count,
                 "active": active_count,
                 "completed": completed_count,
                 "max_total": MAX_TOTAL_SESSIONS,
             },
             "rate_limit": rate_limiter.get_stats(),
+            "ip_rate_limit": {
+                "enabled": IP_RATE_LIMIT_ENABLED,
+                **get_ip_rate_limiter().get_stats(),
+            },
             "cleanup": {
                 "max_age_minutes": SESSION_MAX_AGE_MINUTES,
                 "interval_seconds": CLEANUP_INTERVAL_SECONDS,
@@ -1392,13 +1924,647 @@ async def status(
 
 
 # =============================================================================
+# TOOL 4: PARADIGM_HINT (Recommend guidance vs enforcement)
+# =============================================================================
+
+# Keywords that suggest enforcement mode is better
+_ENFORCEMENT_KEYWORDS = frozenset(
+    [
+        # Logical/mathematical rigor
+        "prove",
+        "proof",
+        "theorem",
+        "lemma",
+        "qed",
+        "therefore",
+        "hence",
+        "implies",
+        "contradiction",
+        "contrapositive",
+        "induction",
+        # Paradoxes and traps
+        "paradox",
+        "monty hall",
+        "birthday problem",
+        "simpson",
+        "base rate",
+        "gambler's fallacy",
+        "conjunction fallacy",
+        "survivorship",
+        # Formal reasoning
+        "valid",
+        "invalid",
+        "sound",
+        "unsound",
+        "fallacy",
+        "syllogism",
+        "modus ponens",
+        "modus tollens",
+        "deduction",
+        "inference",
+        # High-stakes verification
+        "verify",
+        "certify",
+        "audit",
+        "compliance",
+        "safety-critical",
+        # Specific problem types
+        "probability",
+        "conditional probability",
+        "bayes",
+    ]
+)
+
+# Keywords that suggest guidance mode is better
+_GUIDANCE_KEYWORDS = frozenset(
+    [
+        # Creative/exploratory
+        "brainstorm",
+        "explore",
+        "ideas",
+        "creative",
+        "design",
+        "imagine",
+        "possibilities",
+        "alternatives",
+        "options",
+        "suggest",
+        # Analysis/understanding
+        "explain",
+        "summarize",
+        "analyze",
+        "compare",
+        "contrast",
+        "describe",
+        "understand",
+        "clarify",
+        "interpret",
+        "review",
+        # Iterative work
+        "debug",
+        "troubleshoot",
+        "fix",
+        "refactor",
+        "improve",
+        "optimize",
+        "iterate",
+        "prototype",
+        "draft",
+        "sketch",
+        # Open-ended
+        "discuss",
+        "opinion",
+        "perspective",
+        "viewpoint",
+        "thoughts",
+        "consider",
+        "reflect",
+        "ponder",
+    ]
+)
+
+
+def _analyze_problem_for_paradigm(problem: str) -> dict[str, Any]:
+    """Analyze a problem statement and recommend guidance vs enforcement.
+
+    Returns dict with recommendation, confidence, and reasoning.
+    """
+    problem_lower = problem.lower()
+
+    # Count keyword matches
+    enforcement_matches = [kw for kw in _ENFORCEMENT_KEYWORDS if kw in problem_lower]
+    guidance_matches = [kw for kw in _GUIDANCE_KEYWORDS if kw in problem_lower]
+
+    # Check for question patterns
+    has_prove_pattern = any(
+        p in problem_lower
+        for p in [
+            "prove that",
+            "prove the",
+            "show that",
+            "demonstrate that",
+            "verify that",
+            "confirm that",
+            "is it true that",
+        ]
+    )
+    has_open_pattern = any(
+        p in problem_lower
+        for p in [
+            "what are",
+            "how might",
+            "could you",
+            "help me",
+            "i want to",
+            "let's",
+            "can we",
+            "what if",
+            "why does",
+            "how does",
+        ]
+    )
+
+    # Calculate scores
+    enforcement_score = len(enforcement_matches) * 2 + (3 if has_prove_pattern else 0)
+    guidance_score = len(guidance_matches) * 2 + (3 if has_open_pattern else 0)
+
+    # Determine recommendation
+    total = enforcement_score + guidance_score
+    if total == 0:
+        # No strong signals - default to guidance (more flexible)
+        return {
+            "recommendation": "guidance",
+            "confidence": 0.5,
+            "reasoning": "No strong indicators found. Guidance mode is more flexible for general problems.",
+            "enforcement_signals": [],
+            "guidance_signals": [],
+        }
+
+    if enforcement_score > guidance_score:
+        confidence = min(0.95, 0.6 + (enforcement_score - guidance_score) * 0.1)
+        return {
+            "recommendation": "enforcement",
+            "confidence": round(confidence, 2),
+            "reasoning": (
+                "Problem contains formal reasoning indicators. "
+                "Enforcement mode prevents premature conclusions."
+            ),
+            "enforcement_signals": enforcement_matches[:5],  # Top 5
+            "guidance_signals": guidance_matches[:3],
+        }
+    else:
+        confidence = min(0.95, 0.6 + (guidance_score - enforcement_score) * 0.1)
+        return {
+            "recommendation": "guidance",
+            "confidence": round(confidence, 2),
+            "reasoning": (
+                "Problem appears exploratory or creative. Guidance mode allows flexible iteration."
+            ),
+            "enforcement_signals": enforcement_matches[:3],
+            "guidance_signals": guidance_matches[:5],
+        }
+
+
+@mcp.tool
+async def paradigm_hint(
+    problem: str,
+    ctx: Context | None = None,
+) -> str:
+    """Analyze a problem and recommend guidance vs enforcement paradigm.
+
+    Call this before starting reasoning to get a recommendation on which
+    paradigm (think tool vs atomic router) is better suited for your problem.
+
+    Args:
+        problem: The problem statement to analyze
+
+    Returns:
+        JSON with:
+        - recommendation: "guidance" or "enforcement"
+        - confidence: 0.0-1.0 confidence in recommendation
+        - reasoning: Why this paradigm was recommended
+        - enforcement_signals: Keywords suggesting enforcement
+        - guidance_signals: Keywords suggesting guidance
+        - suggested_tools: Which tools to use
+
+    Example:
+        >>> paradigm_hint("Prove the Monty Hall solution mathematically")
+        {
+            "recommendation": "enforcement",
+            "confidence": 0.85,
+            "reasoning": "Problem contains formal reasoning indicators...",
+            "suggested_tools": ["initialize_reasoning", "submit_step", ...]
+        }
+
+    """
+    try:
+        if not problem or not problem.strip():
+            return json.dumps({"error": "problem is required"})
+
+        result = _analyze_problem_for_paradigm(problem)
+
+        # Add suggested tools based on recommendation
+        if result["recommendation"] == "enforcement":
+            result["suggested_tools"] = [
+                "initialize_reasoning",
+                "submit_step",
+                "create_branch",
+                "verify_claims",
+            ]
+            result["workflow_hint"] = (
+                "1. initialize_reasoning(problem, complexity='auto')\n"
+                "2. submit_step(id, 'premise', ..., confidence)\n"
+                "3. submit_step(id, 'hypothesis', ..., confidence)\n"
+                "4. If BRANCH_REQUIRED: create_branch(id, alternatives)\n"
+                "5. submit_step(id, 'verification', ..., confidence)\n"
+                "6. submit_step(id, 'synthesis', ..., confidence)"
+            )
+        else:
+            result["suggested_tools"] = ["think", "compress"]
+            result["workflow_hint"] = (
+                "1. think(action='start', problem=...)\n"
+                "2. think(action='continue', session_id, thought=...)\n"
+                "3. Repeat step 2 as needed\n"
+                "4. think(action='finish', session_id, thought=...)"
+            )
+
+        if ctx:
+            rec = result["recommendation"]
+            conf = result["confidence"]
+            await ctx.info(f"Paradigm hint: {rec} (confidence={conf:.0%})")
+
+        return json.dumps(result, indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("paradigm_hint", str(e))
+        logger.error(f"Paradigm hint failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+# =============================================================================
+# ATOMIC ROUTER TOOLS (New enforced reasoning system)
+# =============================================================================
+
+from src.tools.atomic_router import (  # noqa: E402
+    create_branch as router_create_branch,
+)
+from src.tools.atomic_router import (  # noqa: E402
+    get_router_stats,
+)
+from src.tools.atomic_router import (  # noqa: E402
+    get_session_state as router_get_session_state,
+)
+from src.tools.atomic_router import (  # noqa: E402
+    initialize_reasoning as router_initialize,
+)
+from src.tools.atomic_router import (  # noqa: E402
+    submit_atomic_step as router_submit_step,
+)
+from src.tools.atomic_router import (  # noqa: E402
+    verify_claims as router_verify_claims,
+)
+
+
+@mcp.tool
+async def initialize_reasoning(
+    problem: str,
+    complexity: Literal["low", "medium", "high", "auto"] = "auto",
+    ctx: Context | None = None,
+) -> str:
+    """Initialize a new enforced reasoning session.
+
+    Unlike the 'think' tool which guides, this ENFORCES reasoning discipline
+    through rejection. Steps that violate rules are REJECTED, not warned.
+
+    Args:
+        problem: The problem to reason about (required)
+        complexity: Complexity level - determines min/max steps and confidence threshold
+            - low: 2-5 steps, 60% confidence threshold
+            - medium: 4-8 steps, 70% confidence threshold
+            - high: 6-12 steps, 75% confidence threshold
+            - auto: Detect from problem keywords (default)
+
+    Returns:
+        JSON with session_id, complexity, constraints, and trap warnings
+
+    Example:
+        >>> initialize_reasoning("Explain the Monty Hall paradox", "auto")
+        {
+            "session_id": "abc123",
+            "complexity": "high",
+            "min_steps": 6,
+            "max_steps": 12,
+            "confidence_threshold": 0.75,
+            "guidance": "TRAP WARNING: Monty Hall problem..."
+        }
+
+    """
+    try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
+        # Validate input size
+        validation_error = _validate_input_sizes(problem=problem)
+        if validation_error:
+            return json.dumps(validation_error)
+
+        store = get_metrics_store()
+        with store.trace("initialize_reasoning") as span:
+            span.set_attribute("complexity", complexity)
+            span.set_attribute("problem_length", len(problem))
+
+            result = router_initialize(problem=problem, complexity=complexity)
+
+            span.set_attribute("session_id", result.session_id)
+            span.set_attribute("detected_complexity", result.complexity)
+            store.record_session_start(
+                session_id=result.session_id,
+                problem=problem[:500],
+                mode="enforcement",
+                complexity=result.complexity,
+            )
+
+        if ctx:
+            await ctx.info(
+                f"Initialized router session {result.session_id} "
+                f"(complexity={result.complexity}, min={result.min_steps}, max={result.max_steps})"
+            )
+            if "TRAP WARNING" in result.guidance:
+                await ctx.warning("Reasoning trap detected - see guidance")
+
+        return json.dumps(result.model_dump(), indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("initialize_reasoning", str(e))
+        logger.error(f"Initialize reasoning failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def submit_step(
+    session_id: str,
+    step_type: Literal["premise", "hypothesis", "verification", "synthesis"],
+    content: str,
+    confidence: float,
+    evidence: list[str] | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Submit a single reasoning step. May be REJECTED.
+
+    The router enforces reasoning discipline through 5 rules:
+    - Rule A: Cannot synthesize until min_steps reached
+    - Rule B: Low confidence requires branching (BRANCH_REQUIRED)
+    - Rule C: Cannot synthesize without verification (VERIFICATION_REQUIRED)
+    - Rule D: Must follow state machine transitions
+    - Rule E: Must synthesize at max_steps
+
+    State machine transitions:
+        (start) -> premise -> hypothesis -> verification -> synthesis
+                    ↓           ↓              ↓
+                 premise    hypothesis      hypothesis
+
+    Args:
+        session_id: Session ID from initialize_reasoning
+        step_type: Type of reasoning step
+            - premise: Establish facts/assumptions
+            - hypothesis: Form testable hypothesis
+            - verification: Test hypothesis with evidence
+            - synthesis: Final conclusion (terminal)
+        content: Your reasoning content
+        confidence: Your confidence in this step (0.0-1.0, required!)
+        evidence: Optional evidence supporting this step
+
+    Returns:
+        JSON with status (ACCEPTED/REJECTED/BRANCH_REQUIRED/VERIFICATION_REQUIRED),
+        rejection_reason if rejected, and next valid steps
+
+    Example:
+        >>> submit_step("abc123", "premise", "There are 3 doors", 0.95)
+        {"status": "ACCEPTED", "step_id": "step-1", "valid_next_steps": ["premise", "hypothesis"], ...}
+
+        >>> submit_step("abc123", "synthesis", "Answer is X", 0.9)
+        {"status": "REJECTED", "rejection_reason": "Need 4 more reasoning steps", ...}
+
+    """
+    try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
+        # Validate input size
+        validation_error = _validate_input_sizes(thought=content)
+        if validation_error:
+            return json.dumps(validation_error)
+
+        result = router_submit_step(
+            session_id=session_id,
+            step_type=step_type,
+            content=content,
+            confidence=confidence,
+            evidence=evidence,
+        )
+
+        if ctx:
+            if result.status.value == "ACCEPTED":
+                await ctx.info(
+                    f"Step accepted: {step_type} (steps={result.steps_taken}, "
+                    f"remaining={result.steps_remaining})"
+                )
+            elif result.status.value == "REJECTED":
+                await ctx.warning(f"Step REJECTED: {result.rejection_reason}")
+            elif result.status.value == "BRANCH_REQUIRED":
+                await ctx.warning(
+                    f"BRANCH_REQUIRED: confidence {confidence:.2f} too low. "
+                    "Use create_branch() with 2-4 alternatives."
+                )
+            elif result.status.value == "VERIFICATION_REQUIRED":
+                await ctx.warning(
+                    "VERIFICATION_REQUIRED: Add a verification step before synthesis."
+                )
+
+            if result.can_synthesize:
+                await ctx.info("Session ready for synthesis")
+            elif result.synthesis_blockers:
+                await ctx.info(f"Synthesis blockers: {', '.join(result.synthesis_blockers)}")
+
+        return json.dumps(result.model_dump(), indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("submit_step", str(e))
+        logger.error(f"Submit step failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def create_branch(
+    session_id: str,
+    alternatives: list[str],
+    ctx: Context | None = None,
+) -> str:
+    """Create alternative reasoning branches.
+
+    Required when submit_step returns BRANCH_REQUIRED (confidence below threshold).
+    Creates 2-4 alternative hypotheses to explore in parallel.
+
+    After branching:
+    1. Submit verification steps for each hypothesis
+    2. Compare evidence and confidence across branches
+    3. Select the hypothesis with strongest support
+    4. Continue reasoning from that branch
+
+    Args:
+        session_id: Session ID from initialize_reasoning
+        alternatives: 2-4 alternative hypotheses to explore
+
+    Returns:
+        JSON with branch_ids and guidance on how to proceed
+
+    Example:
+        >>> create_branch("abc123", [
+        ...     "Probability stays 1/3 for original door",
+        ...     "Probability becomes 1/2 for both doors"
+        ... ])
+        {"branch_ids": ["br-1", "br-2"], "guidance": "..."}
+
+    """
+    try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
+        result = router_create_branch(session_id=session_id, alternatives=alternatives)
+
+        if ctx:
+            if result.branch_ids:
+                await ctx.info(f"Created {len(result.branch_ids)} branches")
+            else:
+                await ctx.warning(f"Branch creation failed: {result.guidance}")
+
+        return json.dumps(result.model_dump(), indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("create_branch", str(e))
+        logger.error(f"Create branch failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def verify_claims(
+    session_id: str,
+    claims: list[str],
+    evidence: list[str],
+    ctx: Context | None = None,
+) -> str:
+    """Verify claims against evidence and check for contradictions.
+
+    Use this before synthesis to ensure your conclusions are supported.
+    Detects logical contradictions between claims and missing evidence.
+
+    Args:
+        session_id: Session ID from initialize_reasoning
+        claims: List of claims to verify
+        evidence: List of evidence to check against
+
+    Returns:
+        JSON with verified claims, contradictions, missing evidence,
+        and whether synthesis is now allowed
+
+    Example:
+        >>> verify_claims("abc123",
+        ...     claims=["Switching wins 2/3", "Staying wins 1/3"],
+        ...     evidence=["By Bayes theorem...", "Initial probability 1/3..."]
+        ... )
+        {
+            "verified": ["Switching wins 2/3", "Staying wins 1/3"],
+            "contradictions": [],
+            "missing_evidence": [],
+            "can_synthesize": true
+        }
+
+    """
+    try:
+        # V-003: Check IP-based rate limit
+        ip_allowed, ip_error = await check_ip_rate_limit()
+        if not ip_allowed:
+            return json.dumps(ip_error)
+
+        result = router_verify_claims(session_id=session_id, claims=claims, evidence=evidence)
+
+        if ctx:
+            if result.verified:
+                await ctx.info(f"Verified {len(result.verified)} claim(s)")
+            if result.contradictions:
+                await ctx.warning(f"Detected {len(result.contradictions)} contradiction(s)!")
+            if result.missing_evidence:
+                await ctx.warning(f"Missing evidence for {len(result.missing_evidence)} claim(s)")
+            if result.can_synthesize:
+                await ctx.info("All checks passed - ready for synthesis")
+
+        return json.dumps(result.model_dump(), indent=2)
+
+    except Exception as e:
+        error = ToolExecutionError("verify_claims", str(e))
+        logger.error(f"Verify claims failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+@mcp.tool
+async def router_status(
+    session_id: str | None = None,
+    ctx: Context | None = None,
+) -> str:
+    """Get atomic router status or session state.
+
+    Args:
+        session_id: Optional session ID for specific session state
+
+    Returns:
+        JSON with router stats or session state
+
+    """
+    try:
+        if session_id:
+            state = router_get_session_state(session_id)
+            if state is None:
+                return json.dumps({"error": f"Session '{session_id}' not found or expired"})
+            return json.dumps(state, indent=2)
+
+        # Return global router stats
+        stats = get_router_stats()
+        return json.dumps(
+            {
+                "router": {
+                    "name": "Atomic Reasoning Router",
+                    "tools": [
+                        "initialize_reasoning",
+                        "submit_step",
+                        "create_branch",
+                        "verify_claims",
+                        "router_status",
+                    ],
+                    "rules": [
+                        "A: Minimum depth",
+                        "B: Confidence branching",
+                        "C: Verification required",
+                        "D: State machine",
+                        "E: Maximum steps",
+                    ],
+                },
+                "sessions": stats,
+            },
+            indent=2,
+        )
+
+    except Exception as e:
+        error = ToolExecutionError("router_status", str(e))
+        logger.error(f"Router status failed: {e}")
+        return json.dumps(error.to_dict())
+
+
+# =============================================================================
 # SERVER ENTRY POINT
 # =============================================================================
 
 
 async def _init_unified_manager_async() -> None:
-    """Initialize the unified manager with optional vector store."""
+    """Initialize the unified manager with vector store and encoder for semantic scoring."""
     vector_store = None
+    encoder = None
+
+    # Initialize encoder for semantic scoring
+    try:
+        from src.models.context_encoder import ContextEncoder, EncoderConfig
+
+        encoder_config = EncoderConfig(model_name=_get_embedding_model_name())
+        encoder = ContextEncoder(encoder_config)
+        logger.info(f"Initialized context encoder with {encoder_config.model_name}")
+    except Exception as e:
+        logger.warning(f"Failed to initialize context encoder: {e}")
+        encoder = None
 
     if ENABLE_RAG:
         try:
@@ -1414,13 +2580,27 @@ async def _init_unified_manager_async() -> None:
             logger.warning(f"Failed to initialize vector store, RAG disabled: {e}")
             vector_store = None
 
-    await init_unified_manager(vector_store=vector_store)
-    logger.info("Unified reasoner manager initialized")
+    await init_unified_manager(
+        vector_store=vector_store,
+        encoder=encoder,
+        enable_semantic_scoring=encoder is not None,
+    )
+    logger.info(
+        f"Unified reasoner manager initialized "
+        f"(semantic_scoring={encoder is not None}, rag={vector_store is not None})"
+    )
 
 
 def main() -> None:
-    """Run the MatrixMind MCP server."""
+    """Run the Reason Guard MCP server."""
     logger.info(f"Starting {SERVER_NAME} (transport: {SERVER_TRANSPORT})")
+
+    # Initialize API key authentication (V-001: CWE-306)
+    _init_api_keys()
+    if AUTH_ENABLED:
+        logger.info(f"API key authentication enabled ({len(_API_KEY_HASHES)} key(s) loaded)")
+    else:
+        logger.warning("API key authentication disabled - enable with AUTH_ENABLED=true")
 
     # Initialize embedding model
     _init_model_manager()

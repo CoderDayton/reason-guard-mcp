@@ -1,6 +1,29 @@
-# Contributing to MatrixMind MCP
+# Contributing to Reason Guard MCP
 
 Thank you for your interest in contributing! This guide will help you get started.
+
+## Architecture Overview
+
+Reason Guard is a **dual-paradigm** reasoning state manager:
+
+```
+src/
+├── server.py                    # MCP server (9 tools)
+├── tools/
+│   ├── unified_reasoner.py     # Guidance mode (think tool)
+│   ├── atomic_router.py        # Enforcement mode (submit_step, etc.)
+│   ├── compress.py             # Context compression
+│   └── routing_rules.py        # Pure routing rule functions
+├── utils/
+│   ├── observability.py        # SQLite metrics (zero deps)
+│   ├── session.py              # Session management
+│   └── ...
+└── models/
+    ├── context_encoder.py      # Embedding model wrapper
+    └── ...
+```
+
+**Key principle**: The LLM does all reasoning. Tools only track, validate, and optionally enforce.
 
 ## Development Setup
 
@@ -14,8 +37,8 @@ Thank you for your interest in contributing! This guide will help you get starte
 
 ```bash
 # Clone the repository
-git clone https://github.com/coderdayton/matrixmind-mcp.git
-cd matrixmind-mcp
+git clone https://github.com/coderdayton/reason-guard-mcp.git
+cd reason-guard-mcp
 
 # Install dependencies (including dev)
 make dev
@@ -186,11 +209,12 @@ except SomeError as e:
 
 ```
 tests/
-├── conftest.py          # Shared fixtures
-├── test_smoke.py        # Quick validation (<5s)
-├── test_integration.py  # Pipeline tests
-├── test_performance.py  # Load/stress tests
-└── test_e2e_mcp.py      # End-to-end MCP tests
+├── conftest.py              # Shared fixtures
+├── test_smoke.py            # Quick validation
+├── test_e2e_mcp.py          # End-to-end MCP protocol tests
+├── test_atomic_router.py    # Enforcement mode tests
+├── test_observability.py    # Metrics/tracing tests
+└── test_*.py                # Unit tests for each module
 ```
 
 ### Writing Tests
@@ -267,8 +291,8 @@ Pre-release versions: `0.2.0-alpha`, `0.2.0-beta.1`, `0.2.0-rc.1`
 
 ## Getting Help
 
-- **Questions**: Open a [Discussion](https://github.com/coderdayton/matrixmind-mcp/discussions)
-- **Bugs**: Open an [Issue](https://github.com/coderdayton/matrixmind-mcp/issues)
+- **Questions**: Open a [Discussion](https://github.com/coderdayton/reason-guard-mcp/discussions)
+- **Bugs**: Open an [Issue](https://github.com/coderdayton/reason-guard-mcp/issues)
 - **Security**: See [SECURITY.md](SECURITY.md)
 
 ## License

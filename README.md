@@ -1,104 +1,167 @@
-# MatrixMind MCP Server
+# Reason Guard MCP
 
-[![CI](https://github.com/coderdayton/matrixmind-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/coderdayton/matrixmind-mcp/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/coderdayton/matrixmind-mcp/graph/badge.svg)](https://codecov.io/gh/coderdayton/matrixmind-mcp)
+[![CI](https://github.com/coderdayton/reason-guard-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/coderdayton/reason-guard-mcp/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/coderdayton/reason-guard-mcp/graph/badge.svg)](https://codecov.io/gh/coderdayton/reason-guard-mcp)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![FastMCP 2.0](https://img.shields.io/badge/FastMCP-2.0-green.svg)](https://gofastmcp.com)
 
-**Advanced reasoning state management for LLMs.** A unified reasoning engine with auto-mode selection, blind spot detection, domain-aware validation, and learning from feedback—all via MCP.
+**Dual-paradigm reasoning state manager for LLMs.** Track, validate, and optionally *enforce* structured reasoning via MCP.
+
+## Two Paradigms
+
+Reason Guard offers two ways to manage reasoning:
+
+| Paradigm | Behavior | Best For |
+|----------|----------|----------|
+| **Guidance** | Suggestions, warnings, rewards. Bad steps recorded with feedback. | Open-ended analysis, debugging, brainstorming |
+| **Enforcement** | REJECTS invalid steps. Must fix and retry. | Proofs, paradoxes, logical arguments |
+
+**Start with `paradigm_hint`** — it analyzes your problem and recommends which to use.
 
 ## Quick Start
 
 ```bash
-# Install and run
-uvx matrixmind-mcp
-
-# Or with uv
-uv tool install matrixmind-mcp
-matrixmind-mcp
+uvx reason-guard
 ```
 
 ```python
-# Start a reasoning session (auto-selects optimal mode)
+# 1. Get recommendation
+paradigm_hint(problem="Prove the Monty Hall solution")
+# → { "recommendation": "enforcement", "confidence": 0.85, "trap_detected": true }
+
+# 2a. GUIDANCE MODE - flexible with feedback
 think(action="start", problem="What is 15% of 200?")
-# → {"session_id": "a1b2c3d4-...", "mode": "chain", "domain": "math"}
-
-# Add reasoning steps
-think(action="continue", session_id="...", thought="15% = 0.15")
-think(action="continue", session_id="...", thought="0.15 × 200 = 30")
-
-# Complete with answer
+think(action="continue", session_id="...", thought="15% = 0.15, so 0.15 × 200 = 30")
 think(action="finish", session_id="...", answer="30", confidence=0.99)
+
+# 2b. ENFORCEMENT MODE - strict step validation
+initialize_reasoning(problem="Prove Monty Hall", complexity="high")
+submit_step(session_id="...", step_type="premise", content="3 doors, 1 prize", confidence=0.95)
+# → ACCEPTED or REJECTED
 ```
 
-## Architecture
+## Tools (9 total)
 
-MatrixMind tools are **state managers**, not LLM wrappers. The calling LLM does all reasoning; tools track, validate, and optimize the process:
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    Your LLM (Claude, GPT, etc.)                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                     Reasoning Process                          │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-│                                │                                     │
-│                                ▼                                     │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │               MatrixMind MCP (Unified Reasoner)                │  │
-│  │                                                                 │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │  │
-│  │  │ Auto-Mode    │  │ Thought      │  │ Domain Handlers      │  │  │
-│  │  │ Selection    │  │ Graph        │  │ (math/code/logic)    │  │  │
-│  │  └──────────────┘  └──────────────┘  └──────────────────────┘  │  │
-│  │                                                                 │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │  │
-│  │  │ Blind Spot   │  │ CISC         │  │ RLVR Learning        │  │  │
-│  │  │ Detection    │  │ Confidence   │  │ (Weight Store)       │  │  │
-│  │  └──────────────┘  └──────────────┘  └──────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## Key Features
-
-| Feature | Description |
-|---------|-------------|
-| **Auto-Mode Selection** | Automatically chooses chain, matrix, or hybrid based on problem complexity |
-| **Domain Detection** | Specialized handlers for math, code, logic, and factual problems |
-| **Blind Spot Detection** | Identifies gaps in reasoning paths |
-| **CISC Confidence** | Calibrated confidence scoring with multiple methods |
-| **Thought Graph** | Sparse graph tracking relationships between reasoning steps |
-| **RLVR Learning** | Records feedback to improve suggestion quality over time |
-| **Semantic Compression** | Context-aware prompt compression preserving key information |
-
-## Tools
-
-### Primary Tool: `think`
-
-A unified reasoning interface with 12 actions:
-
-| Action | Purpose | Key Parameters |
-|--------|---------|----------------|
-| `start` | Initialize session | `problem`, `mode` (optional) |
-| `continue` | Add reasoning step | `thought`, `row`/`col` (matrix) |
-| `branch` | Create alternative path | `from_step`, `thought` |
-| `revise` | Update previous thought | `step_index`, `thought` |
-| `synthesize` | Summarize matrix column | `col`, `synthesis` |
-| `verify` | Check a claim | `claim`, `status`, `evidence` |
-| `finish` | Complete with answer | `answer`, `confidence` |
-| `resolve` | Handle contradictions | `resolution`, `chosen_path` |
-| `analyze` | Get quality metrics | — |
-| `suggest` | Get next action hint | — |
-| `feedback` | Record suggestion outcome | `outcome` |
-| `auto` | Execute suggested action | — |
-
-### Auxiliary Tools
+### Paradigm Selection
 
 | Tool | Purpose |
 |------|---------|
-| `compress` | Semantic context compression (stateless) |
-| `status` | Server health and session stats |
+| `paradigm_hint` | Analyze problem, get paradigm recommendation |
+
+### Guidance Mode (4 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `think` | Unified reasoning: start, continue, branch, revise, verify, finish |
+| `compress` | Semantic context compression |
+| `status` | Server/session health |
+
+### Enforcement Mode (4 tools)
+
+| Tool | Purpose |
+|------|---------|
+| `initialize_reasoning` | Start enforced session with step bounds |
+| `submit_step` | Submit step (premise → hypothesis → verification → synthesis) |
+| `create_branch` | Required when confidence is low |
+| `verify_claims` | Verify claims before synthesis |
+| `router_status` | Enforcement session state |
+
+## Guidance Mode
+
+The LLM reasons freely; server provides feedback.
+
+```python
+# Start session (auto-selects chain/matrix/hybrid)
+think(action="start", problem="Calculate compound interest on $1000 at 5% for 3 years")
+# → { "session_id": "abc123", "mode": "chain", "domain": "math" }
+
+# Add steps - receive guidance, blind spot warnings, rewards
+think(action="continue", session_id="abc123", thought="Year 1: 1000 × 1.05 = 1050")
+think(action="continue", session_id="abc123", thought="Year 2: 1050 × 1.05 = 1102.50")
+think(action="continue", session_id="abc123", thought="Year 3: 1102.50 × 1.05 = 1157.63")
+
+# Complete
+think(action="finish", session_id="abc123", answer="$1157.63", confidence=0.95)
+```
+
+### Think Actions
+
+| Action | Purpose | Parameters |
+|--------|---------|------------|
+| `start` | Begin session | `problem`, `mode` (optional) |
+| `continue` | Add step | `thought`, `row`/`col` (matrix) |
+| `branch` | Alternative path | `from_step`, `thought` |
+| `revise` | Update step | `step_index`, `thought` |
+| `synthesize` | Summarize column | `col`, `synthesis` |
+| `verify` | Check claim | `claim`, `status`, `evidence` |
+| `finish` | Complete | `answer`, `confidence` |
+| `analyze` | Get metrics | — |
+| `suggest` | Get hint | — |
+| `feedback` | Record outcome | `outcome` |
+| `auto` | Execute suggestion | — |
+
+## Enforcement Mode
+
+Server REJECTS invalid steps. Forces disciplined reasoning.
+
+```python
+# Initialize with complexity bounds
+initialize_reasoning(problem="Prove the Monty Hall solution", complexity="high")
+# → { "session_id": "xyz789", "min_steps": 6, "max_steps": 12, "trap_detected": true }
+
+# Submit steps - must follow state machine
+submit_step(session_id="xyz789", step_type="premise",
+            content="There are 3 doors, one with a prize", confidence=0.95)
+# → { "status": "ACCEPTED", "step_number": 1 }
+
+submit_step(session_id="xyz789", step_type="hypothesis",
+            content="Switching wins 2/3 of the time", confidence=0.5)
+# → { "status": "BRANCH_REQUIRED", "reason": "confidence < 0.75" }
+
+# Must branch when confidence is low
+create_branch(session_id="xyz789",
+              alternatives=["Switching wins 2/3", "Staying wins 1/2", "Equal odds"])
+# → { "status": "ACCEPTED" }
+
+# Verify before synthesis
+submit_step(session_id="xyz789", step_type="verification",
+            content="Enumerating all cases shows switching wins 2/3", confidence=0.9)
+# → { "status": "ACCEPTED" }
+
+submit_step(session_id="xyz789", step_type="synthesis",
+            content="Switching provably wins 2/3", confidence=0.95)
+# → { "status": "ACCEPTED", "session_complete": true }
+```
+
+### Enforcement Rules
+
+| Rule | Description |
+|------|-------------|
+| **A** | Cannot synthesize until `min_steps` reached |
+| **B** | Low confidence (< 0.75) requires `create_branch` |
+| **C** | Must verify before synthesis |
+| **D** | Must follow state machine: premise → hypothesis → verification → synthesis |
+| **E** | Must synthesize at `max_steps` |
+
+### Step Types
+
+| Type | Purpose |
+|------|---------|
+| `premise` | Establish facts |
+| `hypothesis` | Propose claims |
+| `verification` | Test claims |
+| `synthesis` | Draw conclusions |
+
+## When to Use Which
+
+| Problem Type | Paradigm | Why |
+|--------------|----------|-----|
+| Open-ended analysis | Guidance | Flexibility, exploration |
+| Math proofs | Enforcement | Prevents jumping to conclusions |
+| Paradoxes (Monty Hall) | Enforcement | Traps require discipline |
+| Code debugging | Guidance | Iterative, exploratory |
+| Logical arguments | Enforcement | Forces verification |
+| Brainstorming | Guidance | No strict structure |
 
 ## IDE Integration
 
@@ -108,9 +171,9 @@ A unified reasoning interface with 12 actions:
 ```json
 {
   "servers": {
-    "matrixmind": {
+    "reason-guard": {
       "command": "uvx",
-      "args": ["matrixmind-mcp"]
+      "args": ["reason-guard"]
     }
   }
 }
@@ -120,14 +183,14 @@ A unified reasoning interface with 12 actions:
 <details>
 <summary><strong>Claude Desktop</strong></summary>
 
-Add to `~/.config/claude/claude_desktop_config.json` (Linux/Mac) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+Add to `~/.config/claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
-    "matrixmind": {
+    "reason-guard": {
       "command": "uvx",
-      "args": ["matrixmind-mcp"]
+      "args": ["reason-guard"]
     }
   }
 }
@@ -138,191 +201,71 @@ Add to `~/.config/claude/claude_desktop_config.json` (Linux/Mac) or `%APPDATA%\C
 <summary><strong>HTTP/SSE Mode</strong></summary>
 
 ```bash
-export SERVER_TRANSPORT=http  # or "sse"
+export SERVER_TRANSPORT=http
 export SERVER_PORT=8000
-uvx matrixmind-mcp
-# Connect to http://127.0.0.1:8000
+uvx reason-guard
 ```
 </details>
 
-## Usage Examples
+## Benchmark Results
 
-### Auto-Mode Selection
+| Metric | Baseline | Reason Guard | Improvement |
+|--------|----------|--------------|-------------|
+| **Overall Accuracy** | 50.0% | **83.3%** | **+33.3%** |
+| Math (GSM8K) | 38.9% | 72.2% | +33.3% |
+| Logic (LogiQA) | 66.7% | 100.0% | +33.3% |
 
-```python
-# MatrixMind auto-detects optimal mode based on problem complexity
-think(action="start", problem="Calculate compound interest on $1000 at 5% for 3 years")
-# → { "session_id": "...", "mode": "chain", "domain": "math" }
-
-think(action="start", problem="Compare REST vs GraphQL vs gRPC for our microservices")
-# → { "session_id": "...", "mode": "matrix", "domain": "general" }
-```
-
-### Chain Reasoning
-
-```python
-think(action="start", mode="chain", problem="Make 24 using 3, 4, 5, 6")
-# → { "session_id": "abc123" }
-
-think(action="continue", session_id="abc123", thought="Try (6-3) × (5+4) = 27. Too high.")
-think(action="continue", session_id="abc123", thought="Try 6 × 4 = 24, use 5-3=2...")
-think(action="continue", session_id="abc123", thought="6 × 4 × (5-3) / 2 = 24!")
-
-think(action="finish", session_id="abc123", answer="6 × 4 × (5-3) / 2 = 24", confidence=0.95)
-```
-
-### Matrix of Thought
-
-```python
-think(action="start", mode="matrix",
-      problem="Should we migrate to microservices?",
-      rows=3, cols=2,
-      strategies=["technical", "business", "operational"])
-# → { "session_id": "xyz789" }
-
-# Fill cells
-think(action="continue", session_id="xyz789", row=0, col=0,
-      thought="Technical pros: scalability, independent deployments")
-think(action="continue", session_id="xyz789", row=0, col=1,
-      thought="Technical cons: distributed complexity, debugging")
-
-# Synthesize
-think(action="synthesize", session_id="xyz789", col=0,
-      synthesis="Pros outweigh cons for our scale")
-
-think(action="finish", session_id="xyz789",
-      answer="Yes, migrate with phased approach", confidence=0.8)
-```
-
-### Suggestion-Guided Reasoning
-
-```python
-think(action="start", problem="Complex optimization problem")
-
-# Get AI suggestion for next action
-think(action="suggest", session_id="abc")
-# → { "suggested_action": "continue", "reasoning": "Add first reasoning step" }
-
-# Auto-execute the suggestion
-think(action="auto", session_id="abc")
-
-# Provide feedback to improve future suggestions
-think(action="feedback", session_id="abc", outcome="accepted")
-```
-
-### Verification Mode
-
-```python
-think(action="start", mode="verify",
-      answer="Einstein published special relativity in 1905.",
-      context="Albert Einstein published his theory of special relativity in 1905...")
-
-think(action="verify", session_id="v123",
-      claim="Published in 1905",
-      status="supported",
-      evidence="Context confirms 1905 publication")
-
-think(action="finish", session_id="v123")
-# → { "verified": true, "summary": { "supported": 1 } }
-```
+See **[BENCHMARKS.md](BENCHMARKS.md)** for methodology.
 
 ## Configuration
 
-### Server Settings
+### Server
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SERVER_TRANSPORT` | Transport: `stdio`, `http`, or `sse` | `stdio` |
-| `SERVER_HOST` | Bind address for http/sse | `127.0.0.1` |
-| `SERVER_PORT` | Port for http/sse | `8000` |
-| `LOG_LEVEL` | Logging level | `INFO` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SERVER_TRANSPORT` | `stdio` | `stdio`, `http`, or `sse` |
+| `SERVER_HOST` | `127.0.0.1` | Bind address |
+| `SERVER_PORT` | `8000` | Port for http/sse |
+| `LOG_LEVEL` | `INFO` | Logging level |
 
-### Model Settings
+### Limits
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `EMBEDDING_MODEL` | Sentence embedding model | `Snowflake/snowflake-arctic-embed-xs` |
-| `EMBEDDING_CACHE_DIR` | Model cache directory | `~/.cache/matrixmind-mcp/models/` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_PROBLEM_SIZE` | `50000` | Max problem text |
+| `MAX_THOUGHT_SIZE` | `10000` | Max thought text |
+| `MAX_THOUGHTS_PER_SESSION` | `1000` | Steps per session |
+| `RATE_LIMIT_MAX_SESSIONS` | `100` | New sessions per minute |
+| `MAX_TOTAL_SESSIONS` | `500` | Concurrent sessions |
 
-### Rate Limiting
+### Observability
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RATE_LIMIT_MAX_SESSIONS` | Max new sessions per window | `100` |
-| `RATE_LIMIT_WINDOW_SECONDS` | Rate limit window | `60` |
-| `MAX_TOTAL_SESSIONS` | Max concurrent sessions | `500` |
-| `SESSION_MAX_AGE_MINUTES` | Session TTL | `30` |
-
-### Input Limits (Security)
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MAX_PROBLEM_SIZE` | Max problem text size | `50000` |
-| `MAX_THOUGHT_SIZE` | Max thought text size | `10000` |
-| `MAX_CONTEXT_SIZE` | Max context text size | `100000` |
-| `MAX_ALTERNATIVES` | Max MPPA alternatives | `10` |
-| `MAX_THOUGHTS_PER_SESSION` | Max thoughts per session | `1000` |
-
-### Storage (Optional)
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `ENABLE_RAG` | Enable vector store for RAG | `false` |
-| `VECTOR_DB_PATH` | Vector DB path (or `:memory:`) | `:memory:` |
-| `MATRIXMIND_ALLOWED_DB_DIRS` | Colon-separated allowed DB directories | `~/.matrixmind:~/.local/share/matrixmind:/tmp:$CWD` |
-
-## Security
-
-MatrixMind includes several security hardening measures:
-
-- **Input validation**: Size limits on all text inputs to prevent resource exhaustion
-- **Path traversal protection**: Database paths validated against allowlist
-- **Session limits**: Per-session thought limits to prevent memory exhaustion
-- **Localhost binding**: HTTP/SSE defaults to `127.0.0.1` (not `0.0.0.0`)
-- **Generic error messages**: Session errors don't leak internal state
-- **Full UUIDs**: Cryptographically strong session identifiers
-
-For production deployments with network exposure, add authentication middleware and configure `MATRIXMIND_ALLOWED_DB_DIRS` appropriately.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REASONGUARD_METRICS_ENABLED` | `false` | Enable SQLite metrics |
+| `REASONGUARD_METRICS_DB` | `:memory:` | Metrics database path |
+| `REASONGUARD_METRICS_RETENTION_HOURS` | `24` | Data retention |
+| `REASONGUARD_METRICS_ROTATION_MB` | `100` | Rotate DB when exceeds size |
+| `REASONGUARD_METRICS_ROTATION_KEEP` | `3` | Archives to keep |
 
 ## Development
 
 ```bash
-# Clone and install
-git clone https://github.com/coderdayton/matrixmind-mcp.git
-cd matrixmind-mcp
+git clone https://github.com/coderdayton/reason-guard-mcp.git
+cd reason-guard-mcp
 uv sync --dev
 
-# Run tests
-make test          # All tests
-make test-smoke    # Quick validation
-make lint          # Linting
-
-# Run locally
-python -m src.server
+make test       # All tests (698)
+make test-smoke # Quick validation
+make lint       # Linting
 ```
-
-<details>
-<summary><strong>Docker</strong></summary>
-
-```bash
-docker build -t matrixmind-mcp .
-docker run -p 8000:8000 -e SERVER_TRANSPORT=http matrixmind-mcp
-
-# Or with docker-compose
-docker compose up -d
-```
-</details>
 
 ## Research
 
-This implementation synthesizes techniques from:
-
+Based on:
 - [Chain of Thought Empowers Transformers](https://arxiv.org/abs/2402.12875) (ICLR 2024)
-- [Let Me Think! Long Chain-of-Thought](https://arxiv.org/abs/2505.21825) (2025)
-- [Matrix of Thought: Re-evaluating Complex Reasoning](https://arxiv.org/abs/2509.03918) (2025)
-- [Prompt Compression with Context-Aware Sentence Encoding](https://arxiv.org/abs/2409.01227) (AAAI 2025)
-- [Multi-Path Plan Aggregation (MPPA)](https://arxiv.org/abs/2510.11620) (2025)
-- [Forward-Backward Reasoning (FOBAR)](https://arxiv.org/abs/2308.07758) (ACL 2024)
+- [Matrix of Thought](https://arxiv.org/abs/2509.03918) (2025)
+- [Prompt Compression with Context-Aware Encoding](https://arxiv.org/abs/2409.01227) (AAAI 2025)
 
 ## License
 
@@ -330,4 +273,4 @@ MIT — see [LICENSE](LICENSE)
 
 ---
 
-**[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)** · **[Issues](https://github.com/coderdayton/matrixmind-mcp/issues)** · Built with [FastMCP](https://gofastmcp.com)
+**[Contributing](CONTRIBUTING.md)** · **[Security](SECURITY.md)** · **[Changelog](CHANGELOG.md)**
