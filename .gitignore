@@ -84,3 +84,15 @@ temp/
 matrixmind_thoughts.db
 matrixmind_thoughts.db-shm
 matrixmind_thoughts.db-wal
+
+# Development/profiling files
+profile_kg.py
+ATOMIC_ROUTER_PLAN.md
+
+# Benchmark results (generated)
+benchmark_results.json
+gsm8k_results.json
+*_results.json
+
+# OpenCode local config
+.opencode/
