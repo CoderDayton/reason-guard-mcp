@@ -17,6 +17,10 @@ jobs:
   codeql:
     name: CodeQL Analysis
     runs-on: ubuntu-latest
+    # CodeQL requires "Code scanning" to be enabled in repo settings.
+    # This job will fail until enabled at:
+    # https://github.com/${{ github.repository }}/settings/security_analysis
+    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -79,8 +83,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install 3.12 && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen
@@ -131,16 +140,21 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install 3.12
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install 3.12 && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install bandit
-        run: uv pip install bandit[sarif]
+        run: uv tool install bandit
 
       - name: Run bandit scan
         run: |
-          uv run bandit -r src/ -f sarif -o bandit-results.sarif --severity-level medium || true
-          uv run bandit -r src/ -f json -o bandit-results.json --severity-level medium || true
+          uvx bandit -r src/ -c pyproject.toml -f sarif -o bandit-results.sarif --severity-level medium || true
+          uvx bandit -r src/ -c pyproject.toml -f json -o bandit-results.json --severity-level medium || true
 
           # Generate summary
           echo "## Bandit Security Scan Results" >> $GITHUB_STEP_SUMMARY
