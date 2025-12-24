@@ -29,6 +29,7 @@ dependencies = [
     "tenacity>=9.1.2",
     "numpy>=2.4.0",
     "pyyaml>=6.0.3",
+    "orjson>=3.9.15",
     "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
 

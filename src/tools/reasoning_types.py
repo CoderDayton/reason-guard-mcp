@@ -79,7 +79,7 @@ class ResponseVerbosity(str, Enum):
 # =============================================================================
 
 
-@dataclass
+@dataclass(slots=True)
 class Thought:
     """A single thought/step in the reasoning process."""
 
@@ -124,7 +124,7 @@ class Thought:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class BlindSpot:
     """A detected gap or blind spot in reasoning."""
 
@@ -148,7 +148,7 @@ class BlindSpot:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class RewardSignal:
     """RLVR-style reward signal for learning."""
 
@@ -159,7 +159,7 @@ class RewardSignal:
     timestamp: datetime = field(default_factory=datetime.now)
 
 
-@dataclass
+@dataclass(slots=True)
 class SuggestionRecord:
     """Record of a suggestion made and its outcome.
 
@@ -177,7 +177,7 @@ class SuggestionRecord:
     actual_action: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class SuggestionWeights:
     """Learned weights for suggestion prioritization.
 
@@ -241,7 +241,7 @@ class SuggestionWeights:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class ReasoningSession:
     """State of a unified reasoning session."""
 
@@ -362,7 +362,7 @@ class ReasoningSession:
         return result
 
 
-@dataclass
+@dataclass(slots=True)
 class SessionAnalytics:
     """Consolidated analysis metrics for a reasoning session.
 

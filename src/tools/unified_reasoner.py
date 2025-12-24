@@ -26,6 +26,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import datetime, timedelta
@@ -89,82 +90,68 @@ __all__ = [
 # Planning Step Detection (from MPPA)
 # =============================================================================
 
-PLANNING_INDICATORS: tuple[str, ...] = (
-    "let me",
-    "let's",
-    "i'll",
-    "i will",
-    "i should",
-    "i need to",
-    "first,",
-    "wait,",
-    "alternatively",
-    "maybe",
-    "perhaps",
-    "one approach",
-    "another way",
-    "we could",
-    "we can",
-    "the strategy",
-    "my plan",
-    "to solve this",
-    "i think",
-    "considering",
+# Precompiled regex for planning detection (LATENCY: avoids lower() on full text)
+_PLANNING_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"let me|let's|i'll|i will|i should|i need to|"
+    r"first,|wait,|alternatively|maybe|perhaps|"
+    r"one approach|another way|we could|we can|"
+    r"the strategy|my plan|to solve this|i think|considering"
+    r")",
+    re.IGNORECASE,
 )
 
 
 def is_planning_step(thought: str) -> bool:
     """Detect if a thought is a planning step (decision point)."""
-    thought_lower = thought.lower().strip()
-    return any(thought_lower.startswith(indicator) for indicator in PLANNING_INDICATORS)
+    return bool(_PLANNING_PATTERN.match(thought))
 
 
 # =============================================================================
 # Domain Detection
 # =============================================================================
 
-DOMAIN_PATTERNS: dict[DomainType, list[str]] = {
+DOMAIN_PATTERNS: dict[DomainType, list[re.Pattern[str]]] = {
     DomainType.MATH: [
-        r"\d+\s*[\+\-\*\/\=]\s*\d+",
-        r"equation|formula|calculate|solve|sum|product|integral|derivative",
-        r"percent|ratio|fraction|proportion|average|mean|median",
-        r"x\s*=|y\s*=|n\s*=",
-        r"triangle|circle|square|rectangle|angle|area|volume",
+        re.compile(r"\d+\s*[\+\-\*\/\=]\s*\d+", re.IGNORECASE),
+        re.compile(
+            r"equation|formula|calculate|solve|sum|product|integral|derivative", re.IGNORECASE
+        ),
+        re.compile(r"percent|ratio|fraction|proportion|average|mean|median", re.IGNORECASE),
+        re.compile(r"x\s*=|y\s*=|n\s*=", re.IGNORECASE),
+        re.compile(r"triangle|circle|square|rectangle|angle|area|volume", re.IGNORECASE),
     ],
     DomainType.CODE: [
-        r"function|def |class |import |from .* import",
-        r"if\s*\(|for\s*\(|while\s*\(|return ",
-        r"print\(|console\.log|System\.out",
-        r"\.py|\.js|\.java|\.cpp|\.rs",
-        r"algorithm|complexity|O\(n\)|runtime|memory",
-        r"bug|error|exception|debug|compile",
+        re.compile(r"function|def |class |import |from .* import", re.IGNORECASE),
+        re.compile(r"if\s*\(|for\s*\(|while\s*\(|return ", re.IGNORECASE),
+        re.compile(r"print\(|console\.log|System\.out", re.IGNORECASE),
+        re.compile(r"\.py|\.js|\.java|\.cpp|\.rs", re.IGNORECASE),
+        re.compile(r"algorithm|complexity|O\(n\)|runtime|memory", re.IGNORECASE),
+        re.compile(r"bug|error|exception|debug|compile", re.IGNORECASE),
     ],
     DomainType.LOGIC: [
-        r"\ball\b.*\bare\b|\bsome\b.*\bare\b",
-        r"\bif\b.*\bthen\b|\bonly if\b",
-        r"\bnot\b.*\band\b|\bor\b.*\bnot\b",
-        r"\bmust\b|\bcannot\b|\bimpossible\b",
-        r"contradict|paradox|dilemma|syllogism|premise|conclusion",
-        r"valid|invalid|sound|unsound|fallacy",
+        re.compile(r"\ball\b.*\bare\b|\bsome\b.*\bare\b", re.IGNORECASE),
+        re.compile(r"\bif\b.*\bthen\b|\bonly if\b", re.IGNORECASE),
+        re.compile(r"\bnot\b.*\band\b|\bor\b.*\bnot\b", re.IGNORECASE),
+        re.compile(r"\bmust\b|\bcannot\b|\bimpossible\b", re.IGNORECASE),
+        re.compile(r"contradict|paradox|dilemma|syllogism|premise|conclusion", re.IGNORECASE),
+        re.compile(r"valid|invalid|sound|unsound|fallacy", re.IGNORECASE),
     ],
     DomainType.FACTUAL: [
-        r"who is|what is|when did|where is|how many",
-        r"according to|based on|states that|mentions that",
-        r"true or false|fact check|verify",
+        re.compile(r"who is|what is|when did|where is|how many", re.IGNORECASE),
+        re.compile(r"according to|based on|states that|mentions that", re.IGNORECASE),
+        re.compile(r"true or false|fact check|verify", re.IGNORECASE),
     ],
 }
 
 
 def detect_domain(text: str) -> DomainType:
     """Detect the problem domain from text."""
-    import re
-
-    text_lower = text.lower()
     scores: dict[DomainType, int] = dict.fromkeys(DomainType, 0)
 
     for domain, patterns in DOMAIN_PATTERNS.items():
         for pattern in patterns:
-            if re.search(pattern, text_lower):
+            if pattern.search(text):
                 scores[domain] += 1
 
     # Return domain with highest score, or GENERAL if no matches
@@ -179,76 +166,89 @@ def detect_domain(text: str) -> DomainType:
 # Blind Spot Detection & Speculative Criticism
 # =============================================================================
 
-BLIND_SPOT_PATTERNS: list[tuple[str, str, str]] = [
+# Precompiled regex patterns for blind spot detection (LATENCY: avoids re.compile on every call)
+_BLIND_SPOT_PATTERNS: list[tuple[re.Pattern[str], str, str]] = [
     # (pattern, description, suggested_action)
     # --- Original blind spot patterns ---
     (
-        r"assume|assuming|assumption",
+        re.compile(r"assume|assuming|assumption", re.IGNORECASE),
         "Unstated assumption detected",
-        "Explicitly state and validate the assumption",
+        "Explicitly state and validate assumption",
     ),
     (
-        r"probably|likely|maybe|perhaps|might",
+        re.compile(r"probably|likely|maybe|perhaps|might", re.IGNORECASE),
         "Uncertain claim without confidence quantification",
         "Provide confidence level or supporting evidence",
     ),
     (
-        r"etc\.?|and so on|and others",
+        re.compile(r"etc\.?|and so on|and others", re.IGNORECASE),
         "Incomplete enumeration",
         "List all relevant items or explain why truncated",
     ),
     (
-        r"obviously|clearly|of course|everyone knows",
+        re.compile(r"obviously|clearly|of course|everyone knows", re.IGNORECASE),
         "Unsupported assertion",
-        "Provide reasoning or evidence for the claim",
+        "Provide reasoning or evidence for claim",
     ),
     (
-        r"always|never|all|none",
+        re.compile(r"always|never|all|none", re.IGNORECASE),
         "Absolute claim that may have exceptions",
         "Consider edge cases or counterexamples",
     ),
     (
-        r"but|however|although|despite",
+        re.compile(r"but|however|although|despite", re.IGNORECASE),
         "Potential contradiction or tension",
-        "Resolve the apparent conflict or explain the nuance",
+        "Resolve apparent conflict or explain nuance",
     ),
     # --- Speculative Criticism: Logical Fallacies (zero-latency quality boost) ---
     (
-        r"because .+ therefore|since .+ thus|if .+ then .+ so",
+        re.compile(r"because .+ therefore|since .+ thus|if .+ then .+ so", re.IGNORECASE),
         "Circular reasoning detected",
-        "Break the circular dependency - find independent evidence",
+        "Break circular dependency - find independent evidence",
     ),
     (
-        r"(experts?|scientists?|studies?) (say|show|prove|believe)",
+        re.compile(r"(experts?|scientists?|studies?) (say|show|prove|believe)", re.IGNORECASE),
         "Appeal to authority without citation",
-        "Name the specific source or provide the evidence directly",
+        "Name the specific source or provide evidence directly",
     ),
     (
-        r"(this|that|it) (proves|shows|means|implies) (that )?(\w+ ){0,3}(true|correct|right|wrong|false)",
+        re.compile(
+            r"(this|that|it) (proves|shows|means|implies) (that )?(\w+ ){0,3}(true|correct|right|wrong|false)",
+            re.IGNORECASE,
+        ),
         "Hasty conclusion from limited evidence",
         "State what evidence is still needed before concluding",
     ),
     (
-        r"(first|1\.|step 1).{0,50}(therefore|thus|so|hence) .{0,50}(answer|result|solution)",
+        re.compile(
+            r"(first|1\.|step 1).{0,50}(therefore|thus|so|hence) .{0,50}(answer|result|solution)",
+            re.IGNORECASE,
+        ),
         "Skipped reasoning steps",
         "Show intermediate steps between premise and conclusion",
     ),
     (
-        r"(only|just|simply|merely) (need|have|require|must)",
+        re.compile(r"(only|just|simply|merely) (need|have|require|must)", re.IGNORECASE),
         "Oversimplification detected",
         "Identify complications or prerequisites being glossed over",
     ),
     (
-        r"(same|similar|like|analogous).{0,30}(therefore|so|thus|hence)",
+        re.compile(r"(same|similar|like|analogous).{0,30}(therefore|so|thus|hence)", re.IGNORECASE),
         "Weak analogy as primary evidence",
-        "Explain why the analogy holds or provide direct evidence",
+        "Explain why analogy holds or provide direct evidence",
     ),
     (
-        r"(no|without|lacking) (evidence|proof|data|support).{0,20}(therefore|so|means)",
+        re.compile(
+            r"(no|without|lacking) (evidence|proof|data|support).{0,20}(therefore|so|means)",
+            re.IGNORECASE,
+        ),
         "Argument from ignorance",
         "Absence of evidence is not evidence - seek positive confirmation",
     ),
 ]
+
+# Backwards compatibility alias
+BLIND_SPOT_PATTERNS: list[tuple[re.Pattern[str], str, str]] = _BLIND_SPOT_PATTERNS
 
 
 def detect_blind_spots(
@@ -257,13 +257,11 @@ def detect_blind_spots(
     step_number: int,
 ) -> list[BlindSpot]:
     """Detect potential blind spots in reasoning."""
-    import re
-
     blind_spots: list[BlindSpot] = []
     thought_lower = thought.lower()
 
     for pattern, description, action in BLIND_SPOT_PATTERNS:
-        if re.search(pattern, thought_lower):
+        if pattern.search(thought_lower):
             # Check if this blind spot type was already detected
             already_exists = any(
                 bs.description == description and not bs.addressed for bs in existing_blind_spots
@@ -1102,7 +1100,7 @@ class UnifiedReasonerManager(AsyncSessionManager[ReasoningSession]):
                     supporting = kg.get_supporting_facts(content)
                     if supporting:
                         kg_info["supporting_facts"] = [
-                            f"{r.subject.name} {r.predicate.value if hasattr(r.predicate, 'value') else r.predicate} {r.object_entity.name}"
+                            f"{r.subject.name} {r.predicate_value} {r.object_entity.name}"
                             for r in supporting[:3]
                         ]
 
@@ -1120,7 +1118,7 @@ class UnifiedReasonerManager(AsyncSessionManager[ReasoningSession]):
                             )
 
                             conflict_entry = {
-                                "existing": f"{existing_rel.subject.name} {existing_rel.predicate.value if hasattr(existing_rel.predicate, 'value') else existing_rel.predicate} {existing_rel.object_entity.name}",
+                                "existing": f"{existing_rel.subject.name} {existing_rel.predicate_value} {existing_rel.object_entity.name}",
                                 "reason": reason,
                                 "resolution": resolution,
                             }

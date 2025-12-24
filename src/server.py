@@ -18,7 +18,6 @@ Or: python -m src.server
 
 import asyncio
 import hashlib
-import json
 import os
 import secrets
 import time
@@ -28,6 +27,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from functools import partial, wraps
 from typing import Any, Literal, TypeVar
+
+import orjson
 
 # Note: uvloop is installed automatically when importing src.utils.session
 # (via AsyncSessionManager -> unified_reasoner imports)
@@ -84,6 +85,18 @@ def _get_env_int(key: str, default: int) -> int:
         except ValueError:
             logger.warning(f"Invalid integer for {key}: {value}, using default {default}")
     return default
+
+
+def _json(data: dict[str, Any] | None, *, indent: bool = True) -> str:
+    """Serialize data to JSON string with proper typing.
+
+    Type-safe wrapper around orjson.dumps that returns str.
+    """
+    if data is None:
+        data = {}
+    opts = orjson.OPT_INDENT_2 if indent else 0
+    result: bytes = orjson.dumps(data, option=opts, default=str)
+    return result.decode("utf-8")
 
 
 # =============================================================================
@@ -294,7 +307,7 @@ def require_auth(func: F) -> F:
 
         is_valid, error = validate_api_key(api_key)
         if not is_valid:
-            return json.dumps({"error": "authentication_required", "message": error})
+            return _json({"error": "authentication_required", "message": error}, indent=False)
 
         return await func(*args, **kwargs)
 
@@ -1032,7 +1045,7 @@ async def think(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         # Validate input sizes (CWE-400 prevention)
         validation_error = _validate_input_sizes(
@@ -1042,7 +1055,7 @@ async def think(
             alternatives=alternatives,
         )
         if validation_error:
-            return json.dumps(validation_error)
+            return _json(validation_error, indent=False)
 
         manager = get_unified_manager()
 
@@ -1152,14 +1165,14 @@ async def think(
                 ctx=ctx,
             )
         else:
-            return json.dumps({"error": f"Unknown action: {action}"})
+            return _json({"error": f"Unknown action: {action}"}, indent=False)
 
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return _json({"error": str(e)}, indent=False)
     except Exception as e:
         error = ToolExecutionError("think", str(e), {"action": action})
         logger.error(f"Think action '{action}' failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 async def _think_start(
@@ -1174,7 +1187,7 @@ async def _think_start(
 ) -> str:
     """Handle think start action."""
     if not problem:
-        return json.dumps({"error": "problem is required for start action"})
+        return _json({"error": "problem is required for start action"}, indent=False)
 
     # Check rate limit
     rate_limiter = get_rate_limiter()
@@ -1182,7 +1195,7 @@ async def _think_start(
     if not allowed:
         if ctx:
             await ctx.warning(f"Rate limit exceeded: {info['message']}")
-        return json.dumps(info)
+        return _json(info, indent=False)
 
     # Check total session count (eventual consistency is fine for this check)
     total_sessions = len(manager.get_all_sessions_snapshot())
@@ -1198,7 +1211,7 @@ async def _think_start(
         }
         if ctx:
             await ctx.warning(f"Max sessions exceeded: {total_sessions}/{MAX_TOTAL_SESSIONS}")
-        return json.dumps(error_info)
+        return _json(error_info, indent=False)
 
     # Record the request for rate limiting
     await rate_limiter.record_request()
@@ -1214,7 +1227,7 @@ async def _think_start(
             try:
                 reasoning_mode = ReasoningMode(mode)
             except ValueError:
-                return json.dumps({"error": f"Unknown mode: {mode}"})
+                return _json({"error": f"Unknown mode: {mode}"}, indent=False)
 
     # Start session with observability
     store = get_metrics_store()
@@ -1254,7 +1267,7 @@ async def _think_start(
             f"Started session {result['session_id']} (mode={actual_mode}, domain={domain})"
         )
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_continue(
@@ -1271,9 +1284,9 @@ async def _think_continue(
 ) -> str:
     """Handle think continue action."""
     if not session_id:
-        return json.dumps({"error": "session_id is required for continue action"})
+        return _json({"error": "session_id is required for continue action"}, indent=False)
     if not thought:
-        return json.dumps({"error": "thought is required for continue action"})
+        return _json({"error": "thought is required for continue action"}, indent=False)
 
     try:
         result = await manager.add_thought(
@@ -1288,7 +1301,7 @@ async def _think_continue(
             verbosity=verbosity,
         )
     except SessionNotFoundError:
-        return json.dumps({"error": "Invalid or expired session"})
+        return _json({"error": "Invalid or expired session"}, indent=False)
 
     if ctx:
         step = result.get("step", "?")
@@ -1300,7 +1313,7 @@ async def _think_continue(
             count = len(result["blind_spots"])
             await ctx.warning(f"Detected {count} blind spot(s) in this step")
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_branch(
@@ -1312,11 +1325,11 @@ async def _think_branch(
 ) -> str:
     """Handle think branch action."""
     if not session_id:
-        return json.dumps({"error": "session_id is required for branch action"})
+        return _json({"error": "session_id is required for branch action"}, indent=False)
     if not thought:
-        return json.dumps({"error": "thought is required for branch action"})
+        return _json({"error": "thought is required for branch action"}, indent=False)
     if not branch_from:
-        return json.dumps({"error": "branch_from is required for branch action"})
+        return _json({"error": "branch_from is required for branch action"}, indent=False)
 
     try:
         result = await manager.add_thought(
@@ -1326,12 +1339,12 @@ async def _think_branch(
             branch_from=branch_from,
         )
     except SessionNotFoundError:
-        return json.dumps({"error": "Invalid or expired session"})
+        return _json({"error": "Invalid or expired session"}, indent=False)
 
     if ctx:
         await ctx.info(f"Branched from thought {branch_from}")
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_revise(
@@ -1343,11 +1356,11 @@ async def _think_revise(
 ) -> str:
     """Handle think revise action."""
     if not session_id:
-        return json.dumps({"error": "session_id is required for revise action"})
+        return _json({"error": "session_id is required for revise action"}, indent=False)
     if not thought:
-        return json.dumps({"error": "thought is required for revise action"})
+        return _json({"error": "thought is required for revise action"}, indent=False)
     if not revises:
-        return json.dumps({"error": "revises is required for revise action"})
+        return _json({"error": "revises is required for revise action"}, indent=False)
 
     result = await manager.add_thought(
         session_id=session_id,
@@ -1359,7 +1372,7 @@ async def _think_revise(
     if ctx:
         await ctx.info(f"Revised thought {revises}")
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_synthesize(
@@ -1372,11 +1385,11 @@ async def _think_synthesize(
 ) -> str:
     """Handle think synthesize action (matrix/hybrid only)."""
     if not session_id:
-        return json.dumps({"error": "session_id is required for synthesize action"})
+        return _json({"error": "session_id is required for synthesize action"}, indent=False)
     if col is None:
-        return json.dumps({"error": "col is required for synthesize action"})
+        return _json({"error": "col is required for synthesize action"}, indent=False)
     if not thought:
-        return json.dumps({"error": "thought is required for synthesize action"})
+        return _json({"error": "thought is required for synthesize action"}, indent=False)
 
     result = await manager.synthesize(
         session_id=session_id,
@@ -1388,7 +1401,7 @@ async def _think_synthesize(
     if ctx:
         await ctx.info(f"Synthesized column {col}")
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_verify(
@@ -1403,9 +1416,9 @@ async def _think_verify(
     In the unified reasoner, verify is treated as a verification thought type.
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for verify action"})
+        return _json({"error": "session_id is required for verify action"}, indent=False)
     if not thought:
-        return json.dumps({"error": "thought/evidence is required for verify action"})
+        return _json({"error": "thought/evidence is required for verify action"}, indent=False)
 
     result = await manager.add_thought(
         session_id=session_id,
@@ -1418,7 +1431,7 @@ async def _think_verify(
         step = result.get("step", "?")
         await ctx.info(f"Added verification step {step}")
 
-    return json.dumps(result, indent=2)
+    return _json(result)
 
 
 async def _think_finish(
@@ -1430,7 +1443,7 @@ async def _think_finish(
 ) -> str:
     """Handle think finish action."""
     if not session_id:
-        return json.dumps({"error": "session_id is required for finish action"})
+        return _json({"error": "session_id is required for finish action"}, indent=False)
 
     store = get_metrics_store()
     with store.trace("think_finish", session_id=session_id) as span:
@@ -1462,7 +1475,7 @@ async def _think_finish(
             count = len(result["unaddressed_blind_spots"])
             await ctx.warning(f"Warning: {count} blind spot(s) were not addressed")
 
-    return json.dumps(result, indent=2, default=str)
+    return _json(result)
 
 
 async def _think_resolve(
@@ -1484,18 +1497,19 @@ async def _think_resolve(
 
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for resolve action"})
+        return _json({"error": "session_id is required for resolve action"}, indent=False)
 
     if not resolve_strategy:
-        return json.dumps(
+        return _json(
             {
                 "error": "resolve_strategy is required for resolve action",
                 "valid_strategies": ["revise", "branch", "reconcile", "backtrack"],
-            }
+            },
+            indent=False,
         )
 
     if not thought:
-        return json.dumps({"error": "thought is required for resolve action"})
+        return _json({"error": "thought is required for resolve action"}, indent=False)
 
     result = await manager.resolve_contradiction(
         session_id=session_id,
@@ -1513,7 +1527,7 @@ async def _think_resolve(
             count = result["remaining_contradictions"]
             await ctx.warning(f"Note: {count} contradiction(s) still remain in the session")
 
-    return json.dumps(result, indent=2, default=str)
+    return _json(result)
 
 
 async def _think_analyze(
@@ -1527,12 +1541,12 @@ async def _think_analyze(
     without duplicating raw session data from status/get_status.
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for analyze action"})
+        return _json({"error": "session_id is required for analyze action"}, indent=False)
 
     try:
         analytics = await manager.analyze_session(session_id)
     except SessionNotFoundError:
-        return json.dumps({"error": "Invalid or expired session"})
+        return _json({"error": "Invalid or expired session"}, indent=False)
 
     result = analytics.to_dict()
 
@@ -1558,7 +1572,7 @@ async def _think_analyze(
         if result["recommendations"]:
             await ctx.info(f"Top recommendation: {result['recommendations'][0]}")
 
-    return json.dumps(result, indent=2, default=str)
+    return _json(result)
 
 
 async def _think_suggest(
@@ -1572,12 +1586,12 @@ async def _think_suggest(
     with parameters and reasoning, reducing LLM cognitive load.
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for suggest action"})
+        return _json({"error": "session_id is required for suggest action"}, indent=False)
 
     try:
         suggestion = await manager.suggest_next_action(session_id)
     except SessionNotFoundError:
-        return json.dumps({"error": "Invalid or expired session"})
+        return _json({"error": "Invalid or expired session"}, indent=False)
 
     if ctx:
         action = suggestion["suggested_action"]
@@ -1597,7 +1611,7 @@ async def _think_suggest(
             alt_actions = ", ".join(a["action"] for a in suggestion["alternatives"])
             await ctx.info(f"Alternatives: {alt_actions}")
 
-    return json.dumps(suggestion, indent=2, default=str)
+    return _json(suggestion)
 
 
 async def _think_feedback(
@@ -1615,13 +1629,13 @@ async def _think_feedback(
     for future recommendations.
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for feedback action"})
+        return _json({"error": "session_id is required for feedback action"}, indent=False)
 
     if not suggestion_id:
-        return json.dumps({"error": "suggestion_id is required for feedback action"})
+        return _json({"error": "suggestion_id is required for feedback action"}, indent=False)
 
     if not suggestion_outcome:
-        return json.dumps({"error": "suggestion_outcome is required for feedback action"})
+        return _json({"error": "suggestion_outcome is required for feedback action"}, indent=False)
 
     # Map string outcome to the expected type
     outcome: Literal["accepted", "rejected"] = suggestion_outcome
@@ -1644,7 +1658,7 @@ async def _think_feedback(
         else:
             await ctx.warning(f"Failed to record feedback: {result.get('error')}")
 
-    return json.dumps(result, indent=2, default=str)
+    return _json(result)
 
 
 async def _think_auto(
@@ -1665,13 +1679,13 @@ async def _think_auto(
     with a thought_generator callback.
     """
     if not session_id:
-        return json.dumps({"error": "session_id is required for auto action"})
+        return _json({"error": "session_id is required for auto action"}, indent=False)
 
     if max_auto_steps < 1:
-        return json.dumps({"error": "max_auto_steps must be at least 1"})
+        return _json({"error": "max_auto_steps must be at least 1"}, indent=False)
 
     if max_auto_steps > 20:
-        return json.dumps({"error": "max_auto_steps cannot exceed 20"})
+        return _json({"error": "max_auto_steps cannot exceed 20"}, indent=False)
 
     # Execute auto steps
     try:
@@ -1682,7 +1696,7 @@ async def _think_auto(
             thought_generator=None,  # No LLM integration at server level
         )
     except SessionNotFoundError:
-        return json.dumps({"error": "Invalid or expired session"})
+        return _json({"error": "Invalid or expired session"}, indent=False)
 
     if ctx:
         actions_executed = result.get("actions_executed", [])
@@ -1719,7 +1733,7 @@ async def _think_auto(
             total_thoughts = session_state.get("total_thoughts", 0)
             await ctx.info(f"Progress: {progress:.0%} ({total_thoughts} thoughts)")
 
-    return json.dumps(result, indent=2, default=str)
+    return _json(result)
 
 
 # =============================================================================
@@ -1752,10 +1766,10 @@ async def compress(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         if not query:
-            return json.dumps({"error": "query is required for compression"})
+            return _json({"error": "query is required for compression"}, indent=False)
 
         if ctx:
             await ctx.info(f"Compressing {len(context)} characters...")
@@ -1781,7 +1795,7 @@ async def compress(
             )
 
         # Convert result to dict for JSON serialization
-        return json.dumps(
+        return _json(
             {
                 "compressed": result.compressed_context,
                 "original_tokens": result.original_tokens,
@@ -1795,22 +1809,21 @@ async def compress(
                 / len(result.relevance_scores)
                 if result.relevance_scores
                 else 0.0,
-            },
-            indent=2,
+            }
         )
 
     except ModelNotReadyException as e:
         error = ToolExecutionError("compress", str(e), {"retry_after_seconds": 30})
         logger.warning(f"Model not ready: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
     except ReasonGuardException as e:
         error = ToolExecutionError("compress", str(e))
         logger.error(f"Compression failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
     except Exception as e:
         error = ToolExecutionError("compress", str(e), {"type": type(e).__name__})
         logger.error(f"Unexpected error: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 # =============================================================================
@@ -1839,9 +1852,9 @@ async def status(
         if session_id:
             try:
                 result = await manager.get_status(session_id)
-                return json.dumps(result, indent=2, default=str)
+                return _json(result)
             except SessionNotFoundError:
-                return json.dumps({"error": f"Session not found: {session_id}"})
+                return _json({"error": f"Session not found: {session_id}"}, indent=False)
 
         # Otherwise return server status
         model_manager = ModelManager.get_instance()
@@ -1915,12 +1928,12 @@ async def status(
             state = model_status.get("state", "unknown")
             await ctx.info(f"Server ready, model state: {state}")
 
-        return json.dumps(status_result, indent=2)
+        return _json(status_result)
 
     except Exception as e:
         error = ToolExecutionError("status", str(e))
         logger.error(f"Status check failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 # =============================================================================
@@ -2139,7 +2152,7 @@ async def paradigm_hint(
     """
     try:
         if not problem or not problem.strip():
-            return json.dumps({"error": "problem is required"})
+            return _json({"error": "problem is required"}, indent=False)
 
         result = _analyze_problem_for_paradigm(problem)
 
@@ -2173,12 +2186,12 @@ async def paradigm_hint(
             conf = result["confidence"]
             await ctx.info(f"Paradigm hint: {rec} (confidence={conf:.0%})")
 
-        return json.dumps(result, indent=2)
+        return _json(result)
 
     except Exception as e:
         error = ToolExecutionError("paradigm_hint", str(e))
         logger.error(f"Paradigm hint failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 # =============================================================================
@@ -2243,12 +2256,12 @@ async def initialize_reasoning(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         # Validate input size
         validation_error = _validate_input_sizes(problem=problem)
         if validation_error:
-            return json.dumps(validation_error)
+            return _json(validation_error, indent=False)
 
         store = get_metrics_store()
         with store.trace("initialize_reasoning") as span:
@@ -2274,12 +2287,12 @@ async def initialize_reasoning(
             if "TRAP WARNING" in result.guidance:
                 await ctx.warning("Reasoning trap detected - see guidance")
 
-        return json.dumps(result.model_dump(), indent=2)
+        return _json(result.model_dump())
 
     except Exception as e:
         error = ToolExecutionError("initialize_reasoning", str(e))
         logger.error(f"Initialize reasoning failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 @mcp.tool
@@ -2332,12 +2345,12 @@ async def submit_step(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         # Validate input size
         validation_error = _validate_input_sizes(thought=content)
         if validation_error:
-            return json.dumps(validation_error)
+            return _json(validation_error, indent=False)
 
         result = router_submit_step(
             session_id=session_id,
@@ -2370,12 +2383,12 @@ async def submit_step(
             elif result.synthesis_blockers:
                 await ctx.info(f"Synthesis blockers: {', '.join(result.synthesis_blockers)}")
 
-        return json.dumps(result.model_dump(), indent=2)
+        return _json(result.model_dump())
 
     except Exception as e:
         error = ToolExecutionError("submit_step", str(e))
         logger.error(f"Submit step failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 @mcp.tool
@@ -2414,7 +2427,7 @@ async def create_branch(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         result = router_create_branch(session_id=session_id, alternatives=alternatives)
 
@@ -2424,12 +2437,12 @@ async def create_branch(
             else:
                 await ctx.warning(f"Branch creation failed: {result.guidance}")
 
-        return json.dumps(result.model_dump(), indent=2)
+        return _json(result.model_dump())
 
     except Exception as e:
         error = ToolExecutionError("create_branch", str(e))
         logger.error(f"Create branch failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 @mcp.tool
@@ -2470,7 +2483,7 @@ async def verify_claims(
         # V-003: Check IP-based rate limit
         ip_allowed, ip_error = await check_ip_rate_limit()
         if not ip_allowed:
-            return json.dumps(ip_error)
+            return _json(ip_error, indent=False)
 
         result = router_verify_claims(session_id=session_id, claims=claims, evidence=evidence)
 
@@ -2484,12 +2497,12 @@ async def verify_claims(
             if result.can_synthesize:
                 await ctx.info("All checks passed - ready for synthesis")
 
-        return json.dumps(result.model_dump(), indent=2)
+        return _json(result.model_dump())
 
     except Exception as e:
         error = ToolExecutionError("verify_claims", str(e))
         logger.error(f"Verify claims failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 @mcp.tool
@@ -2510,12 +2523,14 @@ async def router_status(
         if session_id:
             state = router_get_session_state(session_id)
             if state is None:
-                return json.dumps({"error": f"Session '{session_id}' not found or expired"})
-            return json.dumps(state, indent=2)
+                return _json(
+                    {"error": f"Session '{session_id}' not found or expired"}, indent=False
+                )
+            return _json(state)
 
         # Return global router stats
         stats = get_router_stats()
-        return json.dumps(
+        return _json(
             {
                 "router": {
                     "name": "Atomic Reasoning Router",
@@ -2535,14 +2550,13 @@ async def router_status(
                     ],
                 },
                 "sessions": stats,
-            },
-            indent=2,
+            }
         )
 
     except Exception as e:
         error = ToolExecutionError("router_status", str(e))
         logger.error(f"Router status failed: {e}")
-        return json.dumps(error.to_dict())
+        return _json(error.to_dict(), indent=False)
 
 
 # =============================================================================
