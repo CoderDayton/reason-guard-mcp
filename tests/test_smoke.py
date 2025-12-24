@@ -315,9 +315,9 @@ class TestMCPToolsRegistration:
 
         action_schema = props["action"]
         # Should have enum values from the Literal type
-        assert (
-            "enum" in action_schema or "anyOf" in action_schema
-        ), f"think 'action' param not properly resolved: {action_schema}"
+        assert "enum" in action_schema or "anyOf" in action_schema, (
+            f"think 'action' param not properly resolved: {action_schema}"
+        )
 
     def test_tool_functions_callable(self) -> None:
         """Verify all tool functions are callable (not broken by decoration)."""
@@ -528,9 +528,9 @@ class TestAtomicRouterTools:
         )
         data = json.loads(result)
 
-        assert (
-            "error" in data or data.get("status") == "REJECTED"
-        ), f"Expected error for invalid session: {data}"
+        assert "error" in data or data.get("status") == "REJECTED", (
+            f"Expected error for invalid session: {data}"
+        )
 
     async def test_submit_step_valid_workflow(self) -> None:
         """Test submit_step accepts valid step in active session."""
@@ -576,9 +576,9 @@ class TestAtomicRouterTools:
         data = json.loads(result)
 
         # Should return error or empty branch_ids
-        assert (
-            "error" in data.get("guidance", "") or data.get("branch_ids") == []
-        ), f"Expected error for invalid session: {data}"
+        assert "error" in data.get("guidance", "") or data.get("branch_ids") == [], (
+            f"Expected error for invalid session: {data}"
+        )
 
     async def test_verify_claims_requires_valid_session(self) -> None:
         """Test verify_claims with invalid session returns error."""
@@ -594,9 +594,9 @@ class TestAtomicRouterTools:
         data = json.loads(result)
 
         # Should return error or indicate invalid session
-        assert (
-            "error" in str(data).lower() or data.get("verified") == []
-        ), f"Expected error for invalid session: {data}"
+        assert "error" in str(data).lower() or data.get("verified") == [], (
+            f"Expected error for invalid session: {data}"
+        )
 
     async def test_router_status_no_session(self) -> None:
         """Test router_status without session returns global status."""
@@ -629,9 +629,9 @@ class TestAtomicRouterTools:
         status_data = json.loads(status_result)
 
         # Should have session info
-        assert (
-            "session" in status_data or "step_count" in status_data or "status" in status_data
-        ), f"Expected session info: {status_data}"
+        assert "session" in status_data or "step_count" in status_data or "status" in status_data, (
+            f"Expected session info: {status_data}"
+        )
 
     async def test_full_router_workflow(self) -> None:
         """Test complete atomic router workflow: init -> steps -> synthesis."""
