@@ -27,8 +27,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen --extra dev
@@ -51,8 +56,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen --extra dev
@@ -72,8 +82,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen --extra dev
@@ -93,8 +108,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen --extra dev
@@ -123,8 +143,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "pyproject.toml"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Build package
         run: uv build
@@ -174,8 +199,13 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+      - name: Set up Python (with retry)
+        run: |
+          for i in 1 2 3; do
+            uv python install ${{ env.PYTHON_VERSION }} && break
+            echo "Retry $i: Python install failed, waiting 10s..."
+            sleep 10
+          done
 
       - name: Install dependencies
         run: uv sync --frozen --extra dev

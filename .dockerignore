@@ -1,0 +1,92 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Development files
+Makefile
+docker-compose.yml
+.pre-commit-config.yaml
+.python-version
+codecov.yml
+profile_*.py
+
+# CI/CD
+.github/
+
+# Secrets (should never be in Docker anyway)
+secrets/
+.env
+.env.*
+!.env.example
+
+# Test files
+tests/
+conftest.py
+
+# Examples and benchmarks
+examples/
+benchmark*.json
+*_results.json
+
+# Lock files (not needed at runtime)
+uv.lock
+
+# Logs and databases
+logs/
+*.log
+*.db
+*.sqlite
+
+# Scripts
+scripts/
