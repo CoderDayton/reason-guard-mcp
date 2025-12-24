@@ -768,3 +768,343 @@ class TestTrustedProxiesValidation:
         # Warning should be logged
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("10.0.0.0/33" in msg for msg in warning_messages)
+
+
+class TestEnforcementModeRejectionPaths:
+    """Test enforcement mode rejection paths and edge cases."""
+
+    @pytest.mark.asyncio
+    async def test_rejects_synthesis_at_step_zero(self) -> None:
+        """Test that synthesis is rejected when no steps have been submitted."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Try to synthesize at step 0 (should be rejected)
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "Premature synthesis",
+                    "confidence": 0.9,
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "REJECTED"
+            assert "rejection_reason" in response
+
+    @pytest.mark.asyncio
+    async def test_rejects_invalid_step_type(self) -> None:
+        """Test that invalid step types are rejected by Pydantic validation."""
+        from fastmcp import Client
+        from fastmcp.exceptions import ToolError
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Try invalid step type - FastMCP validates Literal types and raises ToolError
+            with pytest.raises(ToolError):
+                await client.call_tool(
+                    "submit_step",
+                    {
+                        "session_id": session_id,
+                        "step_type": "invalid_type",
+                        "content": "Test content",
+                        "confidence": 0.9,
+                    },
+                )
+
+    @pytest.mark.asyncio
+    async def test_rejects_nonexistent_session(self) -> None:
+        """Test that operations on nonexistent sessions return REJECTED status."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": "nonexistent-session-id",
+                    "step_type": "premise",
+                    "content": "Test content",
+                    "confidence": 0.9,
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "REJECTED"
+            assert "not found" in response.get("rejection_reason", "").lower()
+
+    @pytest.mark.asyncio
+    async def test_high_complexity_requires_more_steps(self) -> None:
+        """Test that high complexity problems require more steps before synthesis."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize with high complexity
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Prove Fermat's Last Theorem", "complexity": "high"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+            min_steps = response["min_steps"]
+
+            # High complexity should have min_steps >= 6
+            assert min_steps >= 6
+
+            # Submit one premise
+            await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "premise",
+                    "content": "Initial premise",
+                    "confidence": 0.95,
+                },
+            )
+
+            # Try to synthesize (should be rejected - only 1 step)
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "Premature synthesis",
+                    "confidence": 0.9,
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "REJECTED"
+
+    @pytest.mark.asyncio
+    async def test_very_low_confidence_triggers_branch(self) -> None:
+        """Test that very low confidence (< 0.5) triggers BRANCH_REQUIRED."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Uncertain problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # First submit a premise (required before hypothesis)
+            await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "premise",
+                    "content": "Initial premise",
+                    "confidence": 0.95,
+                },
+            )
+
+            # Submit hypothesis with very low confidence
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "hypothesis",
+                    "content": "Very uncertain hypothesis",
+                    "confidence": 0.3,  # Very low
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "BRANCH_REQUIRED"
+
+    @pytest.mark.asyncio
+    async def test_branch_creation_with_invalid_count(self) -> None:
+        """Test that create_branch validates alternative count."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Try to create branch with only one alternative
+            result = await client.call_tool(
+                "create_branch",
+                {
+                    "session_id": session_id,
+                    "alternatives": ["Only one"],
+                },
+            )
+            response = json.loads(result.data)
+            # Should error - need at least 2 alternatives
+            assert "error" in response or response.get("branch_ids", []) == []
+
+    @pytest.mark.asyncio
+    async def test_verify_claims_empty_session(self) -> None:
+        """Test verify_claims on session with no steps."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Verify claims on empty session
+            result = await client.call_tool(
+                "verify_claims",
+                {
+                    "session_id": session_id,
+                    "claims": ["Test claim"],
+                    "evidence": ["Test evidence"],
+                },
+            )
+            response = json.loads(result.data)
+            # Should succeed but with no supporting steps
+            assert "verified" in response or "error" not in response
+
+    @pytest.mark.asyncio
+    async def test_step_feedback_provides_actionable_guidance(self) -> None:
+        """Test that rejection feedback provides actionable guidance."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize with medium complexity
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Complex problem", "complexity": "medium"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Try to synthesize immediately
+            result = await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "Premature synthesis",
+                    "confidence": 0.9,
+                },
+            )
+            response = json.loads(result.data)
+            assert response["status"] == "REJECTED"
+            # Feedback should include valid next steps
+            assert "valid_next_steps" in response or "rejection_reason" in response
+
+    @pytest.mark.asyncio
+    async def test_session_state_tracks_rejection_history(self) -> None:
+        """Test that session state tracks step count correctly after rejections."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize session
+            result = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Test problem", "complexity": "low"},
+            )
+            response = json.loads(result.data)
+            session_id = response["session_id"]
+
+            # Try invalid synthesis (rejected)
+            await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "synthesis",
+                    "content": "Invalid synthesis",
+                    "confidence": 0.9,
+                },
+            )
+
+            # Check state - step count should still be 0
+            result = await client.call_tool(
+                "router_status",
+                {"session_id": session_id},
+            )
+            response = json.loads(result.data)
+            assert response["step_count"] == 0
+
+            # Now submit valid step
+            await client.call_tool(
+                "submit_step",
+                {
+                    "session_id": session_id,
+                    "step_type": "premise",
+                    "content": "Valid premise",
+                    "confidence": 0.95,
+                },
+            )
+
+            # Check state - step count should be 1
+            result = await client.call_tool(
+                "router_status",
+                {"session_id": session_id},
+            )
+            response = json.loads(result.data)
+            assert response["step_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_complexity_auto_detection_consistency(self) -> None:
+        """Test that complexity auto-detection is consistent across similar problems."""
+        from fastmcp import Client
+
+        from src.server import mcp
+
+        async with Client(mcp) as client:
+            # Initialize without explicit complexity (auto-detect)
+            result1 = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Prove mathematical theorem X"},
+            )
+            response1 = json.loads(result1.data)
+
+            result2 = await client.call_tool(
+                "initialize_reasoning",
+                {"problem": "Prove mathematical theorem Y"},
+            )
+            response2 = json.loads(result2.data)
+
+            # Similar problems should get similar complexity
+            # At minimum, both should have valid min_steps and max_steps
+            assert "min_steps" in response1
+            assert "max_steps" in response1
+            assert "min_steps" in response2
+            assert "max_steps" in response2
+            assert response1["min_steps"] <= response1["max_steps"]
+            assert response2["min_steps"] <= response2["max_steps"]

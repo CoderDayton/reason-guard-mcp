@@ -117,3 +117,110 @@ jobs:
           name: pip-audit-results
           path: pip-audit-results.json
           retention-days: 30
+
+  bandit:
+    name: Bandit Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install bandit
+        run: uv pip install bandit[sarif]
+
+      - name: Run bandit scan
+        run: |
+          uv run bandit -r src/ -f sarif -o bandit-results.sarif --severity-level medium || true
+          uv run bandit -r src/ -f json -o bandit-results.json --severity-level medium || true
+
+          # Generate summary
+          echo "## Bandit Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f bandit-results.json ]; then
+            ISSUES=$(jq '.results | length' bandit-results.json 2>/dev/null || echo "0")
+            echo "Found **$ISSUES** potential security issues" >> $GITHUB_STEP_SUMMARY
+            if [ "$ISSUES" -gt 0 ]; then
+              echo '```json' >> $GITHUB_STEP_SUMMARY
+              jq '.results[] | {filename, line_number, issue_severity, issue_text}' bandit-results.json >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Upload bandit SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: bandit-results.sarif
+
+      - name: Upload bandit results
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: bandit-results
+          path: |
+            bandit-results.sarif
+            bandit-results.json
+          retention-days: 30
+
+  safety:
+    name: Safety Dependency Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies and safety
+        run: |
+          uv sync --frozen
+          uv pip install safety
+
+      - name: Run safety check
+        run: |
+          # Export requirements for safety scan
+          uv pip freeze > requirements-frozen.txt
+
+          # Run safety check (continue on failure to capture results)
+          uv run safety check -r requirements-frozen.txt --output json > safety-results.json 2>&1 || true
+
+          # Generate summary
+          echo "## Safety Dependency Check Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f safety-results.json ]; then
+            # Safety JSON output varies; extract vulnerability count
+            VULNS=$(jq 'if type == "array" then length else .vulnerabilities_found // 0 end' safety-results.json 2>/dev/null || echo "0")
+            echo "Found **$VULNS** vulnerable dependencies" >> $GITHUB_STEP_SUMMARY
+            if [ "$VULNS" != "0" ] && [ "$VULNS" != "null" ]; then
+              echo '```json' >> $GITHUB_STEP_SUMMARY
+              cat safety-results.json >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "Safety check completed (no JSON output)" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload safety results
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: safety-results
+          path: |
+            safety-results.json
+            requirements-frozen.txt
+          retention-days: 30
