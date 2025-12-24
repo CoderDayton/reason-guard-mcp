@@ -219,34 +219,40 @@ See **[BENCHMARKS.md](BENCHMARKS.md)** for methodology.
 
 ## Configuration
 
+Reason Guard is configured via environment variables. Below are the most common settings. For the complete reference including security, rate limiting, and observability options, see **[ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md)**.
+
 ### Server
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SERVER_TRANSPORT` | `stdio` | `stdio`, `http`, or `sse` |
-| `SERVER_HOST` | `127.0.0.1` | Bind address |
+| `SERVER_HOST` | `127.0.0.1` | Bind address (use `0.0.0.0` for Docker) |
 | `SERVER_PORT` | `8000` | Port for http/sse |
-| `LOG_LEVEL` | `INFO` | Logging level |
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+| `LOG_FORMAT` | `text` | `text` or `json` |
 
 ### Limits
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MAX_PROBLEM_SIZE` | `50000` | Max problem text |
-| `MAX_THOUGHT_SIZE` | `10000` | Max thought text |
+| `MAX_PROBLEM_SIZE` | `50000` | Max problem text length |
+| `MAX_THOUGHT_SIZE` | `10000` | Max thought text length |
 | `MAX_THOUGHTS_PER_SESSION` | `1000` | Steps per session |
-| `RATE_LIMIT_MAX_SESSIONS` | `100` | New sessions per minute |
 | `MAX_TOTAL_SESSIONS` | `500` | Concurrent sessions |
 
-### Observability
+### Embedding Model
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REASONGUARD_METRICS_ENABLED` | `false` | Enable SQLite metrics |
-| `REASONGUARD_METRICS_DB` | `:memory:` | Metrics database path |
-| `REASONGUARD_METRICS_RETENTION_HOURS` | `24` | Data retention |
-| `REASONGUARD_METRICS_ROTATION_MB` | `100` | Rotate DB when exceeds size |
-| `REASONGUARD_METRICS_ROTATION_KEEP` | `3` | Archives to keep |
+| `EMBEDDING_MODEL` | `Snowflake/snowflake-arctic-embed-xs` | HuggingFace model for compression |
+| `EMBEDDING_CACHE_DIR` | `~/.cache/reason-guard-mcp/models/` | Model cache directory |
+
+See **[ENVIRONMENT_VARIABLES.md](ENVIRONMENT_VARIABLES.md)** for:
+- Authentication & API keys
+- Rate limiting configuration
+- Metrics & observability
+- Session management
+- Security settings
 
 ## Development
 
