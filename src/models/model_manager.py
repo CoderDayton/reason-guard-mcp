@@ -170,6 +170,7 @@ class ModelManager:
     def __init__(self) -> None:
         """Initialize model manager (use get_instance() instead)."""
         self.model_name: str | None = None
+        self.revision: str | None = None
         self.cache_dir: Path = _get_default_cache_dir()
         self.state: ModelState = ModelState.NOT_STARTED
         self.model: PreTrainedModel | None = None
@@ -204,6 +205,7 @@ class ModelManager:
         model_name: str,
         cache_dir: Path | str | None = None,
         blocking: bool = True,
+        revision: str | None = None,
     ) -> None:
         """Initialize and load the embedding model.
 
@@ -215,6 +217,8 @@ class ModelManager:
             cache_dir: Custom cache directory. Defaults to EMBEDDING_CACHE_DIR env var,
                       or ~/.cache/reason-guard-mcp/models/ if not set.
             blocking: If True, wait for model to load. If False, load in background thread.
+            revision: Git revision (commit hash, tag, or branch) to pin. Defaults to
+                     EMBEDDING_MODEL_REVISION env var, or "main" if not set.
 
         Raises:
             ModelNotReadyException: If initialization fails or insufficient disk space.
@@ -227,6 +231,8 @@ class ModelManager:
                 return
 
             self.model_name = model_name
+            # Use explicit revision, or fall back to env var, or default to "main"
+            self.revision = revision or os.getenv("EMBEDDING_MODEL_REVISION", "main")
             if cache_dir:
                 self.cache_dir = Path(cache_dir)
 
@@ -272,10 +278,13 @@ class ModelManager:
             os.environ["TRANSFORMERS_CACHE"] = str(self.cache_dir)
 
             # Load tokenizer and model (will download if not cached)
+            # nosec B615: revision is user-configurable via EMBEDDING_MODEL_REVISION env var.
+            # Supply chain risk is accepted for flexibility; users can pin commit hashes.
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
                 cache_dir=self.cache_dir,
-            )
+                revision=self.revision,
+            )  # nosec B615
             logger.info("Download complete. Loading model into memory...")
 
             self.state = ModelState.LOADING
@@ -289,10 +298,12 @@ class ModelManager:
                     message="Some weights of.*were not initialized",
                     category=FutureWarning,
                 )
+                # nosec B615: revision is user-configurable via EMBEDDING_MODEL_REVISION.
                 model = AutoModel.from_pretrained(
                     self.model_name,
                     cache_dir=self.cache_dir,
-                )
+                    revision=self.revision,
+                )  # nosec B615
 
             # Move to device and set eval mode
             model.to(self.device)
