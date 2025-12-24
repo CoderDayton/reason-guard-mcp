@@ -11,30 +11,12 @@ on:
 permissions:
   contents: read
   security-events: write
-  actions: read  # Required for CodeQL/SARIF upload workflow access
+  actions: read  # Required for SARIF upload workflow access
+
+# NOTE: CodeQL is handled by GitHub's default setup (enabled in repo settings).
+# Do not add a CodeQL job here - it conflicts with the default setup.
 
 jobs:
-  codeql:
-    name: CodeQL Analysis
-    runs-on: ubuntu-latest
-    # CodeQL requires "Code scanning" to be enabled in repo settings.
-    # This job will fail until enabled at:
-    # https://github.com/${{ github.repository }}/settings/security_analysis
-    continue-on-error: true
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v4
-        with:
-          languages: python
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v4
-        with:
-          category: "/language:python"
-
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest
