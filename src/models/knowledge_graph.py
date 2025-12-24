@@ -40,6 +40,49 @@ class EntityType(str, Enum):
     OTHER = "OTHER"
 
 
+def predicate_str(predicate: RelationType | str) -> str:
+    """Convert a predicate (RelationType or str) to its string value.
+
+    Type-safe helper that handles both RelationType enums and plain strings,
+    avoiding linter errors from accessing `.value` on union types.
+
+    Args:
+        predicate: A RelationType enum or string predicate.
+
+    Returns:
+        The string value of the predicate.
+
+    Example:
+        >>> predicate_str(RelationType.DISCOVERED)
+        'discovered'
+        >>> predicate_str("custom_relation")
+        'custom_relation'
+
+    """
+    return predicate.value if isinstance(predicate, RelationType) else predicate
+
+
+def entity_type_str(entity_type: EntityType) -> str:
+    """Convert an EntityType enum to its string value.
+
+    Type-safe helper for extracting the string value from EntityType enums.
+
+    Args:
+        entity_type: An EntityType enum value.
+
+    Returns:
+        The string value of the entity type.
+
+    Example:
+        >>> entity_type_str(EntityType.PERSON)
+        'PERSON'
+        >>> entity_type_str(EntityType.ORGANIZATION)
+        'ORG'
+
+    """
+    return entity_type.value
+
+
 class RelationType(str, Enum):
     """Common relation types for knowledge graphs."""
 
@@ -74,7 +117,7 @@ class RelationType(str, Enum):
     RESULTS_IN = "results_in"
 
 
-@dataclass
+@dataclass(slots=True, eq=False)
 class Entity:
     """Represents an entity in the knowledge graph.
 
@@ -93,6 +136,18 @@ class Entity:
     properties: dict[str, Any] = field(default_factory=dict)
     mention_count: int = 1
 
+    @property
+    def type_value(self) -> str:
+        """Get the string value of the entity type.
+
+        Convenience property for consistent access to the type's string value.
+
+        Returns:
+            The string value of the entity type.
+
+        """
+        return self.entity_type.value
+
     def __hash__(self) -> int:  # noqa: D105
         return hash(self.name.lower())
 
@@ -105,14 +160,14 @@ class Entity:
         """Convert to dictionary for serialization."""
         return {
             "name": self.name,
-            "type": self.entity_type.value,
+            "type": self.type_value,
             "aliases": list(self.aliases),
             "properties": self.properties,
             "mention_count": self.mention_count,
         }
 
 
-@dataclass
+@dataclass(slots=True, eq=False)
 class Relation:
     """Represents a relation between two entities.
 
@@ -131,6 +186,18 @@ class Relation:
     confidence: float = 1.0
     evidence: str = ""
 
+    @property
+    def predicate_value(self) -> str:
+        """Get the string value of the predicate.
+
+        Convenience property that handles both RelationType enums and plain strings.
+
+        Returns:
+            The string value of the predicate.
+
+        """
+        return predicate_str(self.predicate)
+
     def __hash__(self) -> int:  # noqa: D105
         return hash((self.subject.name, str(self.predicate), self.object_entity.name))
 
@@ -138,9 +205,7 @@ class Relation:
         """Convert to dictionary for serialization."""
         return {
             "subject": self.subject.name,
-            "predicate": str(
-                self.predicate.value if isinstance(self.predicate, RelationType) else self.predicate
-            ),
+            "predicate": self.predicate_value,
             "object": self.object_entity.name,
             "confidence": round(self.confidence, 3),
             "evidence": self.evidence[:200] if self.evidence else "",
@@ -148,12 +213,7 @@ class Relation:
 
     def to_triple(self) -> tuple[str, str, str]:
         """Convert to (subject, predicate, object) triple."""
-        pred = (
-            self.predicate.value
-            if isinstance(self.predicate, RelationType)
-            else str(self.predicate)
-        )
-        return (self.subject.name, pred, self.object_entity.name)
+        return (self.subject.name, self.predicate_value, self.object_entity.name)
 
 
 @dataclass
@@ -573,23 +633,17 @@ class KnowledgeGraph:
         # Build a map of subject+predicate -> relations for functional predicates
         functional_map: dict[tuple[str, str], list[Relation]] = defaultdict(list)
         for rel in self._relations:
-            pred_str = (
-                rel.predicate.value if hasattr(rel.predicate, "value") else str(rel.predicate)
-            )
-            if pred_str in self._FUNCTIONAL_PREDICATES:
-                key = (rel.subject.name.lower(), pred_str)
+            pred = predicate_str(rel.predicate)
+            if pred in self._FUNCTIONAL_PREDICATES:
+                key = (rel.subject.name.lower(), pred)
                 functional_map[key].append(rel)
 
         # Check new_relations against existing ones
         if new_relations:
             for new_rel in new_relations:
-                pred_str = (
-                    new_rel.predicate.value
-                    if hasattr(new_rel.predicate, "value")
-                    else str(new_rel.predicate)
-                )
-                if pred_str in self._FUNCTIONAL_PREDICATES:
-                    key = (new_rel.subject.name.lower(), pred_str)
+                pred = predicate_str(new_rel.predicate)
+                if pred in self._FUNCTIONAL_PREDICATES:
+                    key = (new_rel.subject.name.lower(), pred)
                     for existing in functional_map.get(key, []):
                         # Same subject+predicate but different object = contradiction
                         if (
@@ -597,7 +651,7 @@ class KnowledgeGraph:
                             != new_rel.object_entity.name.lower()
                         ):
                             reason = (
-                                f"Conflicting {pred_str}: KG says '{existing.object_entity.name}' "
+                                f"Conflicting {pred}: KG says '{existing.object_entity.name}' "
                                 f"but new claim says '{new_rel.object_entity.name}'"
                             )
                             contradictions.append((existing, new_rel, reason))
@@ -632,13 +686,9 @@ class KnowledgeGraph:
                                 # If evidence has a year and text has a DIFFERENT year
                                 conflicting = new_years - stored_years
                                 if stored_years and conflicting:
-                                    pred_str = (
-                                        rel.predicate.value
-                                        if hasattr(rel.predicate, "value")
-                                        else str(rel.predicate)
-                                    )
+                                    pred = predicate_str(rel.predicate)
                                     reason = (
-                                        f"Date inconsistency for {rel.subject.name} {pred_str}: "
+                                        f"Date inconsistency for {rel.subject.name} {pred}: "
                                         f"evidence mentions {sorted(stored_years)}, but text says {sorted(conflicting)}"
                                     )
                                     contradictions.append((rel, rel, reason))
@@ -866,14 +916,8 @@ class KnowledgeGraph:
 
             # Check predicate match
             if predicate:
-                rel_pred = (
-                    relation.predicate.value
-                    if isinstance(relation.predicate, RelationType)
-                    else str(relation.predicate)
-                )
-                pred_str = (
-                    predicate.value if isinstance(predicate, RelationType) else str(predicate)
-                )
+                rel_pred = relation.predicate_value
+                pred_str = predicate_str(predicate)
                 if rel_pred != pred_str:
                     continue
 
@@ -884,6 +928,35 @@ class KnowledgeGraph:
             results.append(relation)
 
         return results
+
+    def query_by_triple(
+        self,
+        subject: str | None = None,
+        predicate: str | None = None,
+        obj: str | None = None,
+    ) -> list[Relation]:
+        """Query relations using string-only triple pattern.
+
+        Convenience method that accepts all string arguments, handling
+        predicate conversion internally. Useful when the caller doesn't
+        have access to RelationType enum values.
+
+        Args:
+            subject: Subject entity name (or None for wildcard).
+            predicate: Predicate string value (or None for wildcard).
+            obj: Object entity name (or None for wildcard).
+
+        Returns:
+            List of matching relations.
+
+        Example:
+            >>> kg.query_by_triple("Einstein", "authored", None)
+            [Relation(subject=Einstein, predicate=authored, object=Relativity)]
+            >>> kg.query_by_triple(None, "discovered", "Penicillin")
+            [Relation(subject=Fleming, predicate=discovered, object=Penicillin)]
+
+        """
+        return self.query(subject=subject, predicate=predicate, obj=obj)
 
     def get_neighbors(
         self,
@@ -943,12 +1016,7 @@ class KnowledgeGraph:
 
         relation_types: dict[str, int] = defaultdict(int)
         for relation in self._relations:
-            pred = (
-                relation.predicate.value
-                if isinstance(relation.predicate, RelationType)
-                else str(relation.predicate)
-            )
-            relation_types[pred] += 1
+            relation_types[relation.predicate_value] += 1
 
         num_entities = len(self._entities)
         avg_relations = len(self._relations) / num_entities if num_entities > 0 else 0

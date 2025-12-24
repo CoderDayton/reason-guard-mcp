@@ -13,6 +13,8 @@ from src.models.knowledge_graph import (
     KnowledgeGraphStats,
     Relation,
     RelationType,
+    entity_type_str,
+    predicate_str,
 )
 
 
@@ -132,6 +134,16 @@ class TestEntity:
         assert data["properties"]["born"] == 1879
         assert data["mention_count"] == 5
 
+    def test_entity_type_value(self) -> None:
+        """Test entity type_value property."""
+        person = Entity(name="Alice", entity_type=EntityType.PERSON)
+        org = Entity(name="Acme", entity_type=EntityType.ORGANIZATION)
+        concept = Entity(name="Gravity", entity_type=EntityType.CONCEPT)
+
+        assert person.type_value == "PERSON"
+        assert org.type_value == "ORG"
+        assert concept.type_value == "CONCEPT"
+
 
 class TestRelation:
     """Test Relation dataclass."""
@@ -241,6 +253,62 @@ class TestRelation:
 
         triple = relation.to_triple()
         assert triple == ("A", "custom", "B")
+
+    def test_predicate_value_with_enum(self) -> None:
+        """Test predicate_value property with RelationType enum."""
+        subject = Entity(name="A", entity_type=EntityType.OTHER)
+        obj = Entity(name="B", entity_type=EntityType.OTHER)
+
+        relation = Relation(
+            subject=subject,
+            predicate=RelationType.DISCOVERED,
+            object_entity=obj,
+        )
+
+        assert relation.predicate_value == "discovered"
+
+    def test_predicate_value_with_string(self) -> None:
+        """Test predicate_value property with string predicate."""
+        subject = Entity(name="A", entity_type=EntityType.OTHER)
+        obj = Entity(name="B", entity_type=EntityType.OTHER)
+
+        relation = Relation(
+            subject=subject,
+            predicate="custom_relation",
+            object_entity=obj,
+        )
+
+        assert relation.predicate_value == "custom_relation"
+
+
+class TestPredicateStr:
+    """Test predicate_str helper function."""
+
+    def test_predicate_str_with_enum(self) -> None:
+        """Test predicate_str with RelationType enum."""
+        assert predicate_str(RelationType.DISCOVERED) == "discovered"
+        assert predicate_str(RelationType.AUTHORED) == "authored"
+        assert predicate_str(RelationType.LOCATED_IN) == "located_in"
+
+    def test_predicate_str_with_string(self) -> None:
+        """Test predicate_str with plain string."""
+        assert predicate_str("custom") == "custom"
+        assert predicate_str("my_relation") == "my_relation"
+
+
+class TestEntityTypeStr:
+    """Test entity_type_str helper function."""
+
+    def test_entity_type_str_all_types(self) -> None:
+        """Test entity_type_str with all EntityType values."""
+        assert entity_type_str(EntityType.PERSON) == "PERSON"
+        assert entity_type_str(EntityType.ORGANIZATION) == "ORG"
+        assert entity_type_str(EntityType.LOCATION) == "LOC"
+        assert entity_type_str(EntityType.DATE) == "DATE"
+        assert entity_type_str(EntityType.EVENT) == "EVENT"
+        assert entity_type_str(EntityType.CONCEPT) == "CONCEPT"
+        assert entity_type_str(EntityType.QUANTITY) == "QUANTITY"
+        assert entity_type_str(EntityType.OTHER) == "OTHER"
 
 
 class TestKnowledgeGraphStats:
@@ -818,6 +886,55 @@ class TestKnowledgeGraph:
 
         results = kg.query(predicate="custom_rel")
         assert len(results) == 1
+
+    def test_query_by_triple_subject_only(self) -> None:
+        """Test query_by_triple with subject filter."""
+        kg = KnowledgeGraph()
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+        kg.add_relation("Einstein", RelationType.WORKS_FOR, "Princeton")
+        kg.add_relation("Newton", RelationType.AUTHORED, "Principia")
+
+        results = kg.query_by_triple(subject="Einstein")
+        assert len(results) == 2
+
+    def test_query_by_triple_predicate_only(self) -> None:
+        """Test query_by_triple with predicate filter."""
+        kg = KnowledgeGraph()
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+        kg.add_relation("Newton", RelationType.AUTHORED, "Principia")
+        kg.add_relation("Fleming", RelationType.DISCOVERED, "Penicillin")
+
+        results = kg.query_by_triple(predicate="authored")
+        assert len(results) == 2
+
+    def test_query_by_triple_object_only(self) -> None:
+        """Test query_by_triple with object filter."""
+        kg = KnowledgeGraph()
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+        kg.add_relation("Lorentz", RelationType.RELATED_TO, "Relativity")
+
+        results = kg.query_by_triple(obj="Relativity")
+        assert len(results) == 2
+
+    def test_query_by_triple_full_pattern(self) -> None:
+        """Test query_by_triple with all filters."""
+        kg = KnowledgeGraph()
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Relativity")
+        kg.add_relation("Einstein", RelationType.AUTHORED, "Photoelectric")
+        kg.add_relation("Newton", RelationType.AUTHORED, "Relativity")  # Different subject
+
+        results = kg.query_by_triple(subject="Einstein", predicate="authored", obj="Relativity")
+        assert len(results) == 1
+        assert results[0].subject.name == "Einstein"
+        assert results[0].object_entity.name == "Relativity"
+
+    def test_query_by_triple_no_matches(self) -> None:
+        """Test query_by_triple returns empty list when no matches."""
+        kg = KnowledgeGraph()
+        kg.add_relation("A", RelationType.RELATED_TO, "B")
+
+        results = kg.query_by_triple(subject="X", predicate="unknown", obj="Y")
+        assert len(results) == 0
 
     def test_get_neighbors_one_hop(self) -> None:
         """Test getting neighbors within 1 hop."""

@@ -16,6 +16,8 @@ from .knowledge_graph import (
     KnowledgeGraphExtractor,
     Relation,
     RelationType,
+    entity_type_str,
+    predicate_str,
 )
 
 __all__ = [
@@ -32,4 +34,6 @@ __all__ = [
     "Relation",
     "RelationType",
     "encode_text",
+    "entity_type_str",
+    "predicate_str",
 ]
