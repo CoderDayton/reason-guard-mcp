@@ -301,8 +301,11 @@ jobs:
       - name: Verify signature
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          # Use lowercase repo name for Docker registry compatibility
+          REPO_LOWER: ${{ github.repository }}
         run: |
+          REPO_LC=$(echo "$REPO_LOWER" | tr '[:upper:]' '[:lower:]')
           cosign verify \
             --certificate-identity-regexp="https://github.com/${{ github.repository }}.*" \
             --certificate-oidc-issuer="https://token.actions.githubusercontent.com" \
-            ghcr.io/${{ github.repository }}@${DIGEST}
+            ghcr.io/${REPO_LC}@${DIGEST}
